@@ -1,179 +1,146 @@
 # libinput-rs
 
-[![CI](https://github.com/SisyphusAeolides/libinput-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/SisyphusAeolides/libinput-rs/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+`libinput-rs` is a Rust input research project with two deliberately separated
+artifacts:
 
-A complete, drop-in Rust replacement for **libinput.so** — same C ABI, same versioned symbol nodes, same SONAME (`libinput.so.10`). Works transparently with any compositor or application that links against libinput: Weston, Sway, KWin, GNOME Shell, libinput-debug-events, and more.
+- an optional touchpad companion daemon using evdev and uinput;
+- an experimental implementation of the `libinput.so.10` C ABI for explicit,
+  per-application compatibility testing.
 
-> **libinput-rs does more than the original.** It adds sub-millisecond keyboard repeat synthesis, full multi-touch pinch gesture detection with live scale + rotation, `INPUT_PROP_POINTER`/`INPUT_PROP_BUTTONPAD` device classification, and a zero-copy event pipeline — all in safe, auditable Rust.
+The RPM never replaces Fedora or Enterprise Linux's system `libinput` library.
+Display managers and compositors continue to use the distribution-supported
+implementation.
 
----
+## Why 0.2.0 changes installation
 
-## Feature Comparison
+Earlier packaging installed the experimental library as the system
+`libinput.so.10`. The exported symbol names matched, but many behaviors were
+not yet equivalent to upstream libinput. Because GDM, SDDM, plasma-login,
+GNOME Shell, and KWin all depend on that library, systemwide replacement could
+cause a black screen, remove the password prompt, or leave a session without
+working input.
 
-| Feature | libinput (C) | libinput-rs (Rust) |
-|---|---|---|
-| Pointer motion (relative) | ✅ | ✅ |
-| Pointer motion (absolute) | ✅ | ✅ |
-| Pointer buttons | ✅ | ✅ |
-| Wheel / finger scroll | ✅ | ✅ |
-| Horizontal scroll | ✅ | ✅ |
-| Keyboard key events | ✅ | ✅ |
-| Keyboard repeat synthesis | ✅ (kernel) | ✅ (Rust, 200ms/25ms) |
-| Tap-to-click | ✅ | ✅ |
-| Two-finger natural scroll | ✅ | ✅ |
-| Three-finger swipe | ✅ | ✅ |
-| Pinch gesture (scale + rotation) | ✅ | ✅ |
-| Disable-while-typing (DWT) | ✅ | ✅ (500ms) |
-| Hotplug via inotify | ✅ | ✅ |
-| Device capability API | ✅ | ✅ |
-| Full device config API | ✅ | ✅ |
-| Tap button map (LRM/LMR) | ✅ | ✅ |
-| Calibration matrix | ✅ | ✅ |
-| Suspend / resume | ✅ | ✅ |
-| `INPUT_PROP_POINTER` classification | ✅ | ✅ |
-| Versioned `.so` (`LIBINPUT_1.x`) | ✅ | ✅ |
-| Memory safety | ❌ (C) | ✅ (Rust) |
-| CI-gated symbol leak detection | ❌ | ✅ |
+The standalone daemon also grabbed touchpads before proving that its uinput
+sink was available. A restart loop could therefore interrupt input repeatedly.
 
----
+Version 0.2.0 fixes the deployment and lifecycle hazards:
 
-## Architecture
+- the system `libinput` package and `/usr/lib64/libinput.so.10` are preserved;
+- the experimental ABI library lives under `/usr/lib64/libinput-rs/`;
+- uinput is created before any physical touchpad is grabbed;
+- keyboards are never grabbed or forwarded;
+- only capability-identified touchpads are grabbed;
+- forwarding failures terminate the daemon and release every grab;
+- systemd rate-limits failures and does not start the daemon before a display
+  manager;
+- suspend and resume now release and reopen ABI-backend devices;
+- kernel-module reset and autosuspend modification hooks were removed.
 
-```
-┌─────────────────────────────────────────────────┐
-│                 libinput-rs.so                  │
-│  ┌─────────────┐   ┌──────────────────────────┐ │
-│  │  C ABI shim │   │      BackendState        │ │
-│  │  (lib.rs)   │──▶│  ┌──────────────────┐   │ │
-│  └─────────────┘   │  │  TrackedDevice   │   │ │
-│                    │  │  • MT slot table │   │ │
-│  ┌─────────────┐   │  │  • Key repeat    │   │ │
-│  │  ffi_types  │   │  │  • Pinch state   │   │ │
-│  │  (events,   │   │  │  • DWT timer     │   │ │
-│  │   devices,  │   │  └──────────────────┘   │ │
-│  │   context)  │   └──────────────────────────┘ │
-│  └─────────────┘                                │
-└─────────────────────────────────────────────────┘
-         │  LD_PRELOAD or .so symlink
-         ▼
-  Compositor / application
-  (Sway, KWin, Weston, GNOME Shell…)
-```
+## Supported systems
 
-The library reads `/dev/input/event*` directly via **evdev**, maintains per-device state, and exposes a standard `eventfd`-backed fd that compositors poll. No udev daemon, no external process.
+The supported packaging path is DNF/RPM on:
 
----
+- Fedora 44
+- Fedora Rawhide
+- EPEL 9 and 10
+- RHEL-compatible 9 and 10 chroots
 
-## Building
+## Install from COPR
 
 ```bash
-git clone https://github.com/SisyphusAeolides/libinput-rs.git
-cd libinput-rs
-
-# Arch Linux dependencies
-sudo pacman -S --needed rust cargo libevdev systemd
-
-# Build the ABI-versioned shared library
-./build-shared.sh
-
-# Build the optional standalone daemon
-cargo build --bin libinput-rs --release
+sudo dnf install dnf-plugins-core
+sudo dnf copr enable sisyphuscode/libinput-rs
+sudo dnf install libinput-rs
 ```
 
-The shared library is output to `target/release/libinput.so`.
-
----
-
-## Installation
-
-### Drop-in replacement (recommended)
+Installation does not enable the daemon. Test it from a text console or an SSH
+session before enabling it permanently:
 
 ```bash
-# Build and install the Arch package
-git clone https://github.com/SisyphusAeolides/arch-pkgbuilds.git
-cd arch-pkgbuilds/libinput-rs
-makepkg -si
+sudo systemctl start libinput-rs
+systemctl status libinput-rs
+sudo systemctl enable libinput-rs
 ```
 
-### LD_PRELOAD (no system files touched)
+To stop using the daemon:
 
 ```bash
-LD_PRELOAD=/path/to/target/release/libinput.so sway
+sudo systemctl disable --now libinput-rs
 ```
+
+If an older package replaced the system library, restore it before testing
+0.2.0:
+
+```bash
+sudo dnf reinstall libinput
+sudo ldconfig
+```
+
+## Build with DNF dependencies
+
+```bash
+sudo dnf install rust cargo gcc make binutils systemd-rpm-macros
+make all
+make check
+make test
+```
+
+The daemon is built at `target/release/libinput-rs`. The experimental ABI
+library is built at `target/release/libinput.so`.
 
 ## Configuration
 
-`/etc/libinput-rs/config.json`:
+The daemon reads `/etc/libinput-rs/config.json`:
 
 ```json
 {
   "tap_to_click": true,
   "natural_scrolling": true,
-  "pointer_acceleration": 0.0,
+  "pointer_acceleration": 1.0,
   "disable_while_typing": true
 }
 ```
 
-| Key | Type | Default | Description |
-|---|---|---|---|
-| `tap_to_click` | bool | `true` | Tap-to-click on touchpads |
-| `natural_scrolling` | bool | `true` | Reverse scroll direction (macOS-style) |
-| `pointer_acceleration` | float | `0.0` | Acceleration speed, -1.0 to 1.0 |
-| `disable_while_typing` | bool | `true` | Suppress touchpad input 500ms after keystroke |
+## Experimental ABI testing
 
----
-
-## Keyboard Repeat
-
-libinput-rs synthesises its own repeat events rather than relying on kernel autorepeat. When a key is held:
-
-- **Initial delay:** 200 ms
-- **Repeat interval:** 25 ms (40 Hz)
-
-This matches the timing that Wayland compositors expect and avoids the double-repeat issue that can occur when the kernel and compositor both handle repeat independently.
-
----
-
-## Pinch Gesture
-
-Pinch gestures are detected from raw `ABS_MT_*` multi-touch data:
-
-1. **`GESTURE_PINCH_BEGIN`** — emitted when 2+ fingers contact the surface; records baseline inter-finger distance and angle.
-2. **`GESTURE_PINCH_UPDATE`** — emitted on every `SYN_REPORT` with:
-   - `scale` = current distance / baseline distance (sub-percent resolution)
-   - `angle_delta` = current vector angle − baseline angle, in degrees
-3. **`GESTURE_PINCH_END`** — emitted on finger lift with final scale and `cancelled = false`.
-
----
-
-## CI
-
-Every push and pull request to `main` runs:
-
-| Check | Tool |
-|---|---|
-| Code formatting | `cargo fmt --check` |
-| Lint (zero warnings) | `cargo clippy -D warnings` |
-| Library build | `cargo build --lib --release` |
-| Daemon build | `cargo build --bin --release` |
-| SONAME assertion | `readelf -d` → must be `libinput.so.10` |
-| Versioned symbol check | `nm -D`/`readelf` → exported symbols must use upstream `LIBINPUT_*` nodes |
-| Internal symbol leak check | `nm -D` → no `rust_` or `__rd` exports |
-
----
-
-## Standalone Daemon
-
-The `libinput-rs` binary is an optional companion that grabs physical devices with `EVIOCGRAB`, runs the same input pipeline, and re-emits events via `/dev/uinput`. Use it on systems where replacing the `.so` is not desirable.
+The ABI library is not in the system linker path. Test it only with a single
+non-critical application:
 
 ```bash
-sudo systemctl enable --now libinput-rs
+LD_LIBRARY_PATH=/usr/lib64/libinput-rs your-test-program
 ```
 
-Unit file: `forge/libinput-rs.service`
+Do not copy or symlink it over the distribution's `libinput.so.10`. Matching
+an ABI surface is not the same as matching libinput's complete udev, seat,
+device-quirk, gesture, and lifecycle behavior.
 
----
+## Formal safety models
+
+The fail-open state machine is modeled three ways under `proofs/`:
+
+- Agda proves that a grab cannot be authorized while the output sink is absent;
+- Idris 2 uses indexed states and total transitions so invalid runtime states
+  are unconstructable;
+- Austral represents the exclusive grab as a linear token that must be
+  consumed exactly once on release.
+
+Agda and Idris 2 are available through DNF on the supported Fedora and EPEL
+targets:
+
+```bash
+sudo dnf install Agda idris2
+make proofs
+```
+
+When the Austral compiler is installed, `make proofs` also type-checks the
+Austral model. `make proofs-strict` requires all three compilers.
+
+## Reference behavior
+
+Runtime and ABI lifecycle work is compared against the upstream libinput
+architecture and the `complyue/libinput` branch referenced during debugging.
+The Rust implementation intentionally remains opt-in until behavioral tests,
+not only symbol tests, demonstrate compositor-safe compatibility.
 
 ## License
 

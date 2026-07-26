@@ -1,8 +1,0 @@
-[Unit]
-Description=Reset Elan I2C Trackpad Firmware
-
-[Service]
-Type=oneshot
-ExecStartPre=/usr/bin/modprobe -r elan_i2c
-ExecStartPre=/usr/bin/sleep 1
-ExecStart=/usr/bin/modprobe elan_i2c

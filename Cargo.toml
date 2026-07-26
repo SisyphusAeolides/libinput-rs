@@ -1,10 +1,12 @@
 [package]
 name = "libinput-rs"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
-description = "Drop-in Rust replacement for libinput.so — evdev/uinput backend"
+rust-version = "1.75"
+description = "Fail-open Rust touchpad companion and experimental libinput ABI implementation"
 license = "MIT"
 repository = "https://github.com/SisyphusAeolides/libinput-rs"
+readme = "README.md"
 
 [[bin]]
 name = "libinput-rs"

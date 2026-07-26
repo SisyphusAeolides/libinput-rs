@@ -1,0 +1,8 @@
+module Safety.FailOpen is
+    type SinkReady: Free;
+    type GrabToken: Linear;
+
+    function prepareSink(): SinkReady;
+    function grab(sink: SinkReady): GrabToken;
+    function release(token: GrabToken): Unit;
+end module.

@@ -184,6 +184,7 @@ pub struct BackendState {
     devices: HashMap<RawFd, TrackedDevice>,
     inotify: Option<Inotify>,
     pub global_typing_time: Option<Instant>,
+    suspended: bool,
 }
 
 unsafe impl Send for BackendState {}
@@ -202,6 +203,7 @@ impl BackendState {
             devices: HashMap::new(),
             inotify,
             global_typing_time: None,
+            suspended: false,
         }
     }
 
@@ -219,6 +221,9 @@ impl BackendState {
         ctx: *mut LibinputContext,
         out: &mut Vec<LibinputEvent>,
     ) {
+        if self.suspended {
+            return;
+        }
         for (path, _) in evdev::enumerate() {
             self.try_open(ctx, &path, out);
         }
@@ -248,12 +253,7 @@ impl BackendState {
                 unsafe { std::os::fd::FromRawFd::from_raw_fd(raw_fd) };
             match Device::from_fd(owned_fd) {
                 Ok(d) => d,
-                Err(_) => {
-                    if let Some(close_fn) = interface.close_restricted {
-                        close_fn(raw_fd, (*ctx).user_data);
-                    }
-                    return;
-                }
+                Err(_) => return,
             }
         } else {
             let Ok(d) = Device::open(path) else {
@@ -404,10 +404,6 @@ impl BackendState {
         for fd in dead_fds {
             if let Some(td) = self.devices.remove(&fd) {
                 (*ctx).unregister_fd(fd);
-                let interface = &*(*ctx).interface;
-                if let Some(close_fn) = interface.close_restricted {
-                    close_fn(fd, (*ctx).user_data);
-                }
                 out.push_back(LibinputEvent {
                     event_type: LibinputEventType::LIBINPUT_EVENT_DEVICE_REMOVED,
                     payload: EventPayload::DeviceRemoved,
@@ -427,6 +423,9 @@ impl BackendState {
         ctx: *mut LibinputContext,
         out: &mut VecDeque<LibinputEvent>,
     ) {
+        if self.suspended {
+            return;
+        }
         let Some(ref ino) = self.inotify else { return };
         let Ok(ievents) = ino.read_events() else {
             return;
@@ -447,6 +446,27 @@ impl BackendState {
         for ev in tmp {
             out.push_back(ev);
         }
+    }
+
+    pub unsafe fn suspend(&mut self, ctx: *mut LibinputContext, out: &mut VecDeque<LibinputEvent>) {
+        if self.suspended {
+            return;
+        }
+        self.suspended = true;
+        for (fd, td) in self.devices.drain() {
+            (*ctx).unregister_fd(fd);
+            out.push_back(LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_DEVICE_REMOVED,
+                payload: EventPayload::DeviceRemoved,
+                context: ctx,
+                device: td.lib_device,
+            });
+        }
+    }
+
+    pub unsafe fn resume(&mut self, ctx: *mut LibinputContext, out: &mut Vec<LibinputEvent>) {
+        self.suspended = false;
+        self.scan_and_open(ctx, out);
     }
 
     // -----------------------------------------------------------------------

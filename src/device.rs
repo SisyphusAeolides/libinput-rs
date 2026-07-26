@@ -26,8 +26,6 @@ pub struct DeviceWrapper {
 
     // DWT state
     pub last_typing_time: Option<Instant>,
-    pub ctrl_pressed: bool,
-    pub alt_pressed: bool,
     pub last_movement_time: Option<Instant>,
     pub active_click_button: Option<u16>,
 }
@@ -64,8 +62,6 @@ impl DeviceWrapper {
             touch_start_time: None,
             tap_emitted: false,
             last_typing_time: None,
-            ctrl_pressed: false,
-            alt_pressed: false,
             last_movement_time: None,
             active_click_button: None,
         }
@@ -79,19 +75,18 @@ impl DeviceWrapper {
         last_global_typing_time: Option<Instant>,
     ) -> Result<(), Box<dyn Error>> {
         if ev.event_type() == EventType::KEY {
-            let code = ev.code();
             let value = ev.value();
-
-            if code == KeyCode::KEY_LEFTCTRL.0 || code == KeyCode::KEY_RIGHTCTRL.0 {
-                self.ctrl_pressed = value != 0;
-            }
-            if code == KeyCode::KEY_LEFTALT.0 || code == KeyCode::KEY_RIGHTALT.0 {
-                self.alt_pressed = value != 0;
-            }
 
             if self.is_keyboard && value != 0 {
                 // value 1 is press, 2 is repeat
                 self.last_typing_time = Some(Instant::now());
+            }
+
+            // Keyboards are observed only for disable-while-typing. They are
+            // never grabbed and must never be forwarded into the pointer-only
+            // uinput device.
+            if self.is_keyboard {
+                return Ok(());
             }
         }
 
@@ -324,33 +319,6 @@ impl DeviceWrapper {
     }
 }
 
-fn disable_autosuspend(dev_path: &std::path::Path) {
-    if let Some(file_name) = dev_path.file_name() {
-        let mut sys_path = std::path::PathBuf::from("/sys/class/input");
-        sys_path.push(file_name);
-        sys_path.push("device");
-
-        for _ in 0..4 {
-            let power_control = sys_path.join("power/control");
-            if power_control.exists() {
-                if let Err(e) = std::fs::write(&power_control, "on") {
-                    log::warn!(
-                        "Failed to disable autosuspend at {:?}: {}",
-                        power_control,
-                        e
-                    );
-                } else {
-                    log::info!(
-                        "Automatically disabled hardware autosuspend for {:?}",
-                        dev_path
-                    );
-                }
-            }
-            sys_path.push("..");
-        }
-    }
-}
-
 pub fn try_open_device(path: &std::path::Path) -> Option<DeviceWrapper> {
     if let Ok(mut device) = evdev::Device::open(path) {
         let name = device.name().unwrap_or("Unknown").to_string();
@@ -360,23 +328,24 @@ pub fn try_open_device(path: &std::path::Path) -> Option<DeviceWrapper> {
             return None;
         }
 
-        let is_pointer = name.contains("touchpad")
-            || name.contains("trackpoint")
-            || name.contains("elan")
-            || name.contains("synaptics")
-            || name.contains("mouse");
+        let properties = device.properties();
+        let is_touchpad = device.supported_events().contains(EventType::ABSOLUTE)
+            && device
+                .supported_keys()
+                .is_some_and(|keys| keys.contains(KeyCode::BTN_TOUCH))
+            && (properties.contains(evdev::PropType::POINTER)
+                || properties.contains(evdev::PropType::BUTTONPAD));
         let is_keyboard = device.supported_events().contains(EventType::KEY)
             && device
                 .supported_keys()
                 .is_some_and(|keys| keys.contains(KeyCode::KEY_A));
 
-        if is_pointer {
-            info!("Found target pointer hardware: {} at {:?}", name, path);
+        if is_touchpad {
+            info!("Found touchpad hardware: {} at {:?}", name, path);
             if device.grab().is_ok() {
-                disable_autosuspend(path);
                 return Some(DeviceWrapper::new(device, path.to_path_buf()));
             } else {
-                warn!("Failed to grab pointer device: {:?}", path);
+                warn!("Failed to grab touchpad device: {:?}", path);
             }
         } else if is_keyboard {
             info!("Found keyboard for DWT monitoring: {} at {:?}", name, path);

@@ -1,0 +1,23 @@
+module body Safety.FailOpen is
+    record SinkReady: Free is
+        marker: Unit;
+    end;
+
+    record GrabToken: Linear is
+        marker: Unit;
+    end;
+
+    function prepareSink(): SinkReady is
+        return SinkReady(marker => nil);
+    end;
+
+    function grab(sink: SinkReady): GrabToken is
+        let { marker: Unit } := sink;
+        return GrabToken(marker => marker);
+    end;
+
+    function release(token: GrabToken): Unit is
+        let { marker: Unit } := token;
+        return marker;
+    end;
+end module body.

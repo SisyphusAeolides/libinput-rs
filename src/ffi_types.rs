@@ -8,6 +8,12 @@ use std::sync::Mutex;
 
 use crate::backend::BackendState;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendKind {
+    Udev,
+    Path,
+}
+
 // ---------------------------------------------------------------------------
 // libinput_interface
 // ---------------------------------------------------------------------------
@@ -271,13 +277,19 @@ pub struct LibinputContext {
         unsafe extern "C" fn(ctx: *mut LibinputContext, priority: u32, msg: *const libc::c_char),
     >,
     pub backend: Mutex<BackendState>,
+    pub backend_kind: BackendKind,
+    pub seat_assigned: bool,
 }
 
 unsafe impl Send for LibinputContext {}
 unsafe impl Sync for LibinputContext {}
 
 impl LibinputContext {
-    pub fn new(interface: *const LibinputInterface, user_data: *mut libc::c_void) -> Self {
+    pub fn new(
+        interface: *const LibinputInterface,
+        user_data: *mut libc::c_void,
+        backend_kind: BackendKind,
+    ) -> Self {
         let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         let seat = Box::into_raw(Box::new(LibinputSeat {
             physical_name: CString::new("seat0").unwrap(),
@@ -298,6 +310,8 @@ impl LibinputContext {
             refcount: AtomicI32::new(1),
             log_handler: None,
             backend: Mutex::new(backend),
+            backend_kind,
+            seat_assigned: false,
         };
         if let Some(fd) = inotify_fd {
             ctx.register_fd(fd);

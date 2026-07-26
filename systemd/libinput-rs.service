@@ -1,21 +1,24 @@
 [Unit]
 Description=Rust Input Management Daemon
-DefaultDependencies=no
-After=systemd-udevd.service local-fs.target
-Before=display-manager.service
-Conflicts=shutdown.target
+After=systemd-udevd.service systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+ConditionPathExists=/dev/uinput
+StartLimitIntervalSec=30
+StartLimitBurst=3
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/libinput-rs
-Restart=always
-RestartSec=1s
+Restart=on-failure
+RestartSec=3s
 User=root
 Group=input
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/dev/input /dev/uinput /etc/libinput-rs
-CapabilityBoundingSet=CAP_SYS_ADMIN
+NoNewPrivileges=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
 
 [Install]
-WantedBy=graphical.target
+WantedBy=multi-user.target

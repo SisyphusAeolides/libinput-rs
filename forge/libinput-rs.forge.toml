@@ -1,6 +1,0 @@
-[service]
-name = "libinput-rs"
-description = "Companion input preprocessor (evdev grab + uinput)"
-exec = "/usr/bin/libinput-rs"
-after = ["udev", "udev-trigger", "udev-settle"]
-restart = "always"

@@ -10,7 +10,7 @@ mod backend;
 mod ffi_types;
 
 use crate::ffi_types::{
-    EventPayload, LibinputContext, LibinputDevice, LibinputEvent, LibinputEventType,
+    BackendKind, EventPayload, LibinputContext, LibinputDevice, LibinputEvent, LibinputEventType,
     LibinputInterface, LibinputSeat,
 };
 
@@ -49,12 +49,16 @@ unsafe fn populate_events(ctx: *mut LibinputContext) {
 pub unsafe extern "C" fn libinput_udev_create_context(
     interface: *const LibinputInterface,
     user_data: *mut libc::c_void,
-    _udev: *mut libc::c_void,
+    udev: *mut libc::c_void,
 ) -> *mut LibinputContext {
-    if interface.is_null() {
+    if interface.is_null() || udev.is_null() {
         return std::ptr::null_mut();
     }
-    let ctx = Box::into_raw(Box::new(LibinputContext::new(interface, user_data)));
+    let ctx = Box::into_raw(Box::new(LibinputContext::new(
+        interface,
+        user_data,
+        BackendKind::Udev,
+    )));
     (*(*ctx).seat).context = ctx;
     ctx
 }
@@ -67,7 +71,11 @@ pub unsafe extern "C" fn libinput_path_create_context(
     if interface.is_null() {
         return std::ptr::null_mut();
     }
-    let ctx = Box::into_raw(Box::new(LibinputContext::new(interface, user_data)));
+    let ctx = Box::into_raw(Box::new(LibinputContext::new(
+        interface,
+        user_data,
+        BackendKind::Path,
+    )));
     (*(*ctx).seat).context = ctx;
     ctx
 }
@@ -98,13 +106,18 @@ pub unsafe extern "C" fn libinput_udev_assign_seat(
     ctx: *mut LibinputContext,
     seat_name: *const libc::c_char,
 ) -> libc::c_int {
-    if ctx.is_null() || seat_name.is_null() {
+    if ctx.is_null()
+        || seat_name.is_null()
+        || (*ctx).backend_kind != BackendKind::Udev
+        || (*ctx).seat_assigned
+    {
         return -1;
     }
     let name = CStr::from_ptr(seat_name).to_string_lossy().into_owned();
     if let Ok(cname) = std::ffi::CString::new(name) {
-        (*(*ctx).seat).logical_name = cname;
+        (*(*ctx).seat).physical_name = cname;
     }
+    (*ctx).seat_assigned = true;
     let mut tmp: Vec<LibinputEvent> = Vec::new();
     if let Ok(mut backend) = (*ctx).backend.lock() {
         backend.scan_and_open(ctx, &mut tmp);
@@ -120,7 +133,7 @@ pub unsafe extern "C" fn libinput_path_add_device(
     ctx: *mut LibinputContext,
     path: *const libc::c_char,
 ) -> *mut LibinputDevice {
-    if ctx.is_null() || path.is_null() {
+    if ctx.is_null() || path.is_null() || (*ctx).backend_kind != BackendKind::Path {
         return std::ptr::null_mut();
     }
     let devnode = CStr::from_ptr(path).to_string_lossy().into_owned();
@@ -2986,9 +2999,94 @@ pub unsafe extern "C" fn libinput_tablet_tool_unref(_tool: *mut libc::c_void) ->
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_suspend(_ctx: *mut LibinputContext) {}
+pub unsafe extern "C" fn libinput_suspend(ctx: *mut LibinputContext) {
+    if ctx.is_null() {
+        return;
+    }
+    let mut events = std::collections::VecDeque::new();
+    if let Ok(mut backend) = (*ctx).backend.lock() {
+        backend.suspend(ctx, &mut events);
+    }
+    (*ctx).event_queue.extend(events);
+}
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_resume(_ctx: *mut LibinputContext) -> libc::c_int {
+pub unsafe extern "C" fn libinput_resume(ctx: *mut LibinputContext) -> libc::c_int {
+    if ctx.is_null() {
+        return -1;
+    }
+    let mut events = Vec::new();
+    if let Ok(mut backend) = (*ctx).backend.lock() {
+        backend.resume(ctx, &mut events);
+    } else {
+        return -1;
+    }
+    (*ctx).event_queue.extend(events);
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe extern "C" fn deny_open(
+        _path: *const libc::c_char,
+        _flags: libc::c_int,
+        _user_data: *mut libc::c_void,
+    ) -> libc::c_int {
+        -libc::EACCES
+    }
+
+    unsafe extern "C" fn close_fd(_fd: libc::c_int, _user_data: *mut libc::c_void) {}
+
+    static INTERFACE: LibinputInterface = LibinputInterface {
+        open_restricted: Some(deny_open),
+        close_restricted: Some(close_fd),
+    };
+
+    #[test]
+    fn udev_context_requires_interface_and_udev() {
+        unsafe {
+            let fake_udev = 1usize as *mut libc::c_void;
+            assert!(libinput_udev_create_context(
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                fake_udev,
+            )
+            .is_null());
+            assert!(libinput_udev_create_context(
+                &INTERFACE,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+            .is_null());
+        }
+    }
+
+    #[test]
+    fn seat_assignment_is_udev_only_and_happens_once() {
+        unsafe {
+            let fake_udev = 1usize as *mut libc::c_void;
+            let seat = std::ffi::CString::new("seat0").unwrap();
+            let udev_ctx =
+                libinput_udev_create_context(&INTERFACE, std::ptr::null_mut(), fake_udev);
+            assert!(!udev_ctx.is_null());
+            assert_eq!(libinput_udev_assign_seat(udev_ctx, seat.as_ptr()), 0);
+            assert_eq!(libinput_udev_assign_seat(udev_ctx, seat.as_ptr()), -1);
+            libinput_unref(udev_ctx);
+
+            let path_ctx = libinput_path_create_context(&INTERFACE, std::ptr::null_mut());
+            assert!(!path_ctx.is_null());
+            assert_eq!(libinput_udev_assign_seat(path_ctx, seat.as_ptr()), -1);
+            libinput_unref(path_ctx);
+        }
+    }
+
+    #[test]
+    fn suspend_and_resume_are_null_safe() {
+        unsafe {
+            libinput_suspend(std::ptr::null_mut());
+            assert_eq!(libinput_resume(std::ptr::null_mut()), -1);
+        }
+    }
 }

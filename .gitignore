@@ -1,1 +1,7 @@
 target/
+*.src.rpm
+*.tar.gz
+calltree.html
+error.html
+proofs/agda/*.agdai
+proofs/idris/build/

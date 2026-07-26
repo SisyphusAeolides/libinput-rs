@@ -110,51 +110,20 @@ pub fn run(
                 };
 
                 if let Some(evs) = device_events {
-                    let mut trigger_reset = false;
                     for ev in evs {
-                        if wrapper.is_keyboard
-                            && ev.event_type() == evdev::EventType::KEY
-                            && ev.value() == 1
-                            && ev.code() == evdev::KeyCode::KEY_R.0
-                            && wrapper.ctrl_pressed
-                            && wrapper.alt_pressed
-                        {
-                            trigger_reset = true;
-                        }
-
                         if let Err(e) =
                             wrapper.process_event(ev, v_device, config, last_global_typing_time)
                         {
-                            warn!("Error processing event: {}", e);
+                            return Err(format!(
+                                "failed to forward events from {:?}: {e}",
+                                wrapper.path
+                            )
+                            .into());
                         }
                         if wrapper.is_keyboard {
                             if let Some(typing_time) = wrapper.last_typing_time {
                                 last_global_typing_time = Some(typing_time);
                             }
-                        }
-                    }
-
-                    if trigger_reset {
-                        static RESETTING: std::sync::atomic::AtomicBool =
-                            std::sync::atomic::AtomicBool::new(false);
-                        if !RESETTING.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                            info!("Manual hardware reset triggered via Ctrl+Alt+R! Restarting module...");
-                            std::thread::spawn(|| {
-                                if std::process::Command::new("forgectl")
-                                    .arg("start")
-                                    .arg("libinput-elan-reset")
-                                    .output()
-                                    .is_err()
-                                {
-                                    let _ = std::process::Command::new("systemctl")
-                                        .arg("start")
-                                        .arg("libinput-elan-reset")
-                                        .output();
-                                }
-                                // Service takes 1 second to sleep, so we wait 2 seconds before unblocking
-                                std::thread::sleep(std::time::Duration::from_millis(2500));
-                                RESETTING.store(false, std::sync::atomic::Ordering::SeqCst);
-                            });
                         }
                     }
                 }
