@@ -167,6 +167,13 @@ pub struct LibinputTabletTool {
     pub pressure_range_maximum: f64,
     pub wanted_pressure_range_minimum: f64,
     pub wanted_pressure_range_maximum: f64,
+    pub eraser_button_modes: u32,
+    pub eraser_button_mode: u32,
+    pub wanted_eraser_button_mode: u32,
+    pub eraser_button: u32,
+    pub wanted_eraser_button: u32,
+    pub default_eraser_button: u32,
+    pub in_proximity: bool,
     pub buttons: Vec<u32>,
 }
 

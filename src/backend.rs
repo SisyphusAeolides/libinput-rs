@@ -37,6 +37,8 @@ extern "C" {
     ) -> *const libc::c_void;
     fn libwacom_stylus_get_name(stylus: *const libc::c_void) -> *const libc::c_char;
     fn libwacom_stylus_is_generic(stylus: *const libc::c_void) -> libc::c_int;
+    fn libwacom_stylus_has_eraser(stylus: *const libc::c_void) -> libc::c_int;
+    fn libwacom_stylus_get_eraser_type(stylus: *const libc::c_void) -> libc::c_int;
 }
 
 unsafe fn tablet_is_display_device(path: &std::path::Path) -> bool {
@@ -269,6 +271,9 @@ struct TrackedDevice {
     tablet_touch_button_changed: bool,
     tablet_area_sequence_suppressed: bool,
     tablet_left_handed_applied: bool,
+    tablet_eraser_button_active: bool,
+    tablet_eraser_pen_out_since: Option<Instant>,
+    tablet_eraser_pending_tip_up: bool,
     tablet_zero_pressure_since: Option<Instant>,
     tablet_proximity_timer_enabled: bool,
     tablet_buttons_down: u32,
@@ -597,6 +602,9 @@ impl TrackedDevice {
             tablet_touch_button_changed: false,
             tablet_area_sequence_suppressed: false,
             tablet_left_handed_applied: false,
+            tablet_eraser_button_active: false,
+            tablet_eraser_pen_out_since: None,
+            tablet_eraser_pending_tip_up: false,
             tablet_zero_pressure_since: None,
             tablet_proximity_timer_enabled: true,
             tablet_buttons_down: 0,
@@ -784,6 +792,21 @@ unsafe fn tablet_tool_for(
     capabilities: [bool; 7],
     buttons: &[u32],
 ) -> *mut LibinputTabletTool {
+    if tool_type == 2 {
+        if let Some(tool) = (*ctx).tablet_tools.iter().copied().find(|tool| {
+            !tool.is_null()
+                && (**tool).tool_type == 1
+                && (**tool).eraser_button_mode == 1
+                && if serial == 0 {
+                    (**tool).serial == 0 && (**tool).device == device
+                } else {
+                    (**tool).serial == serial
+                }
+        }) {
+            (*tool).device = device;
+            return tool;
+        }
+    }
     if let Some(tool) = (*ctx).tablet_tools.iter().copied().find(|tool| {
         !tool.is_null()
             && (**tool).tool_type == tool_type
@@ -796,6 +819,7 @@ unsafe fn tablet_tool_for(
         (*tool).device = device;
         return tool;
     }
+    let mut eraser_button_modes = u32::from(tool_type == 1);
     let name = i32::try_from(tool_id).ok().and_then(|tool_id| {
         let database = libwacom_database_new();
         if database.is_null() {
@@ -805,12 +829,33 @@ unsafe fn tablet_tool_for(
         let name = if stylus.is_null() || libwacom_stylus_is_generic(stylus) != 0 {
             None
         } else {
+            if libwacom_stylus_has_eraser(stylus) != 0
+                && libwacom_stylus_get_eraser_type(stylus) == 2
+            {
+                eraser_button_modes = 0;
+            }
             let value = libwacom_stylus_get_name(stylus);
             (!value.is_null()).then(|| std::ffi::CStr::from_ptr(value).to_owned())
         };
         libwacom_database_destroy(database);
         name
     });
+    let tool_buttons: Vec<u32> = buttons
+        .iter()
+        .copied()
+        .filter(|button| match tool_type {
+            6 | 7 => (0x110..=0x117).contains(button),
+            8 => *button == 0x100,
+            _ => matches!(*button, 0x149 | 0x14b | 0x14c),
+        })
+        .collect();
+    let default_eraser_button = if !tool_buttons.contains(&0x14b) {
+        0x14b
+    } else if !tool_buttons.contains(&0x14c) {
+        0x14c
+    } else {
+        0x149
+    };
     let tool = Box::into_raw(Box::new(LibinputTabletTool {
         refcount: std::sync::atomic::AtomicI32::new(1),
         user_data: std::ptr::null_mut(),
@@ -830,15 +875,14 @@ unsafe fn tablet_tool_for(
         pressure_range_maximum: 1.0,
         wanted_pressure_range_minimum: 0.0,
         wanted_pressure_range_maximum: 1.0,
-        buttons: buttons
-            .iter()
-            .copied()
-            .filter(|button| match tool_type {
-                6 | 7 => (0x110..=0x117).contains(button),
-                8 => *button == 0x100,
-                _ => matches!(*button, 0x149 | 0x14b | 0x14c),
-            })
-            .collect(),
+        eraser_button_modes,
+        eraser_button_mode: 0,
+        wanted_eraser_button_mode: 0,
+        eraser_button: default_eraser_button,
+        wanted_eraser_button: default_eraser_button,
+        default_eraser_button,
+        in_proximity: false,
+        buttons: tool_buttons,
     }));
     (*ctx).tablet_tools.push(tool);
     tool
@@ -1042,6 +1086,36 @@ unsafe fn tablet_tool_payload(
         button_state: 0,
         seat_button_count: 0,
     }
+}
+
+unsafe fn push_tablet_tool_button(
+    td: &TrackedDevice,
+    lib_dev: *mut LibinputDevice,
+    ctx: *mut LibinputContext,
+    out: &mut VecDeque<LibinputEvent>,
+    time_usec: u64,
+    tool: *mut LibinputTabletTool,
+    button_state: (u32, bool),
+) {
+    let (button, pressed) = button_state;
+    let seat_button_count = if pressed {
+        press_seat_button(lib_dev)
+    } else {
+        release_seat_button(lib_dev)
+    };
+    (*tool)
+        .refcount
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut payload = tablet_tool_payload(td, lib_dev, time_usec, tool, 1);
+    payload.button = button;
+    payload.button_state = u32::from(pressed);
+    payload.seat_button_count = seat_button_count;
+    out.push_back(LibinputEvent {
+        event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_BUTTON,
+        payload: EventPayload::TabletTool(payload),
+        context: ctx,
+        device: lib_dev,
+    });
 }
 
 unsafe fn active_tablet_for_touch(
@@ -1990,6 +2064,9 @@ impl BackendState {
                 context: ctx,
                 device,
             });
+            (*tool).in_proximity = false;
+            (*tool).eraser_button_mode = (*tool).wanted_eraser_button_mode;
+            (*tool).eraser_button = (*tool).wanted_eraser_button;
             tracked.tablet_tool = std::ptr::null_mut();
             tracked.tablet_zero_pressure_since = None;
             tracked.tablet_buttons_down = 0;
@@ -2041,6 +2118,58 @@ impl BackendState {
         ctx: *mut LibinputContext,
         out: &mut VecDeque<LibinputEvent>,
     ) {
+        for td in self.devices.values_mut() {
+            let Some(since) = td.tablet_eraser_pen_out_since else {
+                continue;
+            };
+            if since.elapsed() < Duration::from_millis(30) || td.tablet_tool.is_null() {
+                continue;
+            }
+            let tool = td.tablet_tool;
+            let time_usec = systime_to_usec(SystemTime::now());
+            if td.tablet_eraser_pending_tip_up {
+                td.tablet_tip_down = false;
+                td.tablet_tip_pending = None;
+                (*tool)
+                    .refcount
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                out.push_back(LibinputEvent {
+                    event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_TIP,
+                    payload: EventPayload::TabletTool(tablet_tool_payload(
+                        td,
+                        td.lib_device,
+                        time_usec,
+                        tool,
+                        1,
+                    )),
+                    context: ctx,
+                    device: td.lib_device,
+                });
+            }
+            (*tool)
+                .refcount
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            out.push_back(LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_PROXIMITY,
+                payload: EventPayload::TabletTool(tablet_tool_payload(
+                    td,
+                    td.lib_device,
+                    time_usec,
+                    tool,
+                    0,
+                )),
+                context: ctx,
+                device: td.lib_device,
+            });
+            (*tool).in_proximity = false;
+            (*tool).eraser_button_mode = (*tool).wanted_eraser_button_mode;
+            (*tool).eraser_button = (*tool).wanted_eraser_button;
+            td.tablet_tool = std::ptr::null_mut();
+            td.tablet_eraser_pen_out_since = None;
+            td.tablet_eraser_pending_tip_up = false;
+            (*td.lib_device).tablet_in_proximity = false;
+            (*td.lib_device).area = (*td.lib_device).wanted_area;
+        }
         for td in self.devices.values_mut() {
             if !td.tablet_proximity_timer_enabled || td.tablet_buttons_down != 0 {
                 continue;
@@ -2350,10 +2479,17 @@ impl BackendState {
             .filter_map(|tracked| tracked.tablet_zero_pressure_since)
             .map(|since| Duration::from_millis(150).saturating_sub(since.elapsed()))
             .min();
+        let next_eraser_timeout = self
+            .devices
+            .values()
+            .filter_map(|tracked| tracked.tablet_eraser_pen_out_since)
+            .map(|since| Duration::from_millis(30).saturating_sub(since.elapsed()))
+            .min();
         let next_timeout = [
             next_middle_timeout,
             next_debounce_timeout,
             next_tablet_timeout,
+            next_eraser_timeout,
         ]
         .into_iter()
         .flatten()
@@ -2806,7 +2942,15 @@ impl BackendState {
             td.tablet_axes_changed = false;
             return;
         };
-        if in_proximity && td.tablet_tool.is_null() && !(*lib_dev).tablet_in_proximity {
+        let had_pending_eraser_pen_out =
+            in_proximity && td.tablet_eraser_pen_out_since.take().is_some();
+        if had_pending_eraser_pen_out && td.tablet_eraser_pending_tip_up {
+            td.tablet_tip_down = true;
+            td.tablet_tip_pending = None;
+            td.tablet_eraser_pending_tip_up = false;
+        }
+        let was_in_proximity = (*lib_dev).tablet_in_proximity;
+        if in_proximity && td.tablet_tool.is_null() && !was_in_proximity {
             (*ctx).touch_arbitration_until = None;
             td.tablet_left_handed_applied = (*lib_dev).left_handed;
             (*lib_dev).area = (*lib_dev).wanted_area;
@@ -2852,6 +2996,42 @@ impl BackendState {
             td.tablet_axes_changed = false;
             return;
         }
+        if !in_proximity
+            && !td.tablet_tool.is_null()
+            && (*td.tablet_tool).tool_type == 1
+            && (*td.tablet_tool).eraser_button_mode == 1
+        {
+            if td.tablet_eraser_button_active {
+                push_tablet_tool_button(
+                    td,
+                    lib_dev,
+                    ctx,
+                    out,
+                    ts_usec,
+                    td.tablet_tool,
+                    ((*td.tablet_tool).eraser_button, false),
+                );
+                td.tablet_eraser_button_active = false;
+            }
+            td.tablet_eraser_pending_tip_up = td.tablet_tip_pending == Some(false);
+            if td.tablet_eraser_pending_tip_up {
+                td.tablet_tip_down = true;
+                td.tablet_tip_pending = None;
+            }
+            td.tablet_eraser_pen_out_since = Some(Instant::now());
+            td.tablet_x_changed = false;
+            td.tablet_y_changed = false;
+            td.tablet_pressure_changed = false;
+            td.tablet_distance_changed = false;
+            td.tablet_tilt_x_changed = false;
+            td.tablet_tilt_y_changed = false;
+            td.tablet_rotation_changed = false;
+            td.tablet_slider_changed = false;
+            td.tablet_wheel_changed = false;
+            td.tablet_axes_changed = false;
+            (*ctx).arm_timer(Some(Duration::from_millis(30)));
+            return;
+        }
         let proximity_out_raw_position = (!in_proximity).then_some((td.tablet_x, td.tablet_y));
         if !in_proximity {
             td.tablet_x = td.tablet_last_event_x;
@@ -2859,9 +3039,15 @@ impl BackendState {
             td.tablet_x_changed = false;
             td.tablet_y_changed = false;
         }
+        let converts_eraser_to_button = in_proximity
+            && td.tablet_tool_type == 2
+            && !td.tablet_tool.is_null()
+            && (*td.tablet_tool).tool_type == 1
+            && (*td.tablet_tool).eraser_button_mode == 1;
         if in_proximity
             && !td.tablet_tool.is_null()
             && (*td.tablet_tool).tool_type != td.tablet_tool_type
+            && !converts_eraser_to_button
         {
             let previous_tool = td.tablet_tool;
             (*previous_tool)
@@ -2925,8 +3111,34 @@ impl BackendState {
         if tool.is_null() {
             return;
         }
+        if in_proximity {
+            (*tool).in_proximity = true;
+        }
+        let eraser_enter = in_proximity
+            && td.tablet_tool_type == 2
+            && (*tool).tool_type == 1
+            && (*tool).eraser_button_mode == 1
+            && !td.tablet_eraser_button_active;
+        let eraser_return_to_pen = in_proximity
+            && td.tablet_tool_type == 1
+            && (*tool).tool_type == 1
+            && td.tablet_eraser_button_active;
+        let suppress_proximity = was_in_proximity
+            && (eraser_enter || eraser_return_to_pen || had_pending_eraser_pen_out);
         update_tablet_pressure_offset(td, in_proximity);
         update_tablet_tip_from_pressure(td, touch_button_changed);
+        if eraser_return_to_pen {
+            push_tablet_tool_button(
+                td,
+                lib_dev,
+                ctx,
+                out,
+                ts_usec,
+                tool,
+                ((*tool).eraser_button, false),
+            );
+            td.tablet_eraser_button_active = false;
+        }
         let tip_before_proximity =
             !in_proximity && (td.tablet_tip_down || td.tablet_tip_pending == Some(false));
         if tip_before_proximity {
@@ -2963,21 +3175,35 @@ impl BackendState {
             }
             td.tablet_buttons_down = 0;
         }
-        (*tool)
-            .refcount
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        out.push_back(LibinputEvent {
-            event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_PROXIMITY,
-            payload: EventPayload::TabletTool(tablet_tool_payload(
+        if !suppress_proximity {
+            (*tool)
+                .refcount
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            out.push_back(LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_PROXIMITY,
+                payload: EventPayload::TabletTool(tablet_tool_payload(
+                    td,
+                    lib_dev,
+                    ts_usec,
+                    tool,
+                    u32::from(in_proximity),
+                )),
+                context: ctx,
+                device: lib_dev,
+            });
+        }
+        if eraser_enter {
+            push_tablet_tool_button(
                 td,
                 lib_dev,
+                ctx,
+                out,
                 ts_usec,
                 tool,
-                u32::from(in_proximity),
-            )),
-            context: ctx,
-            device: lib_dev,
-        });
+                ((*tool).eraser_button, true),
+            );
+            td.tablet_eraser_button_active = true;
+        }
         if in_proximity && td.tablet_tip_pending.take().is_some() {
             (*tool)
                 .refcount
@@ -2992,6 +3218,9 @@ impl BackendState {
             });
         }
         if !in_proximity {
+            (*tool).in_proximity = false;
+            (*tool).eraser_button_mode = (*tool).wanted_eraser_button_mode;
+            (*tool).eraser_button = (*tool).wanted_eraser_button;
             td.tablet_tool = std::ptr::null_mut();
             td.tablet_zero_pressure_since = None;
             (*ctx).touch_arbitration_until = Some(Instant::now() + Duration::from_millis(90));

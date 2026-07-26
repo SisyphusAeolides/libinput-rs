@@ -3510,24 +3510,45 @@ pub unsafe extern "C" fn libinput_tablet_tool_config_pressure_range_get_default_
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_tool_config_eraser_button_get_modes(
-    _tool: *const libc::c_void,
+    tool: *const libc::c_void,
 ) -> u32 {
-    0
+    let tool = tool.cast::<LibinputTabletTool>();
+    if tool.is_null() {
+        0
+    } else {
+        (*tool).eraser_button_modes
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_tool_config_eraser_button_set_mode(
-    _tool: *mut libc::c_void,
-    _mode: u32,
+    tool: *mut libc::c_void,
+    mode: u32,
 ) -> u32 {
-    1
+    let tool = tool.cast::<LibinputTabletTool>();
+    if tool.is_null() || (mode != 0 && ((*tool).eraser_button_modes & mode) == 0) {
+        return 1;
+    }
+    if !matches!(mode, 0 | 1) {
+        return 2;
+    }
+    (*tool).wanted_eraser_button_mode = mode;
+    if !(*tool).in_proximity {
+        (*tool).eraser_button_mode = mode;
+    }
+    0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_tool_config_eraser_button_get_mode(
-    _tool: *const libc::c_void,
+    tool: *const libc::c_void,
 ) -> u32 {
-    0
+    let tool = tool.cast::<LibinputTabletTool>();
+    if tool.is_null() || (*tool).eraser_button_modes == 0 {
+        0
+    } else {
+        (*tool).wanted_eraser_button_mode
+    }
 }
 
 #[no_mangle]
@@ -3539,24 +3560,50 @@ pub unsafe extern "C" fn libinput_tablet_tool_config_eraser_button_get_default_m
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_tool_config_eraser_button_set_button(
-    _tool: *mut libc::c_void,
-    _button: u32,
+    tool: *mut libc::c_void,
+    button: u32,
 ) -> u32 {
-    1
+    let tool = tool.cast::<LibinputTabletTool>();
+    if tool.is_null() || (*tool).eraser_button_modes == 0 {
+        return 1;
+    }
+    let is_button = matches!(button, 0x149 | 0x14b | 0x14c)
+        || (0x100..0x140).contains(&button)
+        || (0x150..=0x151).contains(&button)
+        || (0x220..=0x223).contains(&button)
+        || (0x2c0..=0x2e7).contains(&button);
+    if !is_button {
+        return 2;
+    }
+    (*tool).wanted_eraser_button = button;
+    if !(*tool).in_proximity {
+        (*tool).eraser_button = button;
+    }
+    0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_tool_config_eraser_button_get_button(
-    _tool: *const libc::c_void,
+    tool: *const libc::c_void,
 ) -> u32 {
-    0
+    let tool = tool.cast::<LibinputTabletTool>();
+    if tool.is_null() || (*tool).eraser_button_modes == 0 {
+        0
+    } else {
+        (*tool).wanted_eraser_button
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_tool_config_eraser_button_get_default_button(
-    _tool: *const libc::c_void,
+    tool: *const libc::c_void,
 ) -> u32 {
-    0
+    let tool = tool.cast::<LibinputTabletTool>();
+    if tool.is_null() || (*tool).eraser_button_modes == 0 {
+        0
+    } else {
+        (*tool).default_eraser_button
+    }
 }
 
 #[no_mangle]
