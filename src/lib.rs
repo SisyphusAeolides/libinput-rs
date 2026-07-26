@@ -884,7 +884,9 @@ pub unsafe extern "C" fn libinput_event_get_gesture_event(
         | LibinputEventType::LIBINPUT_EVENT_GESTURE_SWIPE_END
         | LibinputEventType::LIBINPUT_EVENT_GESTURE_PINCH_BEGIN
         | LibinputEventType::LIBINPUT_EVENT_GESTURE_PINCH_UPDATE
-        | LibinputEventType::LIBINPUT_EVENT_GESTURE_PINCH_END => event,
+        | LibinputEventType::LIBINPUT_EVENT_GESTURE_PINCH_END
+        | LibinputEventType::LIBINPUT_EVENT_GESTURE_HOLD_BEGIN
+        | LibinputEventType::LIBINPUT_EVENT_GESTURE_HOLD_END => event,
         _ => std::ptr::null_mut(),
     }
 }
@@ -907,7 +909,9 @@ pub unsafe extern "C" fn libinput_event_gesture_get_time(event: *const LibinputE
         | EventPayload::GestureSwipeEnd(e)
         | EventPayload::GesturePinchBegin(e)
         | EventPayload::GesturePinchUpdate(e)
-        | EventPayload::GesturePinchEnd(e) => (e.time_usec / 1000) as u32,
+        | EventPayload::GesturePinchEnd(e)
+        | EventPayload::GestureHoldBegin(e)
+        | EventPayload::GestureHoldEnd(e) => (e.time_usec / 1000) as u32,
         _ => 0,
     }
 }
@@ -923,7 +927,9 @@ pub unsafe extern "C" fn libinput_event_gesture_get_time_usec(event: *const Libi
         | EventPayload::GestureSwipeEnd(e)
         | EventPayload::GesturePinchBegin(e)
         | EventPayload::GesturePinchUpdate(e)
-        | EventPayload::GesturePinchEnd(e) => e.time_usec,
+        | EventPayload::GesturePinchEnd(e)
+        | EventPayload::GestureHoldBegin(e)
+        | EventPayload::GestureHoldEnd(e) => e.time_usec,
         _ => 0,
     }
 }
@@ -941,7 +947,9 @@ pub unsafe extern "C" fn libinput_event_gesture_get_finger_count(
         | EventPayload::GestureSwipeEnd(e)
         | EventPayload::GesturePinchBegin(e)
         | EventPayload::GesturePinchUpdate(e)
-        | EventPayload::GesturePinchEnd(e) => e.finger_count,
+        | EventPayload::GesturePinchEnd(e)
+        | EventPayload::GestureHoldBegin(e)
+        | EventPayload::GestureHoldEnd(e) => e.finger_count,
         _ => 0,
     }
 }
@@ -1014,9 +1022,9 @@ pub unsafe extern "C" fn libinput_event_gesture_get_cancelled(
         return 0;
     }
     match &(*event).payload {
-        EventPayload::GestureSwipeEnd(e) | EventPayload::GesturePinchEnd(e) => {
-            e.cancelled as libc::c_int
-        }
+        EventPayload::GestureSwipeEnd(e)
+        | EventPayload::GesturePinchEnd(e)
+        | EventPayload::GestureHoldEnd(e) => e.cancelled as libc::c_int,
         _ => 0,
     }
 }
@@ -1632,7 +1640,7 @@ pub unsafe extern "C" fn libinput_device_config_scroll_get_methods(
         return 0;
     }
     let mut methods = 0;
-    if (*dev).has_touch {
+    if (*dev).has_touch || (*dev).has_gesture {
         methods |= 0b011;
     }
     if (*dev).supports_button_scroll {
