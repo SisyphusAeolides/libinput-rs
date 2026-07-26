@@ -13,6 +13,7 @@ BuildRequires:  cargo >= 1.75
 BuildRequires:  rust >= 1.75
 BuildRequires:  gcc
 BuildRequires:  make
+BuildRequires:  systemd-devel
 BuildRequires:  systemd-rpm-macros
 Requires:       %{_libdir}/libinput.so.10
 Requires:       systemd

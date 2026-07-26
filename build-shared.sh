@@ -7,5 +7,5 @@ cc -shared \
   -Wl,--whole-archive target/release/libinput.a -Wl,--no-whole-archive \
   -Wl,--version-script=libinput.map \
   -Wl,-soname,libinput.so.10 \
-  -ldl -lm -lpthread -lrt \
+  -ldl -lm -lpthread -lrt -ludev \
   -o target/release/libinput.so

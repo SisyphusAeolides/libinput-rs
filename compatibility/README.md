@@ -1,0 +1,20 @@
+# Compatibility gates
+
+`libinput-rs` is not a drop-in replacement until every gate in
+`libinput-1.31.3.toml` is true. Matching function names is necessary but is
+not sufficient: event behavior, configuration status values, ownership,
+restricted-file callbacks, device admission, quirks, and suspend/resume must
+also match the reference implementation.
+
+The reference is upstream libinput 1.31.3 at commit
+`26191d396d74d505541d6311f0b4ae68d791b890`, matching Fedora 45's
+`libinput.so.10.13.0` ABI.
+
+Use `scripts/check-abi.sh` for symbol, symbol-version, version-node, and SONAME
+parity. Use `scripts/run-upstream-suite.sh` with an upstream build directory
+to run its test binary against the Rust library without changing the
+installed system library.
+
+The gate file records only complete test groups. Individual passing tests are
+useful progress, but do not turn a group green.
+

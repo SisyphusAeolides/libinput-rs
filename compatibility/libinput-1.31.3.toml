@@ -1,0 +1,42 @@
+target_version = "1.31.3"
+target_commit = "26191d396d74d505541d6311f0b4ae68d791b890"
+soname = "libinput.so.10"
+public_symbols = 309
+version_nodes = 25
+
+[gates]
+symbol_versions = true
+soname = true
+deviceless = true
+device = false
+gestures = false
+keyboard = false
+log = false
+misc = false
+pad = false
+path = false
+plugins = false
+pointer = false
+quirks = false
+switch = false
+tablet = false
+tablet_eraser = false
+tablet_left_handed = false
+tablet_proximity = false
+tablet_tip = false
+totem = false
+touch = false
+touchpad = false
+touchpad_buttons = false
+touchpad_dwt = false
+touchpad_palm = false
+touchpad_tap = false
+touchpad_tap_drag = false
+touchpad_tap_palm = false
+trackball = false
+trackpoint = false
+udev = false
+valgrind = false
+display_managers = false
+rpm_transaction = false
+

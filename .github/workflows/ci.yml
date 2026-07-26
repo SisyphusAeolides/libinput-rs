@@ -21,7 +21,7 @@ jobs:
       - name: Install DNF dependencies
         run: >-
           dnf -y install rust cargo clippy rustfmt gcc make binutils rpm-build
-          rpmdevtools rpmlint systemd-rpm-macros
+          rpmdevtools rpmlint systemd-devel systemd-rpm-macros
 
       - name: Check Rust
         run: make check

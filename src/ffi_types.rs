@@ -198,12 +198,19 @@ pub struct LibinputDevice {
     pub devnode: CString,
     pub vendor_id: u32,
     pub product_id: u32,
+    pub bus_type: u32,
     pub has_keyboard: bool,
     pub has_pointer: bool,
     pub has_touch: bool,
     pub has_gesture: bool,
     pub has_switch: bool,
     pub has_tablet: bool,
+    pub has_tablet_pad: bool,
+    pub touch_count: i32,
+    pub width_mm: Option<f64>,
+    pub height_mm: Option<f64>,
+    pub send_events_modes: u32,
+    pub send_events_mode: u32,
     pub tap_enabled: bool,
     pub tap_button_map: u32, // 0=LRM 1=LMR
     pub natural_scroll: bool,
@@ -219,6 +226,7 @@ pub struct LibinputDevice {
     pub user_data: *mut libc::c_void,
     pub seat: *mut LibinputSeat,
     pub context: *mut LibinputContext,
+    pub udev_device: *mut libc::c_void,
 }
 
 unsafe impl Send for LibinputDevice {}
@@ -236,12 +244,19 @@ impl LibinputDevice {
             devnode: CString::new(devnode).unwrap_or_else(|_| CString::new("").unwrap()),
             vendor_id: 0,
             product_id: 0,
+            bus_type: 0,
             has_keyboard: false,
-            has_pointer: true,
+            has_pointer: false,
             has_touch: false,
             has_gesture: false,
             has_switch: false,
             has_tablet: false,
+            has_tablet_pad: false,
+            touch_count: 0,
+            width_mm: None,
+            height_mm: None,
+            send_events_modes: 1,
+            send_events_mode: 0,
             tap_enabled: true,
             tap_button_map: 0,
             natural_scroll: true,
@@ -257,6 +272,18 @@ impl LibinputDevice {
             user_data: std::ptr::null_mut(),
             seat,
             context,
+            udev_device: std::ptr::null_mut(),
+        }
+    }
+}
+
+impl Drop for LibinputDevice {
+    fn drop(&mut self) {
+        if !self.udev_device.is_null() {
+            unsafe {
+                crate::udev::udev_device_unref(self.udev_device);
+            }
+            self.udev_device = std::ptr::null_mut();
         }
     }
 }
@@ -274,8 +301,14 @@ pub struct LibinputContext {
     pub seat: *mut LibinputSeat,
     pub refcount: AtomicI32,
     pub log_handler: Option<
-        unsafe extern "C" fn(ctx: *mut LibinputContext, priority: u32, msg: *const libc::c_char),
+        unsafe extern "C" fn(
+            ctx: *mut LibinputContext,
+            priority: u32,
+            format: *const libc::c_char,
+            args: *mut libc::c_void,
+        ),
     >,
+    pub log_priority: u32,
     pub backend: Mutex<BackendState>,
     pub backend_kind: BackendKind,
     pub seat_assigned: bool,
@@ -309,6 +342,7 @@ impl LibinputContext {
             seat,
             refcount: AtomicI32::new(1),
             log_handler: None,
+            log_priority: 30,
             backend: Mutex::new(backend),
             backend_kind,
             seat_assigned: false,
@@ -353,6 +387,11 @@ impl LibinputContext {
 
 impl Drop for LibinputContext {
     fn drop(&mut self) {
+        if let Ok(backend) = self.backend.get_mut() {
+            unsafe {
+                backend.close_all(self.interface, self.user_data);
+            }
+        }
         if self.epoll_fd >= 0 {
             unsafe {
                 libc::close(self.epoll_fd);

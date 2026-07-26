@@ -1,13 +1,14 @@
-//! libinput-rs: drop-in Rust replacement for libinput.so
+//! Experimental Rust implementation of the libinput.so ABI.
 //!
-//! Exports the complete C ABI surface defined by <libinput.h>.
-//! Applications that link against libinput can use this library
-//! transparently via LD_PRELOAD or by replacing the .so symlink.
+//! The complete C ABI surface is exported, but behavioral compatibility is
+//! still gated by the upstream test suite. Do not install this library over a
+//! system libinput until every compatibility gate is complete.
 
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
 mod backend;
 mod ffi_types;
+mod udev;
 
 use crate::ffi_types::{
     BackendKind, EventPayload, LibinputContext, LibinputDevice, LibinputEvent, LibinputEventType,
@@ -16,6 +17,16 @@ use crate::ffi_types::{
 
 use std::ffi::CStr;
 use std::os::unix::io::RawFd;
+
+unsafe extern "C" {
+    fn input_emit_log(
+        handler: *mut libc::c_void,
+        context: *mut libc::c_void,
+        priority: u32,
+        format: *const libc::c_char,
+        ...
+    );
+}
 
 #[repr(C)]
 pub struct LibinputConfigAreaRectangle {
@@ -139,17 +150,28 @@ pub unsafe extern "C" fn libinput_path_add_device(
     let devnode = CStr::from_ptr(path).to_string_lossy().into_owned();
     let p = std::path::PathBuf::from(&devnode);
     let mut tmp: Vec<LibinputEvent> = Vec::new();
+    let old_len = (*ctx).devices.len();
     if let Ok(mut backend) = (*ctx).backend.lock() {
         backend.try_open(ctx, &p, &mut tmp);
     }
     for ev in tmp {
         (*ctx).event_queue.push_back(ev);
     }
-    (*ctx)
-        .devices
-        .last()
-        .copied()
-        .unwrap_or(std::ptr::null_mut())
+    if (*ctx).devices.len() == old_len + 1 {
+        (&(*ctx).devices)[old_len]
+    } else {
+        if (*ctx).log_priority <= 30 {
+            if let Some(handler) = (*ctx).log_handler {
+                input_emit_log(
+                    handler as *mut libc::c_void,
+                    ctx.cast(),
+                    30,
+                    c"failed to add device\n".as_ptr(),
+                );
+            }
+        }
+        std::ptr::null_mut()
+    }
 }
 
 #[no_mangle]
@@ -157,7 +179,20 @@ pub unsafe extern "C" fn libinput_path_remove_device(dev: *mut LibinputDevice) {
     if dev.is_null() {
         return;
     }
-    (*dev).name = std::ffi::CString::new("").unwrap();
+    let ctx = (*dev).context;
+    if ctx.is_null() || (*ctx).backend_kind != BackendKind::Path {
+        return;
+    }
+    let mut events = std::collections::VecDeque::new();
+    let removed = if let Ok(mut backend) = (*ctx).backend.lock() {
+        backend.remove_device(ctx, dev, &mut events)
+    } else {
+        false
+    };
+    if removed {
+        (*ctx).devices.retain(|candidate| *candidate != dev);
+        (*ctx).event_queue.extend(events);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,7 +1052,7 @@ pub unsafe extern "C" fn libinput_device_touch_get_touch_count(
     if dev.is_null() || !(*dev).has_touch {
         return 0;
     }
-    10
+    (*dev).touch_count
 }
 
 #[no_mangle]
@@ -1029,12 +1064,13 @@ pub unsafe extern "C" fn libinput_device_has_capability(
         return 0;
     }
     let has = match capability {
-        1 => (*dev).has_keyboard,
-        2 => (*dev).has_pointer,
-        3 => (*dev).has_touch,
-        4 => (*dev).has_gesture,
-        5 => (*dev).has_switch,
-        6 => (*dev).has_tablet,
+        0 => (*dev).has_keyboard,
+        1 => (*dev).has_pointer,
+        2 => (*dev).has_touch,
+        3 => (*dev).has_tablet,
+        4 => (*dev).has_tablet_pad,
+        5 => (*dev).has_gesture,
+        6 => (*dev).has_switch,
         _ => false,
     };
     has as libc::c_int
@@ -1903,18 +1939,30 @@ pub unsafe extern "C" fn libinput_config_status_to_str(status: u32) -> *const li
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_log_set_priority(_ctx: *mut LibinputContext, _priority: u32) {}
+pub unsafe extern "C" fn libinput_log_set_priority(ctx: *mut LibinputContext, priority: u32) {
+    if !ctx.is_null() {
+        (*ctx).log_priority = priority;
+    }
+}
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_log_get_priority(_ctx: *const LibinputContext) -> u32 {
-    3
+pub unsafe extern "C" fn libinput_log_get_priority(ctx: *const LibinputContext) -> u32 {
+    if ctx.is_null() {
+        return 30;
+    }
+    (*ctx).log_priority
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_log_set_handler(
     ctx: *mut LibinputContext,
     handler: Option<
-        unsafe extern "C" fn(ctx: *mut LibinputContext, priority: u32, msg: *const libc::c_char),
+        unsafe extern "C" fn(
+            ctx: *mut LibinputContext,
+            priority: u32,
+            format: *const libc::c_char,
+            args: *mut libc::c_void,
+        ),
     >,
 ) {
     if ctx.is_null() {
@@ -2063,27 +2111,38 @@ pub unsafe extern "C" fn libinput_device_config_scroll_get_default_button(
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_send_events_get_modes(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    0b11
+    if dev.is_null() {
+        return 0;
+    }
+    (*dev).send_events_modes
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_send_events_set_mode(
     dev: *mut LibinputDevice,
-    _mode: u32,
+    mode: u32,
 ) -> u32 {
     if dev.is_null() {
         return 1;
     }
+    let supported = (*dev).send_events_modes;
+    if mode & !supported != 0 {
+        return 1;
+    }
+    (*dev).send_events_mode = if mode & 1 != 0 { 1 } else { mode };
     0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_send_events_get_mode(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    0
+    if dev.is_null() {
+        return 0;
+    }
+    (*dev).send_events_mode
 }
 
 #[no_mangle]
@@ -2134,29 +2193,40 @@ pub unsafe extern "C" fn libinput_device_group_get_user_data(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_device_get_id_bustype(_dev: *const LibinputDevice) -> u32 {
-    0
+pub unsafe extern "C" fn libinput_device_get_id_bustype(dev: *const LibinputDevice) -> u32 {
+    if dev.is_null() {
+        return 0;
+    }
+    (*dev).bus_type
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_get_size(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
     width: *mut f64,
     height: *mut f64,
 ) -> libc::c_int {
-    if width.is_null() || height.is_null() {
+    if dev.is_null() || width.is_null() || height.is_null() {
         return 0;
     }
-    *width = 0.0;
-    *height = 0.0;
-    1
+    match ((*dev).width_mm, (*dev).height_mm) {
+        (Some(w), Some(h)) => {
+            *width = w;
+            *height = h;
+            0
+        }
+        _ => -1,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_get_udev_device(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> *mut libc::c_void {
-    std::ptr::null_mut()
+    if dev.is_null() || (*dev).udev_device.is_null() {
+        return std::ptr::null_mut();
+    }
+    udev::udev_device_ref((*dev).udev_device)
 }
 
 #[no_mangle]

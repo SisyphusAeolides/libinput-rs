@@ -3,8 +3,9 @@ LIBDIR ?= $(PREFIX)/lib64
 UNITDIR ?= $(PREFIX)/lib/systemd/system
 DESTDIR ?=
 AUSTRAL ?= austral
+REFERENCE_LIBINPUT ?= /usr/lib64/libinput.so.10
 
-.PHONY: all build shared check packaging-check test proofs proofs-strict install
+.PHONY: all build shared check packaging-check test abi-check proofs proofs-strict install
 
 all: build shared
 
@@ -29,11 +30,18 @@ packaging-check:
 test:
 	cargo test --locked
 
+abi-check: shared
+	scripts/check-abi.sh "$(REFERENCE_LIBINPUT)" target/release/libinput.so
+
 proofs:
 	cd proofs/agda && agda FailOpen.agda
+	cd proofs/agda && agda ResourceLifecycle.agda
 	cd proofs/idris && idris2 --check FailOpen.idr
+	cd proofs/idris && idris2 --check ResourceLifecycle.idr
 	@if command -v "$(AUSTRAL)" >/dev/null 2>&1; then \
-		cd proofs/austral && "$(AUSTRAL)" compile --target-type=tc FailOpen.aui,FailOpen.aum; \
+		cd proofs/austral && \
+		"$(AUSTRAL)" compile --target-type=tc FailOpen.aui,FailOpen.aum && \
+		"$(AUSTRAL)" compile --target-type=tc ResourceLifecycle.aui,ResourceLifecycle.aum; \
 	else \
 		echo "Austral compiler not found; Agda and Idris proofs passed"; \
 	fi

@@ -14,9 +14,48 @@ use evdev::{AbsoluteAxisCode, Device, EventType, InputEvent, KeyCode, RelativeAx
 use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
 
 use crate::ffi_types::{
-    EventPayload, GestureEvent, KeyboardKeyEvent, LibinputContext, LibinputDevice, LibinputEvent,
-    LibinputEventType, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
+    BackendKind, EventPayload, GestureEvent, KeyboardKeyEvent, LibinputContext, LibinputDevice,
+    LibinputEvent, LibinputEventType, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
 };
+
+struct RestrictedFdGuard {
+    fd: RawFd,
+    close: Option<unsafe extern "C" fn(RawFd, *mut libc::c_void)>,
+    user_data: *mut libc::c_void,
+    armed: bool,
+}
+
+impl RestrictedFdGuard {
+    fn new(
+        fd: RawFd,
+        close: Option<unsafe extern "C" fn(RawFd, *mut libc::c_void)>,
+        user_data: *mut libc::c_void,
+    ) -> Self {
+        Self {
+            fd,
+            close,
+            user_data,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) -> RawFd {
+        self.armed = false;
+        self.fd
+    }
+}
+
+impl Drop for RestrictedFdGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(close) = self.close {
+                unsafe { close(self.fd, self.user_data) };
+            } else {
+                unsafe { libc::close(self.fd) };
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Multi-touch slot
@@ -52,6 +91,7 @@ struct HeldKey {
 
 struct TrackedDevice {
     device: Device,
+    restricted_fd: Option<RawFd>,
     path: PathBuf,
     is_absolute: bool,
     is_keyboard: bool,
@@ -94,22 +134,23 @@ struct TrackedDevice {
 unsafe impl Send for TrackedDevice {}
 
 impl TrackedDevice {
-    fn new(device: Device, path: PathBuf, lib_device: *mut LibinputDevice) -> Self {
-        let is_absolute = device.supported_events().contains(EventType::ABSOLUTE);
-        let is_keyboard = device
-            .supported_keys()
-            .is_some_and(|k| k.contains(KeyCode::KEY_A));
-        // Use INPUT_PROP_POINTER for reliable pointer classification
-        let props = device.properties();
-        let is_pointer = props.contains(evdev::PropType::POINTER)
-            || props.contains(evdev::PropType::BUTTONPAD)
-            || (!is_keyboard && device.supported_events().contains(EventType::RELATIVE));
+    fn new(
+        device: Device,
+        restricted_fd: Option<RawFd>,
+        path: PathBuf,
+        lib_device: *mut LibinputDevice,
+        uses_absolute_events: bool,
+        is_keyboard: bool,
+        is_pointer: bool,
+    ) -> Self {
+        let is_absolute = uses_absolute_events;
 
         // Pre-allocate 10 MT slots (covers every consumer touchpad)
         let mt_slots = vec![MtSlot::default(); 10];
 
         Self {
             device,
+            restricted_fd,
             path,
             is_absolute,
             is_keyboard,
@@ -136,6 +177,28 @@ impl TrackedDevice {
             last_typing_time: None,
             lib_device,
         }
+    }
+
+    unsafe fn close(
+        self,
+        interface: *const crate::ffi_types::LibinputInterface,
+        user_data: *mut libc::c_void,
+    ) -> *mut LibinputDevice {
+        let TrackedDevice {
+            device,
+            restricted_fd,
+            lib_device,
+            ..
+        } = self;
+        drop(device);
+        if let Some(fd) = restricted_fd {
+            if !interface.is_null() {
+                if let Some(close_fn) = (*interface).close_restricted {
+                    close_fn(fd, user_data);
+                }
+            }
+        }
+        lib_device
     }
 
     /// Count currently active MT slots.
@@ -236,7 +299,7 @@ impl BackendState {
         out: &mut Vec<LibinputEvent>,
     ) {
         let interface = &*(*ctx).interface;
-        let device = if let Some(open_fn) = interface.open_restricted {
+        let (device, restricted_guard) = if let Some(open_fn) = interface.open_restricted {
             let c_path = match std::ffi::CString::new(path.to_str().unwrap_or("")) {
                 Ok(c) => c,
                 Err(_) => return,
@@ -249,17 +312,23 @@ impl BackendState {
             if raw_fd < 0 {
                 return;
             }
+            let guard =
+                RestrictedFdGuard::new(raw_fd, interface.close_restricted, (*ctx).user_data);
+            let device_fd = libc::fcntl(raw_fd, libc::F_DUPFD_CLOEXEC, 0);
+            if device_fd < 0 {
+                return;
+            }
             let owned_fd: std::os::fd::OwnedFd =
-                unsafe { std::os::fd::FromRawFd::from_raw_fd(raw_fd) };
+                unsafe { std::os::fd::FromRawFd::from_raw_fd(device_fd) };
             match Device::from_fd(owned_fd) {
-                Ok(d) => d,
+                Ok(d) => (d, Some(guard)),
                 Err(_) => return,
             }
         } else {
             let Ok(d) = Device::open(path) else {
                 return;
             };
-            d
+            (d, None)
         };
 
         let name = device.name().unwrap_or("Unknown").to_string();
@@ -270,15 +339,90 @@ impl BackendState {
         }
 
         let props = device.properties();
-        let is_pointer = props.contains(evdev::PropType::POINTER)
-            || props.contains(evdev::PropType::BUTTONPAD)
-            || device.supported_events().contains(EventType::RELATIVE);
-        let is_keyboard = device
-            .supported_keys()
-            .is_some_and(|k| k.contains(KeyCode::KEY_A));
-        let is_absolute = device.supported_events().contains(EventType::ABSOLUTE);
-
-        if !is_pointer && !is_keyboard {
+        let keys = device.supported_keys();
+        let rel = device.supported_relative_axes();
+        let abs = device.supported_absolute_axes();
+        let udev_device = crate::udev::UdevDevice::from_path(path);
+        let udev_pointer = udev_device.as_ptr();
+        let has_tag = |tag| crate::udev::property_equals(udev_pointer, tag, "1");
+        let tag_keyboard = has_tag("ID_INPUT_KEYBOARD");
+        let tag_touchpad = has_tag("ID_INPUT_TOUCHPAD");
+        let tag_touchscreen = has_tag("ID_INPUT_TOUCHSCREEN");
+        let tag_tablet = has_tag("ID_INPUT_TABLET");
+        let tag_tablet_pad = has_tag("ID_INPUT_TABLET_PAD");
+        let tag_switch = has_tag("ID_INPUT_SWITCH");
+        let tag_mouse = has_tag("ID_INPUT_MOUSE");
+        let tag_pointing_stick = has_tag("ID_INPUT_POINTINGSTICK");
+        let has_class_tag = tag_keyboard
+            || tag_touchpad
+            || tag_touchscreen
+            || tag_tablet
+            || tag_tablet_pad
+            || tag_switch
+            || tag_mouse
+            || tag_pointing_stick;
+        let use_evdev_fallback = !has_class_tag;
+        let is_keyboard = tag_keyboard
+            || (use_evdev_fallback && keys.is_some_and(|k| k.iter().any(|key| key.0 < 0x100)));
+        let has_pen = keys.is_some_and(|k| {
+            k.contains(KeyCode::BTN_TOOL_PEN)
+                || k.contains(KeyCode::BTN_TOOL_RUBBER)
+                || k.contains(KeyCode::BTN_TOOL_BRUSH)
+                || k.contains(KeyCode::BTN_TOOL_PENCIL)
+                || k.contains(KeyCode::BTN_TOOL_AIRBRUSH)
+        });
+        let has_finger = keys.is_some_and(|k| k.contains(KeyCode::BTN_TOOL_FINGER));
+        let has_touch_button = keys.is_some_and(|k| k.contains(KeyCode::BTN_TOUCH));
+        let has_abs_xy = abs.is_some_and(|a| {
+            a.contains(AbsoluteAxisCode::ABS_X) && a.contains(AbsoluteAxisCode::ABS_Y)
+        });
+        let has_mt_xy = abs.is_some_and(|a| {
+            a.contains(AbsoluteAxisCode::ABS_MT_POSITION_X)
+                && a.contains(AbsoluteAxisCode::ABS_MT_POSITION_Y)
+        });
+        let is_touchpad = tag_touchpad
+            || (use_evdev_fallback
+                && !has_pen
+                && (props.contains(evdev::PropType::POINTER)
+                    || props.contains(evdev::PropType::BUTTONPAD)
+                    || has_finger)
+                && (has_abs_xy || has_mt_xy));
+        let has_touch = tag_touchscreen
+            || (use_evdev_fallback
+                && !has_pen
+                && !is_touchpad
+                && has_touch_button
+                && (has_abs_xy || has_mt_xy));
+        let has_tablet = tag_tablet || (use_evdev_fallback && has_pen);
+        let input_id = device.input_id();
+        let has_tablet_pad = tag_tablet_pad
+            || (use_evdev_fallback
+                && !has_pen
+                && !has_finger
+                && !has_touch_button
+                && device.supported_events().contains(EventType::ABSOLUTE)
+                && keys.is_some_and(|k| {
+                    k.contains(KeyCode::BTN_0)
+                        || (input_id.vendor() == 0x056a && k.iter().any(|key| key.0 >= 0x100))
+                }));
+        let has_switch = tag_switch
+            || (use_evdev_fallback
+                && device
+                    .supported_switches()
+                    .is_some_and(|s| s.iter().next().is_some()));
+        let has_relative_pointer = rel.is_some_and(|r| {
+            r.contains(RelativeAxisCode::REL_X)
+                || r.contains(RelativeAxisCode::REL_Y)
+                || r.contains(RelativeAxisCode::REL_WHEEL)
+        });
+        let is_pointer = is_touchpad || tag_mouse || tag_pointing_stick || has_relative_pointer;
+        if !is_pointer
+            && !is_keyboard
+            && !has_touch
+            && !has_tablet
+            && !has_tablet_pad
+            && !has_switch
+        {
             return;
         }
 
@@ -290,8 +434,61 @@ impl BackendState {
         )));
         (*lib_dev).has_pointer = is_pointer;
         (*lib_dev).has_keyboard = is_keyboard;
-        (*lib_dev).has_touch = is_absolute && is_pointer;
-        (*lib_dev).has_gesture = is_absolute && is_pointer;
+        (*lib_dev).has_touch = has_touch;
+        (*lib_dev).has_gesture = is_touchpad;
+        (*lib_dev).has_switch = has_switch;
+        (*lib_dev).has_tablet = has_tablet;
+        (*lib_dev).has_tablet_pad = has_tablet_pad;
+        (*lib_dev).vendor_id = input_id.vendor() as u32;
+        (*lib_dev).product_id = input_id.product() as u32;
+        (*lib_dev).bus_type = input_id.bus_type().0 as u32;
+        (*lib_dev).udev_device = udev_device.into_raw();
+        (*lib_dev).sysname =
+            std::ffi::CString::new(path.file_name().and_then(|s| s.to_str()).unwrap_or(""))
+                .unwrap_or_else(|_| std::ffi::CString::new("").unwrap());
+        let external_touchpad = crate::udev::property_equals(
+            (*lib_dev).udev_device,
+            "ID_INPUT_TOUCHPAD_INTEGRATION",
+            "external",
+        );
+        (*lib_dev).send_events_modes =
+            if is_touchpad && !external_touchpad && input_id.vendor() != 0x056a {
+                0b11
+            } else {
+                0b01
+            };
+
+        if let Ok(absinfo) = device.get_absinfo() {
+            let mut x = None;
+            let mut y = None;
+            let mut slots = None;
+            for (axis, info) in absinfo {
+                if axis == AbsoluteAxisCode::ABS_X || axis == AbsoluteAxisCode::ABS_MT_POSITION_X {
+                    if info.resolution() > 0 {
+                        x = Some(
+                            (info.maximum() - info.minimum()) as f64 / info.resolution() as f64,
+                        );
+                    }
+                } else if axis == AbsoluteAxisCode::ABS_Y
+                    || axis == AbsoluteAxisCode::ABS_MT_POSITION_Y
+                {
+                    if info.resolution() > 0 {
+                        y = Some(
+                            (info.maximum() - info.minimum()) as f64 / info.resolution() as f64,
+                        );
+                    }
+                } else if axis == AbsoluteAxisCode::ABS_MT_SLOT {
+                    slots = Some(info.maximum() - info.minimum() + 1);
+                }
+            }
+            (*lib_dev).width_mm = x;
+            (*lib_dev).height_mm = y;
+            (*lib_dev).touch_count = if has_touch || is_touchpad {
+                slots.unwrap_or(1)
+            } else {
+                0
+            };
+        }
         (*ctx).devices.push(lib_dev);
 
         let fd = {
@@ -304,7 +501,16 @@ impl BackendState {
 
         (*ctx).register_fd(fd);
 
-        let td = TrackedDevice::new(device, path.to_path_buf(), lib_dev);
+        let restricted_fd = restricted_guard.map(RestrictedFdGuard::disarm);
+        let td = TrackedDevice::new(
+            device,
+            restricted_fd,
+            path.to_path_buf(),
+            lib_dev,
+            is_touchpad || has_touch || has_tablet,
+            is_keyboard,
+            is_pointer,
+        );
         self.devices.insert(fd, td);
 
         out.push(LibinputEvent {
@@ -362,13 +568,17 @@ impl BackendState {
             let cfg_dwt = unsafe { &*lib_dev }.dwt_enabled;
             let cfg_accel = unsafe { &*lib_dev }.accel_speed as f32 + 1.0;
 
+            if unsafe { &*lib_dev }.send_events_mode == 1 {
+                continue;
+            }
+
             let global_typing = self.global_typing_time;
 
             for ev in &batch {
                 let ts_usec = systime_to_usec(ev.timestamp());
 
                 // ---- Keyboard device ----
-                if is_kbd && !is_abs {
+                if is_kbd && !is_abs && !is_ptr {
                     Self::process_keyboard_event(
                         ev,
                         ts_usec,
@@ -404,11 +614,12 @@ impl BackendState {
         for fd in dead_fds {
             if let Some(td) = self.devices.remove(&fd) {
                 (*ctx).unregister_fd(fd);
+                let lib_device = td.close((*ctx).interface, (*ctx).user_data);
                 out.push_back(LibinputEvent {
                     event_type: LibinputEventType::LIBINPUT_EVENT_DEVICE_REMOVED,
                     payload: EventPayload::DeviceRemoved,
                     context: ctx,
-                    device: td.lib_device,
+                    device: lib_device,
                 });
             }
         }
@@ -423,7 +634,7 @@ impl BackendState {
         ctx: *mut LibinputContext,
         out: &mut VecDeque<LibinputEvent>,
     ) {
-        if self.suspended {
+        if self.suspended || (*ctx).backend_kind != BackendKind::Udev {
             return;
         }
         let Some(ref ino) = self.inotify else { return };
@@ -455,12 +666,51 @@ impl BackendState {
         self.suspended = true;
         for (fd, td) in self.devices.drain() {
             (*ctx).unregister_fd(fd);
+            let lib_device = td.close((*ctx).interface, (*ctx).user_data);
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_DEVICE_REMOVED,
                 payload: EventPayload::DeviceRemoved,
                 context: ctx,
-                device: td.lib_device,
+                device: lib_device,
             });
+        }
+    }
+
+    pub unsafe fn remove_device(
+        &mut self,
+        ctx: *mut LibinputContext,
+        device: *mut LibinputDevice,
+        out: &mut VecDeque<LibinputEvent>,
+    ) -> bool {
+        let fd = self
+            .devices
+            .iter()
+            .find_map(|(fd, tracked)| (tracked.lib_device == device).then_some(*fd));
+        let Some(fd) = fd else {
+            return false;
+        };
+        let tracked = self
+            .devices
+            .remove(&fd)
+            .expect("tracked device disappeared");
+        (*ctx).unregister_fd(fd);
+        let lib_device = tracked.close((*ctx).interface, (*ctx).user_data);
+        out.push_back(LibinputEvent {
+            event_type: LibinputEventType::LIBINPUT_EVENT_DEVICE_REMOVED,
+            payload: EventPayload::DeviceRemoved,
+            context: ctx,
+            device: lib_device,
+        });
+        true
+    }
+
+    pub unsafe fn close_all(
+        &mut self,
+        interface: *const crate::ffi_types::LibinputInterface,
+        user_data: *mut libc::c_void,
+    ) {
+        for (_, tracked) in self.devices.drain() {
+            tracked.close(interface, user_data);
         }
     }
 
