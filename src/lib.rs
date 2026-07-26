@@ -89,6 +89,24 @@ pub(crate) unsafe fn emit_error_log(ctx: *mut LibinputContext, message: &str) {
     );
 }
 
+pub(crate) unsafe fn emit_info_log(ctx: *mut LibinputContext, message: &str) {
+    if ctx.is_null() || (*ctx).log_priority > 20 {
+        return;
+    }
+    let Some(handler) = (*ctx).log_handler else {
+        return;
+    };
+    let Ok(message) = std::ffi::CString::new(format!("{message}\n")) else {
+        return;
+    };
+    input_emit_log(
+        handler as *mut libc::c_void,
+        ctx.cast(),
+        20,
+        message.as_ptr(),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Context lifecycle
 // ---------------------------------------------------------------------------
@@ -195,6 +213,7 @@ pub unsafe extern "C" fn libinput_path_add_device(
         .metadata()
         .is_ok_and(|metadata| metadata.file_type().is_char_device())
     {
+        emit_error_log(ctx, "failed to add device");
         return std::ptr::null_mut();
     }
     let mut tmp: Vec<LibinputEvent> = Vec::new();
@@ -209,18 +228,10 @@ pub unsafe extern "C" fn libinput_path_add_device(
         if let Ok(mut backend) = (*ctx).backend.lock() {
             backend.remember_path(&p);
         }
+        emit_info_log(ctx, "device added");
         (&(*ctx).devices)[old_len]
     } else {
-        if (*ctx).log_priority <= 30 {
-            if let Some(handler) = (*ctx).log_handler {
-                input_emit_log(
-                    handler as *mut libc::c_void,
-                    ctx.cast(),
-                    30,
-                    c"failed to add device\n".as_ptr(),
-                );
-            }
-        }
+        emit_error_log(ctx, "failed to add device");
         std::ptr::null_mut()
     }
 }

@@ -165,6 +165,7 @@ struct TrackedDevice {
     current_dy: i32,
     abs_x_range: Option<(i32, i32)>,
     abs_y_range: Option<(i32, i32)>,
+    axis_range_warning_at: Option<Instant>,
     tap_emitted: bool,
     touch_start_time: Option<Instant>,
     last_movement_time: Option<Instant>,
@@ -345,6 +346,7 @@ impl TrackedDevice {
             current_dy: 0,
             abs_x_range,
             abs_y_range,
+            axis_range_warning_at: None,
             tap_emitted: false,
             touch_start_time: None,
             last_movement_time: None,
@@ -2913,6 +2915,23 @@ impl BackendState {
             EventType::ABSOLUTE => {
                 let code = ev.code();
                 let val = ev.value();
+
+                let expected_range = if code == AbsoluteAxisCode::ABS_X.0 {
+                    td.abs_x_range
+                } else if code == AbsoluteAxisCode::ABS_Y.0 {
+                    td.abs_y_range
+                } else {
+                    None
+                };
+                if expected_range.is_some_and(|(minimum, maximum)| val < minimum || val > maximum)
+                    && match td.axis_range_warning_at {
+                        Some(last) => last.elapsed() >= Duration::from_secs(5 * 60),
+                        None => true,
+                    }
+                {
+                    td.axis_range_warning_at = Some(Instant::now());
+                    crate::emit_info_log(ctx, "input value is outside expected range");
+                }
 
                 if code == AbsoluteAxisCode::ABS_MT_TRACKING_ID.0 {
                     td.protocol_a_tracking_id = Some(val);
