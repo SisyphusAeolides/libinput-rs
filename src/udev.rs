@@ -74,3 +74,12 @@ pub unsafe fn property_equals(device: *mut libc::c_void, key: &str, expected: &s
     let value = udev_device_get_property_value(device, key.as_ptr());
     !value.is_null() && CStr::from_ptr(value).to_bytes() == expected.as_bytes()
 }
+
+pub unsafe fn property_value(device: *mut libc::c_void, key: &str) -> Option<String> {
+    if device.is_null() {
+        return None;
+    }
+    let key = CString::new(key).ok()?;
+    let value = udev_device_get_property_value(device, key.as_ptr());
+    (!value.is_null()).then(|| CStr::from_ptr(value).to_string_lossy().into_owned())
+}

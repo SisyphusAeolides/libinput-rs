@@ -8,11 +8,12 @@
 
 mod backend;
 mod ffi_types;
+mod quirks;
 mod udev;
 
 use crate::ffi_types::{
-    BackendKind, EventPayload, LibinputContext, LibinputDevice, LibinputEvent, LibinputEventType,
-    LibinputInterface, LibinputSeat,
+    BackendKind, EventPayload, LibinputContext, LibinputDevice, LibinputDeviceGroup, LibinputEvent,
+    LibinputEventType, LibinputInterface, LibinputSeat,
 };
 
 use std::ffi::CStr;
@@ -50,6 +51,42 @@ unsafe fn populate_events(ctx: *mut LibinputContext) {
         backend.drain_into_queue(ctx, &mut tmp);
     }
     ctx_ref.event_queue.extend(tmp);
+}
+
+pub(crate) unsafe fn emit_debug_log(ctx: *mut LibinputContext, message: &str) {
+    if ctx.is_null() || (*ctx).log_priority > 10 {
+        return;
+    }
+    let Some(handler) = (*ctx).log_handler else {
+        return;
+    };
+    let Ok(message) = std::ffi::CString::new(format!("{message}\n")) else {
+        return;
+    };
+    input_emit_log(
+        handler as *mut libc::c_void,
+        ctx.cast(),
+        10,
+        message.as_ptr(),
+    );
+}
+
+pub(crate) unsafe fn emit_error_log(ctx: *mut LibinputContext, message: &str) {
+    if ctx.is_null() || (*ctx).log_priority > 30 {
+        return;
+    }
+    let Some(handler) = (*ctx).log_handler else {
+        return;
+    };
+    let Ok(message) = std::ffi::CString::new(format!("{message}\n")) else {
+        return;
+    };
+    input_emit_log(
+        handler as *mut libc::c_void,
+        ctx.cast(),
+        30,
+        message.as_ptr(),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -124,7 +161,11 @@ pub unsafe extern "C" fn libinput_udev_assign_seat(
     {
         return -1;
     }
-    let name = CStr::from_ptr(seat_name).to_string_lossy().into_owned();
+    let seat_name = CStr::from_ptr(seat_name);
+    if seat_name.to_bytes().len() > 255 {
+        return -1;
+    }
+    let name = seat_name.to_string_lossy().into_owned();
     if let Ok(cname) = std::ffi::CString::new(name) {
         (*(*ctx).seat).physical_name = cname;
     }
@@ -149,6 +190,13 @@ pub unsafe extern "C" fn libinput_path_add_device(
     }
     let devnode = CStr::from_ptr(path).to_string_lossy().into_owned();
     let p = std::path::PathBuf::from(&devnode);
+    use std::os::unix::fs::FileTypeExt;
+    if !p
+        .metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_char_device())
+    {
+        return std::ptr::null_mut();
+    }
     let mut tmp: Vec<LibinputEvent> = Vec::new();
     let old_len = (*ctx).devices.len();
     if let Ok(mut backend) = (*ctx).backend.lock() {
@@ -158,6 +206,9 @@ pub unsafe extern "C" fn libinput_path_add_device(
         (*ctx).event_queue.push_back(ev);
     }
     if (*ctx).devices.len() == old_len + 1 {
+        if let Ok(mut backend) = (*ctx).backend.lock() {
+            backend.remember_path(&p);
+        }
         (&(*ctx).devices)[old_len]
     } else {
         if (*ctx).log_priority <= 30 {
@@ -183,8 +234,10 @@ pub unsafe extern "C" fn libinput_path_remove_device(dev: *mut LibinputDevice) {
     if ctx.is_null() || (*ctx).backend_kind != BackendKind::Path {
         return;
     }
+    let path = std::path::PathBuf::from((*dev).devnode.to_string_lossy().into_owned());
     let mut events = std::collections::VecDeque::new();
     let removed = if let Ok(mut backend) = (*ctx).backend.lock() {
+        backend.forget_path(&path);
         backend.remove_device(ctx, dev, &mut events)
     } else {
         false
@@ -192,6 +245,7 @@ pub unsafe extern "C" fn libinput_path_remove_device(dev: *mut LibinputDevice) {
     if removed {
         (*ctx).devices.retain(|candidate| *candidate != dev);
         (*ctx).event_queue.extend(events);
+        libinput_device_unref(dev);
     }
 }
 
@@ -214,6 +268,7 @@ pub unsafe extern "C" fn libinput_dispatch(ctx: *mut LibinputContext) -> libc::c
     }
     let mut events: [libc::epoll_event; 16] = std::mem::zeroed();
     libc::epoll_wait((*ctx).epoll_fd, events.as_mut_ptr(), 16, 0);
+    (*ctx).drain_fd();
     populate_events(ctx);
     0
 }
@@ -469,11 +524,7 @@ pub unsafe extern "C" fn libinput_event_pointer_get_seat_button_count(
         return 0;
     }
     if let EventPayload::PointerButton(e) = &(*event).payload {
-        if e.state == 1 {
-            1
-        } else {
-            0
-        }
+        e.seat_button_count
     } else {
         0
     }
@@ -482,12 +533,15 @@ pub unsafe extern "C" fn libinput_event_pointer_get_seat_button_count(
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_pointer_get_axis_value(
     event: *const LibinputEvent,
-    _axis: u32,
+    axis: u32,
 ) -> f64 {
     if event.is_null() {
         return 0.0;
     }
     if let EventPayload::PointerAxis(e) = &(*event).payload {
+        if e.axis != axis {
+            return 0.0;
+        }
         e.value
     } else {
         0.0
@@ -497,12 +551,15 @@ pub unsafe extern "C" fn libinput_event_pointer_get_axis_value(
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_pointer_get_axis_value_discrete(
     event: *const LibinputEvent,
-    _axis: u32,
+    axis: u32,
 ) -> f64 {
     if event.is_null() {
         return 0.0;
     }
     if let EventPayload::PointerAxis(e) = &(*event).payload {
+        if e.axis != axis {
+            return 0.0;
+        }
         e.value_discrete as f64
     } else {
         0.0
@@ -526,12 +583,12 @@ pub unsafe extern "C" fn libinput_event_pointer_get_axis_source(
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_pointer_has_axis(
     event: *const LibinputEvent,
-    _axis: u32,
+    axis: u32,
 ) -> libc::c_int {
     if event.is_null() {
         return 0;
     }
-    matches!((*event).payload, EventPayload::PointerAxis(_)) as libc::c_int
+    matches!(&(*event).payload, EventPayload::PointerAxis(e) if e.axis == axis) as libc::c_int
 }
 
 // ---------------------------------------------------------------------------
@@ -689,7 +746,9 @@ pub unsafe extern "C" fn libinput_event_touch_get_slot(event: *const LibinputEve
         return -1;
     }
     match &(*event).payload {
-        EventPayload::TouchDown(e) | EventPayload::TouchMotion(e) => e.slot,
+        EventPayload::TouchDown(e) | EventPayload::TouchMotion(e) | EventPayload::TouchUp(e) => {
+            e.slot
+        }
         _ => -1,
     }
 }
@@ -700,7 +759,9 @@ pub unsafe extern "C" fn libinput_event_touch_get_seat_slot(event: *const Libinp
         return -1;
     }
     match &(*event).payload {
-        EventPayload::TouchDown(e) | EventPayload::TouchMotion(e) => e.seat_slot,
+        EventPayload::TouchDown(e) | EventPayload::TouchMotion(e) | EventPayload::TouchUp(e) => {
+            e.seat_slot
+        }
         _ => -1,
     }
 }
@@ -711,7 +772,17 @@ pub unsafe extern "C" fn libinput_event_touch_get_x(event: *const LibinputEvent)
         return 0.0;
     }
     match &(*event).payload {
-        EventPayload::TouchDown(e) | EventPayload::TouchMotion(e) => e.x,
+        EventPayload::TouchDown(e) | EventPayload::TouchMotion(e) => {
+            let device = (*event).device;
+            if !device.is_null() {
+                if let (Some((minimum, _)), Some(resolution)) =
+                    ((*device).abs_x_range, (*device).abs_x_resolution)
+                {
+                    return (e.x - minimum as f64) / resolution as f64;
+                }
+            }
+            e.x
+        }
         _ => 0.0,
     }
 }
@@ -722,25 +793,66 @@ pub unsafe extern "C" fn libinput_event_touch_get_y(event: *const LibinputEvent)
         return 0.0;
     }
     match &(*event).payload {
-        EventPayload::TouchDown(e) | EventPayload::TouchMotion(e) => e.y,
+        EventPayload::TouchDown(e) | EventPayload::TouchMotion(e) => {
+            let device = (*event).device;
+            if !device.is_null() {
+                if let (Some((minimum, _)), Some(resolution)) =
+                    ((*device).abs_y_range, (*device).abs_y_resolution)
+                {
+                    return (e.y - minimum as f64) / resolution as f64;
+                }
+            }
+            e.y
+        }
         _ => 0.0,
     }
+}
+
+unsafe fn transformed_touch_coordinates(event: *const LibinputEvent) -> Option<(f64, f64)> {
+    let touch = match &(*event).payload {
+        EventPayload::TouchDown(e) | EventPayload::TouchMotion(e) => e,
+        _ => return None,
+    };
+    let device = (*event).device;
+    if device.is_null() {
+        return None;
+    }
+    let ((xmin, xmax), (ymin, ymax)) = ((*device).abs_x_range?, (*device).abs_y_range?);
+    let x_span = (xmax as i64 - xmin as i64 + 1).max(1) as f64;
+    let y_span = (ymax as i64 - ymin as i64 + 1).max(1) as f64;
+    let x = (touch.x - xmin as f64) / x_span;
+    let y = (touch.y - ymin as f64) / y_span;
+    let matrix = (*device).calibration;
+    Some((
+        matrix[0] as f64 * x + matrix[1] as f64 * y + matrix[2] as f64,
+        matrix[3] as f64 * x + matrix[4] as f64 * y + matrix[5] as f64,
+    ))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_touch_get_x_transformed(
     event: *const LibinputEvent,
-    _width: u32,
+    width: u32,
 ) -> f64 {
-    libinput_event_touch_get_x(event)
+    if event.is_null() {
+        return 0.0;
+    }
+    transformed_touch_coordinates(event)
+        .map(|(x, _)| x * width as f64)
+        .unwrap_or(0.0)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_touch_get_y_transformed(
     event: *const LibinputEvent,
-    _height: u32,
+    height: u32,
 ) -> f64 {
-    libinput_event_touch_get_y(event)
+    if event.is_null() {
+        return 0.0;
+    }
+    transformed_touch_coordinates(event)
+        .map(|(_, y)| y * height as f64)
+        .unwrap_or(0.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,9 +1114,15 @@ pub unsafe extern "C" fn libinput_device_get_sysname(
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_get_output_name(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> *const libc::c_char {
-    std::ptr::null()
+    if dev.is_null() {
+        return std::ptr::null();
+    }
+    (*dev)
+        .output_name
+        .as_ref()
+        .map_or(std::ptr::null(), |name| name.as_ptr())
 }
 
 #[no_mangle]
@@ -1050,7 +1168,7 @@ pub unsafe extern "C" fn libinput_device_touch_get_touch_count(
     dev: *const LibinputDevice,
 ) -> libc::c_int {
     if dev.is_null() || !(*dev).has_touch {
-        return 0;
+        return -1;
     }
     (*dev).touch_count
 }
@@ -1118,7 +1236,7 @@ pub unsafe extern "C" fn libinput_device_config_tap_get_enabled(dev: *const Libi
 pub unsafe extern "C" fn libinput_device_config_tap_get_default_enabled(
     _dev: *const LibinputDevice,
 ) -> u32 {
-    1
+    0
 }
 
 #[no_mangle]
@@ -1237,6 +1355,9 @@ pub unsafe extern "C" fn libinput_device_config_3fg_drag_get_default_enabled(
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_config_accel_create(profile: u32) -> *mut libc::c_void {
+    if !matches!(profile, 1 | 2 | 4) {
+        return std::ptr::null_mut();
+    }
     Box::into_raw(Box::new(profile)) as *mut libc::c_void
 }
 
@@ -1255,10 +1376,23 @@ pub unsafe extern "C" fn libinput_config_accel_set_points(
     npoints: libc::size_t,
     points: *const f64,
 ) -> u32 {
-    if accel_config.is_null() || points.is_null() || step <= 0.0 || npoints == 0 {
+    if accel_config.is_null()
+        || points.is_null()
+        || !step.is_finite()
+        || step <= 0.0
+        || step >= 1e10
+        || npoints == 0
+    {
         return 2;
     }
-    1
+    let points = std::slice::from_raw_parts(points, npoints);
+    if points
+        .iter()
+        .any(|point| !point.is_finite() || *point < 0.0 || *point >= 1e10)
+    {
+        return 2;
+    }
+    0
 }
 
 #[no_mangle]
@@ -1269,7 +1403,15 @@ pub unsafe extern "C" fn libinput_device_config_accel_apply(
     if dev.is_null() || accel_config.is_null() {
         return 2;
     }
-    (*dev).accel_profile = *(accel_config as *const u32);
+    if !(*dev).accel_available {
+        return 1;
+    }
+    let profile = *(accel_config as *const u32);
+    if profile & libinput_device_config_accel_get_profiles(dev) == 0 {
+        return 1;
+    }
+    (*dev).accel_profile = profile;
+    (*dev).accel_speed = 0.0;
     0
 }
 
@@ -1280,7 +1422,7 @@ pub unsafe extern "C" fn libinput_device_config_accel_is_available(
     if dev.is_null() {
         return 0;
     }
-    (*dev).has_pointer as libc::c_int
+    (*dev).accel_available as libc::c_int
 }
 
 #[no_mangle]
@@ -1291,7 +1433,13 @@ pub unsafe extern "C" fn libinput_device_config_accel_set_speed(
     if dev.is_null() {
         return 1;
     }
-    (*dev).accel_speed = speed.clamp(-1.0, 1.0);
+    if !speed.is_finite() || !(-1.0..=1.0).contains(&speed) {
+        return 2;
+    }
+    if !(*dev).accel_available {
+        return 1;
+    }
+    (*dev).accel_speed = speed;
     0
 }
 
@@ -1317,8 +1465,8 @@ pub unsafe extern "C" fn libinput_device_config_accel_get_profiles(
     if dev.is_null() {
         return 0;
     }
-    if (*dev).has_pointer {
-        0b11
+    if (*dev).accel_available {
+        0b111
     } else {
         0
     }
@@ -1332,6 +1480,12 @@ pub unsafe extern "C" fn libinput_device_config_accel_set_profile(
     if dev.is_null() {
         return 1;
     }
+    if profile == 0 || profile & !0b111 != 0 || profile.count_ones() != 1 {
+        return 2;
+    }
+    if profile & libinput_device_config_accel_get_profiles(dev) == 0 {
+        return 1;
+    }
     (*dev).accel_profile = profile;
     0
 }
@@ -1343,14 +1497,22 @@ pub unsafe extern "C" fn libinput_device_config_accel_get_profile(
     if dev.is_null() {
         return 0;
     }
-    (*dev).accel_profile
+    if (*dev).accel_available {
+        (*dev).accel_profile
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_accel_get_default_profile(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    1
+    if dev.is_null() || !(*dev).accel_available {
+        0
+    } else {
+        2
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1415,7 +1577,7 @@ pub unsafe extern "C" fn libinput_device_config_left_handed_set(
     dev: *mut LibinputDevice,
     enabled: libc::c_int,
 ) -> u32 {
-    if dev.is_null() {
+    if dev.is_null() || !(*dev).has_pointer {
         return 1;
     }
     (*dev).left_handed = enabled != 0;
@@ -1450,11 +1612,14 @@ pub unsafe extern "C" fn libinput_device_config_scroll_get_methods(
     if dev.is_null() {
         return 0;
     }
-    if (*dev).has_touch || (*dev).has_pointer {
-        0b111
-    } else {
-        0
+    let mut methods = 0;
+    if (*dev).has_touch {
+        methods |= 0b011;
     }
+    if (*dev).supports_button_scroll {
+        methods |= 0b100;
+    }
+    methods
 }
 
 #[no_mangle]
@@ -1463,6 +1628,9 @@ pub unsafe extern "C" fn libinput_device_config_scroll_set_method(
     method: u32,
 ) -> u32 {
     if dev.is_null() {
+        return 1;
+    }
+    if method & !libinput_device_config_scroll_get_methods(dev) != 0 {
         return 1;
     }
     (*dev).scroll_method = method;
@@ -1481,46 +1649,66 @@ pub unsafe extern "C" fn libinput_device_config_scroll_get_method(
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_scroll_get_default_method(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    2
+    if dev.is_null() {
+        0
+    } else {
+        (*dev).scroll_default_method
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_scroll_set_button(
     dev: *mut LibinputDevice,
-    _button: u32,
+    button: u32,
 ) -> u32 {
-    if dev.is_null() {
+    if dev.is_null() || !(*dev).supports_button_scroll {
         1
     } else {
+        (*dev).scroll_button = button;
         0
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_scroll_get_button(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    0
+    if dev.is_null() {
+        0
+    } else {
+        (*dev).scroll_button
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_scroll_set_button_lock(
     dev: *mut LibinputDevice,
-    _state: u32,
+    state: u32,
 ) -> u32 {
     if dev.is_null() {
         return 1;
     }
-    1
+    if state > 1 {
+        return 2;
+    }
+    if !(*dev).supports_button_scroll {
+        return 1;
+    }
+    (*dev).scroll_button_lock = state;
+    0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_scroll_get_button_lock(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    0
+    if dev.is_null() {
+        0
+    } else {
+        (*dev).scroll_button_lock
+    }
 }
 
 #[no_mangle]
@@ -1613,7 +1801,7 @@ pub unsafe extern "C" fn libinput_device_config_middle_emulation_is_available(
     if dev.is_null() {
         return 0;
     }
-    (*dev).has_pointer as libc::c_int
+    (*dev).middle_emulation_available as libc::c_int
 }
 
 #[no_mangle]
@@ -1624,6 +1812,12 @@ pub unsafe extern "C" fn libinput_device_config_middle_emulation_set_enabled(
     if dev.is_null() {
         return 1;
     }
+    if enabled > 1 {
+        return 2;
+    }
+    if enabled == 1 && !(*dev).middle_emulation_available {
+        return 1;
+    }
     (*dev).middle_emulation = enabled != 0;
     0
 }
@@ -1632,7 +1826,7 @@ pub unsafe extern "C" fn libinput_device_config_middle_emulation_set_enabled(
 pub unsafe extern "C" fn libinput_device_config_middle_emulation_get_enabled(
     dev: *const LibinputDevice,
 ) -> u32 {
-    if dev.is_null() {
+    if dev.is_null() || !(*dev).middle_emulation_available {
         return 0;
     }
     (*dev).middle_emulation as u32
@@ -1640,9 +1834,12 @@ pub unsafe extern "C" fn libinput_device_config_middle_emulation_get_enabled(
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_middle_emulation_get_default_enabled(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    0
+    if dev.is_null() || !(*dev).middle_emulation_available {
+        return 0;
+    }
+    (*dev).middle_emulation_default as u32
 }
 
 // ---------------------------------------------------------------------------
@@ -1779,7 +1976,7 @@ pub unsafe extern "C" fn libinput_device_config_calibration_has_matrix(
     if dev.is_null() {
         return 0;
     }
-    (*dev).has_touch as libc::c_int
+    (*dev).calibration_available as libc::c_int
 }
 
 #[no_mangle]
@@ -1787,7 +1984,7 @@ pub unsafe extern "C" fn libinput_device_config_calibration_set_matrix(
     dev: *mut LibinputDevice,
     matrix: *const f32,
 ) -> u32 {
-    if dev.is_null() || matrix.is_null() {
+    if dev.is_null() || matrix.is_null() || !(*dev).calibration_available {
         return 1;
     }
     (*dev)
@@ -1801,23 +1998,23 @@ pub unsafe extern "C" fn libinput_device_config_calibration_get_matrix(
     dev: *const LibinputDevice,
     matrix: *mut f32,
 ) -> libc::c_int {
-    if dev.is_null() || matrix.is_null() {
+    if dev.is_null() || matrix.is_null() || !(*dev).calibration_available {
         return 0;
     }
     std::slice::from_raw_parts_mut(matrix, 6).copy_from_slice(&(*dev).calibration);
-    1
+    ((*dev).calibration != [1.0_f32, 0.0, 0.0, 0.0, 1.0, 0.0]) as libc::c_int
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_calibration_get_default_matrix(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
     matrix: *mut f32,
 ) -> libc::c_int {
-    if matrix.is_null() {
+    if dev.is_null() || matrix.is_null() || !(*dev).calibration_available {
         return 0;
     }
-    std::slice::from_raw_parts_mut(matrix, 6).copy_from_slice(&[1.0_f32, 0.0, 0.0, 0.0, 1.0, 0.0]);
-    1
+    std::slice::from_raw_parts_mut(matrix, 6).copy_from_slice(&(*dev).default_calibration);
+    ((*dev).default_calibration != [1.0_f32, 0.0, 0.0, 0.0, 1.0, 0.0]) as libc::c_int
 }
 
 // ---------------------------------------------------------------------------
@@ -1840,14 +2037,69 @@ pub unsafe extern "C" fn libinput_device_set_seat_logical_name(
     if dev.is_null() || name.is_null() || (*dev).seat.is_null() {
         return -1;
     }
-    let name = CStr::from_ptr(name).to_string_lossy().into_owned();
-    match std::ffi::CString::new(name) {
-        Ok(name) => {
-            (*(*dev).seat).logical_name = name;
-            0
-        }
-        Err(_) => -1,
+    let name = CStr::from_ptr(name);
+    if name.to_bytes().is_empty() || name.to_bytes().len() > 255 {
+        return -1;
     }
+    if (*(*dev).seat).logical_name.as_c_str() == name {
+        return 0;
+    }
+    let Ok(logical_name) = std::ffi::CString::new(name.to_bytes()) else {
+        return -1;
+    };
+    let ctx = (*dev).context;
+    if ctx.is_null() {
+        return -1;
+    }
+    let physical_name = (*(*dev).seat).physical_name.clone();
+    let new_seat = (*ctx)
+        .seats
+        .iter()
+        .copied()
+        .find(|seat| {
+            !seat.is_null()
+                && (**seat).physical_name == physical_name
+                && (**seat).logical_name == logical_name
+        })
+        .unwrap_or_else(|| {
+            let seat = Box::into_raw(Box::new(LibinputSeat {
+                physical_name,
+                logical_name,
+                refcount: std::sync::atomic::AtomicI32::new(1),
+                user_data: std::ptr::null_mut(),
+                context: ctx,
+                button_count: std::sync::atomic::AtomicU32::new(0),
+            }));
+            (*ctx).seats.push(seat);
+            seat
+        });
+
+    let path = std::path::PathBuf::from((*dev).devnode.to_string_lossy().into_owned());
+    let mut removed = std::collections::VecDeque::new();
+    let mut added = Vec::new();
+    let replaced = if let Ok(mut backend) = (*ctx).backend.lock() {
+        if backend.remove_device(ctx, dev, &mut removed) {
+            backend.try_open(ctx, &path, &mut added);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let Some(replacement) = added.first().map(|event| event.device) else {
+        return -1;
+    };
+    if !replaced || replacement.is_null() {
+        return -1;
+    }
+    (*ctx).devices.retain(|candidate| *candidate != dev);
+    libinput_device_unref(dev);
+    (*replacement).seat = new_seat;
+    (*ctx).event_queue.extend(removed);
+    (*ctx).event_queue.extend(added);
+    (*ctx).signal_fd();
+    0
 }
 
 #[no_mangle]
@@ -1893,9 +2145,14 @@ pub unsafe extern "C" fn libinput_seat_ref(seat: *mut libc::c_void) -> *mut libc
 #[no_mangle]
 pub unsafe extern "C" fn libinput_seat_unref(seat: *mut libc::c_void) -> *mut libc::c_void {
     if !seat.is_null() {
-        (*(seat as *mut LibinputSeat))
+        let seat = seat as *mut LibinputSeat;
+        if (*seat)
             .refcount
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            drop(Box::from_raw(seat));
+        }
     }
     std::ptr::null_mut()
 }
@@ -2104,9 +2361,13 @@ pub unsafe extern "C" fn libinput_device_config_rotation_get_default_angle(
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_scroll_get_default_button(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    0
+    if dev.is_null() {
+        0
+    } else {
+        (*dev).scroll_default_button
+    }
 }
 
 #[no_mangle]
@@ -2131,7 +2392,19 @@ pub unsafe extern "C" fn libinput_device_config_send_events_set_mode(
     if mode & !supported != 0 {
         return 1;
     }
-    (*dev).send_events_mode = if mode & 1 != 0 { 1 } else { mode };
+    let previous = (*dev).send_events_mode;
+    let next = if mode & 1 != 0 { 1 } else { mode };
+    (*dev).send_events_mode = next;
+    if previous != 1 && next == 1 {
+        let ctx = (*dev).context;
+        if !ctx.is_null() {
+            let mut events = std::collections::VecDeque::new();
+            if let Ok(mut backend) = (*ctx).backend.lock() {
+                backend.release_active_inputs(ctx, dev, &mut events);
+            }
+            (*ctx).event_queue.extend(events);
+        }
+    }
     0
 }
 
@@ -2161,35 +2434,64 @@ pub unsafe extern "C" fn libinput_device_config_tap_get_default_drag_lock_enable
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_get_device_group(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> *mut libc::c_void {
-    std::ptr::null_mut()
+    if dev.is_null() {
+        return std::ptr::null_mut();
+    }
+    (*dev).group.cast()
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_group_ref(group: *mut libc::c_void) -> *mut libc::c_void {
-    group
+    if group.is_null() {
+        return std::ptr::null_mut();
+    }
+    let group = group.cast::<LibinputDeviceGroup>();
+    (*group)
+        .refcount
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    group.cast()
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_group_unref(
-    _group: *mut libc::c_void,
+    group: *mut libc::c_void,
 ) -> *mut libc::c_void {
-    std::ptr::null_mut()
+    if group.is_null() {
+        return std::ptr::null_mut();
+    }
+    let group = group.cast::<LibinputDeviceGroup>();
+    if (*group)
+        .refcount
+        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+        == 1
+    {
+        drop(Box::from_raw(group));
+        std::ptr::null_mut()
+    } else {
+        group.cast()
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_group_set_user_data(
-    _group: *mut libc::c_void,
-    _data: *mut libc::c_void,
+    group: *mut libc::c_void,
+    data: *mut libc::c_void,
 ) {
+    if !group.is_null() {
+        (*group.cast::<LibinputDeviceGroup>()).user_data = data;
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_group_get_user_data(
-    _group: *const libc::c_void,
+    group: *const libc::c_void,
 ) -> *mut libc::c_void {
-    std::ptr::null_mut()
+    if group.is_null() {
+        return std::ptr::null_mut();
+    }
+    (*group.cast::<LibinputDeviceGroup>()).user_data
 }
 
 #[no_mangle]
@@ -2232,12 +2534,12 @@ pub unsafe extern "C" fn libinput_device_get_udev_device(
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_keyboard_has_key(
     dev: *const LibinputDevice,
-    _key: u32,
+    key: u32,
 ) -> libc::c_int {
-    if dev.is_null() {
+    if dev.is_null() || !(*dev).has_keyboard || key > u16::MAX as u32 {
         return 0;
     }
-    (*dev).has_keyboard as libc::c_int
+    (*dev).event_codes.contains(&(key as u16)) as libc::c_int
 }
 
 #[no_mangle]
@@ -2251,12 +2553,15 @@ pub unsafe extern "C" fn libinput_device_led_update(dev: *mut LibinputDevice, _l
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_pointer_has_button(
     dev: *const LibinputDevice,
-    _button: u32,
+    button: u32,
 ) -> libc::c_int {
-    if dev.is_null() {
+    if dev.is_null() || button > u16::MAX as u32 {
         return 0;
     }
-    (*dev).has_pointer as libc::c_int
+    if !(*dev).has_pointer {
+        return -1;
+    }
+    (*dev).event_codes.contains(&(button as u16)) as libc::c_int
 }
 
 #[no_mangle]
@@ -2372,17 +2677,41 @@ pub unsafe extern "C" fn libinput_event_tablet_tool_get_base_event(
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_pointer_get_absolute_x_transformed(
     event: *const LibinputEvent,
-    _width: u32,
+    width: u32,
 ) -> f64 {
-    libinput_event_pointer_get_absolute_x(event)
+    if event.is_null() {
+        return 0.0;
+    }
+    if let EventPayload::PointerMotionAbsolute(e) = &(*event).payload {
+        let range = e.x_max - e.x_min;
+        if range > 0.0 {
+            (e.abs_x - e.x_min) * f64::from(width) / range
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_pointer_get_absolute_y_transformed(
     event: *const LibinputEvent,
-    _height: u32,
+    height: u32,
 ) -> f64 {
-    libinput_event_pointer_get_absolute_y(event)
+    if event.is_null() {
+        return 0.0;
+    }
+    if let EventPayload::PointerMotionAbsolute(e) = &(*event).payload {
+        let range = e.y_max - e.y_min;
+        if range > 0.0 {
+            (e.abs_y - e.y_min) * f64::from(height) / range
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    }
 }
 
 #[no_mangle]
@@ -2398,7 +2727,15 @@ pub unsafe extern "C" fn libinput_event_pointer_get_scroll_value_v120(
     event: *const LibinputEvent,
     axis: u32,
 ) -> f64 {
-    libinput_event_pointer_get_axis_value(event, axis) * 120.0
+    if event.is_null() {
+        return 0.0;
+    }
+    if let EventPayload::PointerAxis(e) = &(*event).payload {
+        if e.axis == axis {
+            return e.value_v120;
+        }
+    }
+    0.0
 }
 
 #[no_mangle]
@@ -3085,14 +3422,17 @@ pub unsafe extern "C" fn libinput_resume(ctx: *mut LibinputContext) -> libc::c_i
     if ctx.is_null() {
         return -1;
     }
-    let mut events = Vec::new();
-    if let Ok(mut backend) = (*ctx).backend.lock() {
-        backend.resume(ctx, &mut events);
+    let mut events = std::collections::VecDeque::new();
+    let status = if let Ok(mut backend) = (*ctx).backend.lock() {
+        backend.resume(ctx, &mut events)
     } else {
         return -1;
-    }
+    };
     (*ctx).event_queue.extend(events);
-    0
+    if !(*ctx).event_queue.is_empty() {
+        (*ctx).signal_fd();
+    }
+    status
 }
 
 #[cfg(test)]

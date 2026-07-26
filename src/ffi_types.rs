@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use crate::backend::BackendState;
@@ -89,6 +89,10 @@ pub struct PointerMotionAbsoluteEvent {
     pub time_usec: u64,
     pub abs_x: f64,
     pub abs_y: f64,
+    pub x_min: f64,
+    pub x_max: f64,
+    pub y_min: f64,
+    pub y_max: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +100,7 @@ pub struct PointerButtonEvent {
     pub time_usec: u64,
     pub button: u32,
     pub state: u32,
+    pub seat_button_count: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +109,7 @@ pub struct PointerAxisEvent {
     pub axis: u32,
     pub value: f64,
     pub value_discrete: i32,
+    pub value_v120: f64,
     pub source: u32,
 }
 
@@ -175,6 +181,22 @@ pub struct LibinputEvent {
     pub device: *mut LibinputDevice,
 }
 
+impl Drop for LibinputEvent {
+    fn drop(&mut self) {
+        if self.event_type != LibinputEventType::LIBINPUT_EVENT_DEVICE_REMOVED
+            || self.device.is_null()
+        {
+            return;
+        }
+        unsafe {
+            if (*self.device).refcount.fetch_sub(1, Ordering::AcqRel) == 1 {
+                drop(Box::from_raw(self.device));
+            }
+        }
+        self.device = std::ptr::null_mut();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LibinputSeat
 // ---------------------------------------------------------------------------
@@ -185,6 +207,27 @@ pub struct LibinputSeat {
     pub refcount: AtomicI32,
     pub user_data: *mut libc::c_void,
     pub context: *mut LibinputContext,
+    pub button_count: AtomicU32,
+}
+
+// ---------------------------------------------------------------------------
+// LibinputDeviceGroup
+// ---------------------------------------------------------------------------
+
+pub struct LibinputDeviceGroup {
+    pub refcount: AtomicI32,
+    pub user_data: *mut libc::c_void,
+}
+
+unsafe impl Send for LibinputDeviceGroup {}
+
+impl LibinputDeviceGroup {
+    fn new() -> Self {
+        Self {
+            refcount: AtomicI32::new(1),
+            user_data: std::ptr::null_mut(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +239,7 @@ pub struct LibinputDevice {
     pub name: CString,
     pub sysname: CString,
     pub devnode: CString,
+    pub output_name: Option<CString>,
     pub vendor_id: u32,
     pub product_id: u32,
     pub bus_type: u32,
@@ -206,9 +250,16 @@ pub struct LibinputDevice {
     pub has_switch: bool,
     pub has_tablet: bool,
     pub has_tablet_pad: bool,
+    pub accel_available: bool,
+    pub supports_button_scroll: bool,
+    pub event_codes: Vec<u16>,
     pub touch_count: i32,
     pub width_mm: Option<f64>,
     pub height_mm: Option<f64>,
+    pub abs_x_range: Option<(i32, i32)>,
+    pub abs_y_range: Option<(i32, i32)>,
+    pub abs_x_resolution: Option<i32>,
+    pub abs_y_resolution: Option<i32>,
     pub send_events_modes: u32,
     pub send_events_mode: u32,
     pub tap_enabled: bool,
@@ -218,15 +269,26 @@ pub struct LibinputDevice {
     pub accel_profile: u32,
     pub left_handed: bool,
     pub scroll_method: u32,
+    pub scroll_default_method: u32,
+    pub scroll_button: u32,
+    pub scroll_default_button: u32,
+    pub scroll_button_lock: u32,
     pub click_method: u32,
+    pub middle_emulation_available: bool,
     pub middle_emulation: bool,
+    pub middle_emulation_default: bool,
     pub dwt_enabled: bool,
+    pub wheel_click_angle_vertical: f64,
+    pub wheel_click_angle_horizontal: f64,
+    pub calibration_available: bool,
     pub calibration: [f32; 6],
+    pub default_calibration: [f32; 6],
     pub refcount: AtomicI32,
     pub user_data: *mut libc::c_void,
     pub seat: *mut LibinputSeat,
     pub context: *mut LibinputContext,
     pub udev_device: *mut libc::c_void,
+    pub group: *mut LibinputDeviceGroup,
 }
 
 unsafe impl Send for LibinputDevice {}
@@ -242,6 +304,7 @@ impl LibinputDevice {
             name: CString::new(name).unwrap_or_else(|_| CString::new("Unknown").unwrap()),
             sysname: CString::new("").unwrap(),
             devnode: CString::new(devnode).unwrap_or_else(|_| CString::new("").unwrap()),
+            output_name: None,
             vendor_id: 0,
             product_id: 0,
             bus_type: 0,
@@ -252,27 +315,45 @@ impl LibinputDevice {
             has_switch: false,
             has_tablet: false,
             has_tablet_pad: false,
+            accel_available: false,
+            supports_button_scroll: false,
+            event_codes: Vec::new(),
             touch_count: 0,
             width_mm: None,
             height_mm: None,
+            abs_x_range: None,
+            abs_y_range: None,
+            abs_x_resolution: None,
+            abs_y_resolution: None,
             send_events_modes: 1,
             send_events_mode: 0,
-            tap_enabled: true,
+            tap_enabled: false,
             tap_button_map: 0,
-            natural_scroll: true,
+            natural_scroll: false,
             accel_speed: 0.0,
-            accel_profile: 1,
+            accel_profile: 2,
             left_handed: false,
             scroll_method: 2,
+            scroll_default_method: 2,
+            scroll_button: 0,
+            scroll_default_button: 0,
+            scroll_button_lock: 0,
             click_method: 1,
+            middle_emulation_available: false,
             middle_emulation: false,
+            middle_emulation_default: false,
             dwt_enabled: true,
+            wheel_click_angle_vertical: 15.0,
+            wheel_click_angle_horizontal: 15.0,
+            calibration_available: false,
             calibration: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            default_calibration: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
             refcount: AtomicI32::new(1),
             user_data: std::ptr::null_mut(),
             seat,
             context,
             udev_device: std::ptr::null_mut(),
+            group: Box::into_raw(Box::new(LibinputDeviceGroup::new())),
         }
     }
 }
@@ -285,6 +366,14 @@ impl Drop for LibinputDevice {
             }
             self.udev_device = std::ptr::null_mut();
         }
+        if !self.group.is_null() {
+            unsafe {
+                if (*self.group).refcount.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    drop(Box::from_raw(self.group));
+                }
+            }
+            self.group = std::ptr::null_mut();
+        }
     }
 }
 
@@ -296,9 +385,13 @@ pub struct LibinputContext {
     pub interface: *const LibinputInterface,
     pub user_data: *mut libc::c_void,
     pub epoll_fd: RawFd,
+    pub wake_fd: RawFd,
+    pub timer_fd: RawFd,
     pub event_queue: VecDeque<LibinputEvent>,
     pub devices: Vec<*mut LibinputDevice>,
+    pub touch_seat_slots: Vec<bool>,
     pub seat: *mut LibinputSeat,
+    pub seats: Vec<*mut LibinputSeat>,
     pub refcount: AtomicI32,
     pub log_handler: Option<
         unsafe extern "C" fn(
@@ -324,12 +417,20 @@ impl LibinputContext {
         backend_kind: BackendKind,
     ) -> Self {
         let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        let timer_fd = unsafe {
+            libc::timerfd_create(
+                libc::CLOCK_MONOTONIC,
+                libc::TFD_CLOEXEC | libc::TFD_NONBLOCK,
+            )
+        };
         let seat = Box::into_raw(Box::new(LibinputSeat {
             physical_name: CString::new("seat0").unwrap(),
             logical_name: CString::new("default").unwrap(),
             refcount: AtomicI32::new(1),
             user_data: std::ptr::null_mut(),
             context: std::ptr::null_mut(),
+            button_count: AtomicU32::new(0),
         }));
         let backend = BackendState::new();
         let inotify_fd = backend.inotify_fd();
@@ -337,9 +438,13 @@ impl LibinputContext {
             interface,
             user_data,
             epoll_fd,
+            wake_fd,
+            timer_fd,
             event_queue: VecDeque::new(),
             devices: Vec::new(),
+            touch_seat_slots: Vec::new(),
             seat,
+            seats: vec![seat],
             refcount: AtomicI32::new(1),
             log_handler: None,
             log_priority: 30,
@@ -349,6 +454,12 @@ impl LibinputContext {
         };
         if let Some(fd) = inotify_fd {
             ctx.register_fd(fd);
+        }
+        if wake_fd >= 0 {
+            ctx.register_fd(wake_fd);
+        }
+        if timer_fd >= 0 {
+            ctx.register_fd(timer_fd);
         }
         ctx
     }
@@ -370,11 +481,58 @@ impl LibinputContext {
     }
 
     pub fn signal_fd(&self) {
-        // No-op: epoll wakes naturally from registered device/inotify fds.
+        if self.wake_fd < 0 {
+            return;
+        }
+        let value: u64 = 1;
+        unsafe {
+            libc::write(
+                self.wake_fd,
+                (&value as *const u64).cast(),
+                std::mem::size_of::<u64>(),
+            );
+        }
     }
 
     pub fn drain_fd(&self) {
-        // No-op: epoll_wait in libinput_dispatch handles draining readiness.
+        let mut value: u64 = 0;
+        for fd in [self.wake_fd, self.timer_fd] {
+            if fd < 0 {
+                continue;
+            }
+            unsafe {
+                while libc::read(
+                    fd,
+                    (&mut value as *mut u64).cast(),
+                    std::mem::size_of::<u64>(),
+                ) > 0
+                {}
+            }
+        }
+    }
+
+    pub fn arm_timer(&self, delay: Option<std::time::Duration>) {
+        if self.timer_fd < 0 {
+            return;
+        }
+        let mut value = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        if let Some(delay) = delay {
+            value.tv_sec = delay.as_secs().try_into().unwrap_or(libc::time_t::MAX);
+            value.tv_nsec = libc::c_long::from(delay.subsec_nanos().max(1));
+        }
+        let spec = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: value,
+        };
+        unsafe {
+            libc::timerfd_settime(self.timer_fd, 0, &spec, std::ptr::null_mut());
+        }
     }
 
     pub fn inc_ref(&self) {
@@ -397,15 +555,31 @@ impl Drop for LibinputContext {
                 libc::close(self.epoll_fd);
             }
         }
-        if !self.seat.is_null() {
+        if self.wake_fd >= 0 {
             unsafe {
-                drop(Box::from_raw(self.seat));
+                libc::close(self.wake_fd);
+            }
+        }
+        if self.timer_fd >= 0 {
+            unsafe {
+                libc::close(self.timer_fd);
+            }
+        }
+        for seat in self.seats.drain(..) {
+            if !seat.is_null() {
+                unsafe {
+                    if (*seat).refcount.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        drop(Box::from_raw(seat));
+                    }
+                }
             }
         }
         for dev_ptr in self.devices.drain(..) {
             if !dev_ptr.is_null() {
                 unsafe {
-                    drop(Box::from_raw(dev_ptr));
+                    if (*dev_ptr).refcount.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        drop(Box::from_raw(dev_ptr));
+                    }
                 }
             }
         }

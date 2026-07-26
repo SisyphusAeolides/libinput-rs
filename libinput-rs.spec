@@ -62,7 +62,7 @@ test ! -e %{buildroot}%{_libdir}/libinput.so.10
 %{_mandir}/man8/libinput-rs.8*
 
 %changelog
-* Sun Jul 26 2026 Kenny Glowner <sisyphuscode@fedoraproject.org> - 0.2.0-1
+* Sun Jul 26 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.2.0-1
 - Convert packaging and CI to DNF and RPM
 - Preserve the system libinput library and isolate the experimental ABI build
 - Make touchpad grabbing fail open and remove display-manager ordering
