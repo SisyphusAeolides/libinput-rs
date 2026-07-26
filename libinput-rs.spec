@@ -14,7 +14,7 @@ BuildRequires:  rust >= 1.75
 BuildRequires:  gcc
 BuildRequires:  make
 BuildRequires:  systemd-rpm-macros
-Requires:       libinput
+Requires:       %{_libdir}/libinput.so.10
 Requires:       systemd
 
 %description

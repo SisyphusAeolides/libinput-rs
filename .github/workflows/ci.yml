@@ -38,12 +38,20 @@ jobs:
           objdump -T target/release/libinput.so | grep -q 'LIBINPUT_0.12.0.*libinput_get_fd'
           test -z "$(nm -D target/release/libinput.so | grep -E ' T (rust_|__rd)' || true)"
 
-      - name: Build source RPM
+      - name: Build and inspect RPMs
         run: |
-          mkdir -p "$PWD/rpmbuild/SOURCES" "$PWD/rpmbuild/SRPMS"
+          mkdir -p "$PWD/rpmbuild/SOURCES" "$PWD/rpmbuild/SRPMS" "$PWD/rpmbuild/RPMS"
           git archive --format=tar.gz --prefix=libinput-rs-0.2.0/ --output="$PWD/rpmbuild/SOURCES/libinput-rs-0.2.0.tar.gz" HEAD
           rpmbuild -bs libinput-rs.spec --define "_topdir $PWD/rpmbuild"
-          rpm -qp --provides "$PWD"/rpmbuild/SRPMS/*.src.rpm | grep -q '^libinput-rs'
+          rpmbuild --rebuild "$PWD"/rpmbuild/SRPMS/*.src.rpm --define "_topdir $PWD/rpmbuild"
+          package=$(find "$PWD/rpmbuild/RPMS" -name 'libinput-rs-[0-9]*.rpm' -print -quit)
+          test -n "$package"
+          rpm -qp --provides "$package" | grep -q '^libinput-rs = '
+          ! rpm -qp --provides "$package" | grep -q 'libinput\.so\.10'
+          rpm -qpl "$package" | grep -q '/libinput-rs/libinput\.so\.10$'
+          ! rpm -qpl "$package" | grep -q '/libinput\.so\.10$'
+          rpm -qp --requires "$package" | grep -q '/libinput\.so\.10$'
+          rpmlint "$package"
 
   proofs:
     name: Safety proofs

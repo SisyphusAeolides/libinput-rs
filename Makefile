@@ -22,6 +22,7 @@ check: packaging-check
 packaging-check:
 	! grep -Eq '^Before=.*display-manager|^DefaultDependencies=no|^Restart=always' systemd/libinput-rs.service
 	! grep -Eq '^(Provides|Obsoletes):.*libinput' libinput-rs.spec
+	grep -q '^Requires: *%{_libdir}/libinput.so.10' libinput-rs.spec
 	grep -q '%{_libdir}/libinput-rs/libinput.so.10' libinput-rs.spec
 	! grep -Eq '^install .*%\{_libdir\}/libinput\.so\.10' libinput-rs.spec
 
