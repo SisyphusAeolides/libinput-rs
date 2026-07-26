@@ -15,8 +15,9 @@ use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
 
 use crate::ffi_types::{
     BackendKind, EventPayload, GestureEvent, KeyboardKeyEvent, LibinputContext, LibinputDevice,
-    LibinputEvent, LibinputEventType, LibinputTabletTool, PointerAxisEvent, PointerButtonEvent,
-    PointerMotionAbsoluteEvent, PointerMotionEvent, TabletToolEvent, TouchEvent,
+    LibinputEvent, LibinputEventType, LibinputTabletPadModeGroup, LibinputTabletTool,
+    PointerAxisEvent, PointerButtonEvent, PointerMotionAbsoluteEvent, PointerMotionEvent,
+    TabletPadEvent, TabletToolEvent, TouchEvent,
 };
 
 #[link(name = "wacom")]
@@ -31,6 +32,18 @@ extern "C" {
     ) -> *mut libc::c_void;
     fn libwacom_destroy(device: *mut libc::c_void);
     fn libwacom_get_integration_flags(device: *const libc::c_void) -> libc::c_int;
+    fn libwacom_new_from_usbid(
+        database: *const libc::c_void,
+        vendor_id: libc::c_int,
+        product_id: libc::c_int,
+        error: *mut libc::c_void,
+    ) -> *mut libc::c_void;
+    fn libwacom_get_num_buttons(device: *const libc::c_void) -> libc::c_int;
+    fn libwacom_is_reversible(device: *const libc::c_void) -> libc::c_int;
+    fn libwacom_get_button_evdev_code(
+        device: *const libc::c_void,
+        button: libc::c_char,
+    ) -> libc::c_int;
     fn libwacom_stylus_get_for_id(
         database: *const libc::c_void,
         tool_id: libc::c_int,
@@ -270,6 +283,14 @@ struct TrackedDevice {
     tablet_slider: f64,
     tablet_slider_range: Option<(i32, i32)>,
     tablet_slider_changed: bool,
+    tablet_size_major: f64,
+    tablet_size_minor: f64,
+    tablet_size_major_resolution: i32,
+    tablet_size_minor_resolution: i32,
+    tablet_last_event_size_major: f64,
+    tablet_last_event_size_minor: f64,
+    tablet_size_major_changed: bool,
+    tablet_size_minor_changed: bool,
     tablet_wheel_delta: f64,
     tablet_wheel_discrete: i32,
     tablet_wheel_changed: bool,
@@ -286,7 +307,17 @@ struct TrackedDevice {
     tablet_proximity_timer_enabled: bool,
     tablet_buttons_down: u32,
     tablet_held_buttons: Vec<u32>,
+    tablet_ignored_initial_buttons: Vec<u32>,
     tablet_pending_button_events: Vec<(u32, bool)>,
+
+    // --- tablet pad ---
+    pad_ring_ranges: [Option<(i32, i32)>; 2],
+    pad_strip_ranges: [Option<(i32, i32)>; 2],
+    pad_ring_values: [i32; 2],
+    pad_strip_values: [i32; 2],
+    pad_changed_axes: u8,
+    pad_abs_misc_terminator: bool,
+    pad_dial_values: [Option<f64>; 2],
 
     // --- multi-touch slots (for pinch) ---
     mt_slots: Vec<MtSlot>,
@@ -299,6 +330,9 @@ struct TrackedDevice {
     pinch_base_dist: f64,
     pinch_base_angle: f64,
     pinch_fingers: i32,
+    swipe_active: bool,
+    swipe_fingers: i32,
+    mt_contact_count_changed: bool,
 
     // --- keyboard repeat ---
     held_keys: Vec<HeldKey>,
@@ -358,7 +392,7 @@ impl TrackedDevice {
             axes.contains(AbsoluteAxisCode::ABS_MT_TOUCH_MAJOR)
                 && axes.contains(AbsoluteAxisCode::ABS_MT_TOUCH_MINOR)
         });
-        let tablet_buttons = device
+        let tablet_buttons: Vec<u32> = device
             .supported_keys()
             .map(|keys| {
                 [KeyCode::BTN_STYLUS.0, KeyCode::BTN_STYLUS2.0, 0x149, 0x100]
@@ -369,7 +403,7 @@ impl TrackedDevice {
                     .collect()
             })
             .unwrap_or_default();
-        let initial_tablet_tool_type = {
+        let mut initial_tablet_tool_type = {
             use std::os::fd::AsRawFd;
             let mut key_bits = [0_u8; 96];
             let request =
@@ -396,6 +430,26 @@ impl TrackedDevice {
                 None
             }
         };
+        let initial_tablet_buttons = {
+            use std::os::fd::AsRawFd;
+            let mut key_bits = [0_u8; 96];
+            let request =
+                ((2_u64 << 30) | ((key_bits.len() as u64) << 16) | ((b'E' as u64) << 8) | 0x18)
+                    as libc::c_ulong;
+            if unsafe { libc::ioctl(device.as_raw_fd(), request, key_bits.as_mut_ptr()) } >= 0 {
+                tablet_buttons
+                    .iter()
+                    .copied()
+                    .filter(|code| {
+                        key_bits
+                            .get((*code as usize) / 8)
+                            .is_some_and(|byte| byte & (1 << (*code % 8)) != 0)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
         let supports_hi_res_vertical =
             relative_axes.is_some_and(|axes| axes.contains(RelativeAxisCode::REL_WHEEL_HI_RES));
         let supports_hi_res_horizontal =
@@ -416,6 +470,15 @@ impl TrackedDevice {
         let mut tablet_rotation_info = None;
         let mut tablet_slider = 0.0;
         let mut tablet_slider_range = None;
+        let mut tablet_size_major = 0.0;
+        let mut tablet_size_minor = 0.0;
+        let mut tablet_size_major_resolution = 0;
+        let mut tablet_size_minor_resolution = 0;
+        let mut current_mt_tracking_id = -1;
+        let mut pad_ring_ranges = [None; 2];
+        let mut pad_strip_ranges = [None; 2];
+        let mut pad_ring_values = [0; 2];
+        let mut pad_strip_values = [0; 2];
         let mut has_mt = false;
         let mut has_mt_slot = false;
         let mut mt_slot_count = 10_usize;
@@ -449,8 +512,15 @@ impl TrackedDevice {
                 } else if axis == AbsoluteAxisCode::ABS_WHEEL {
                     tablet_slider = f64::from(info.value());
                     tablet_slider_range = Some((info.minimum(), info.maximum()));
+                } else if axis == AbsoluteAxisCode::ABS_MT_TOUCH_MAJOR {
+                    tablet_size_major = f64::from(info.value());
+                    tablet_size_major_resolution = info.resolution();
+                } else if axis == AbsoluteAxisCode::ABS_MT_TOUCH_MINOR {
+                    tablet_size_minor = f64::from(info.value());
+                    tablet_size_minor_resolution = info.resolution();
                 } else if axis == AbsoluteAxisCode::ABS_MT_TRACKING_ID {
                     has_mt = true;
+                    current_mt_tracking_id = info.value();
                 } else if axis == AbsoluteAxisCode::ABS_MT_SLOT {
                     has_mt_slot = true;
                     mt_slot_count = (info.maximum() - info.minimum() + 1).clamp(1, 256) as usize;
@@ -458,6 +528,19 @@ impl TrackedDevice {
                     mt_x_fuzz = info.fuzz();
                 } else if axis == AbsoluteAxisCode::ABS_MT_POSITION_Y {
                     mt_y_fuzz = info.fuzz();
+                }
+                if axis == AbsoluteAxisCode::ABS_WHEEL {
+                    pad_ring_ranges[0] = Some((info.minimum(), info.maximum()));
+                    pad_ring_values[0] = info.value();
+                } else if axis == AbsoluteAxisCode::ABS_THROTTLE {
+                    pad_ring_ranges[1] = Some((info.minimum(), info.maximum()));
+                    pad_ring_values[1] = info.value();
+                } else if axis == AbsoluteAxisCode::ABS_RX {
+                    pad_strip_ranges[0] = Some((info.minimum(), info.maximum()));
+                    pad_strip_values[0] = info.value();
+                } else if axis == AbsoluteAxisCode::ABS_RY {
+                    pad_strip_ranges[1] = Some((info.minimum(), info.maximum()));
+                    pad_strip_values[1] = info.value();
                 }
             }
         }
@@ -480,12 +563,24 @@ impl TrackedDevice {
                 for (slot, value) in mt_slots.iter_mut().zip(values) {
                     slot.x = value as f64;
                 }
+                if unsafe { (*lib_device).has_tablet } && tablet_has_size {
+                    current_abs_x = Some(mt_slots[0].x as i32);
+                }
             }
             if let Some(values) = query_slots(AbsoluteAxisCode::ABS_MT_POSITION_Y) {
                 for (slot, value) in mt_slots.iter_mut().zip(values) {
                     slot.y = value as f64;
                 }
+                if unsafe { (*lib_device).has_tablet } && tablet_has_size {
+                    current_abs_y = Some(mt_slots[0].y as i32);
+                }
             }
+            if let Some(values) = query_slots(AbsoluteAxisCode::ABS_MT_TRACKING_ID) {
+                current_mt_tracking_id = values[0];
+            }
+        }
+        if unsafe { (*lib_device).has_tablet } && tablet_has_size && current_mt_tracking_id >= 0 {
+            initial_tablet_tool_type = Some(8);
         }
 
         Self {
@@ -565,14 +660,15 @@ impl TrackedDevice {
             tablet_tool_id: 0,
             tablet_tool_type: initial_tablet_tool_type.unwrap_or(1),
             tablet_active_tool_keys: initial_tablet_tool_type
-                .map(|tool_type| match tool_type {
-                    2 => KeyCode::BTN_TOOL_RUBBER.0,
-                    3 => KeyCode::BTN_TOOL_BRUSH.0,
-                    4 => KeyCode::BTN_TOOL_PENCIL.0,
-                    5 => KeyCode::BTN_TOOL_AIRBRUSH.0,
-                    6 => KeyCode::BTN_TOOL_MOUSE.0,
-                    7 => KeyCode::BTN_TOOL_LENS.0,
-                    _ => KeyCode::BTN_TOOL_PEN.0,
+                .and_then(|tool_type| match tool_type {
+                    2 => Some(KeyCode::BTN_TOOL_RUBBER.0),
+                    3 => Some(KeyCode::BTN_TOOL_BRUSH.0),
+                    4 => Some(KeyCode::BTN_TOOL_PENCIL.0),
+                    5 => Some(KeyCode::BTN_TOOL_AIRBRUSH.0),
+                    6 => Some(KeyCode::BTN_TOOL_MOUSE.0),
+                    7 => Some(KeyCode::BTN_TOOL_LENS.0),
+                    8 => None,
+                    _ => Some(KeyCode::BTN_TOOL_PEN.0),
                 })
                 .into_iter()
                 .collect(),
@@ -621,11 +717,19 @@ impl TrackedDevice {
             tablet_slider,
             tablet_slider_range,
             tablet_slider_changed: false,
+            tablet_size_major,
+            tablet_size_minor,
+            tablet_size_major_resolution,
+            tablet_size_minor_resolution,
+            tablet_last_event_size_major: tablet_size_major,
+            tablet_last_event_size_minor: tablet_size_minor,
+            tablet_size_major_changed: false,
+            tablet_size_minor_changed: false,
             tablet_wheel_delta: 0.0,
             tablet_wheel_discrete: 0,
             tablet_wheel_changed: false,
-            tablet_tip_down: false,
-            tablet_tip_pending: None,
+            tablet_tip_down: initial_tablet_tool_type == Some(8),
+            tablet_tip_pending: (initial_tablet_tool_type == Some(8)).then_some(true),
             tablet_touch_button_changed: false,
             tablet_area_sequence_suppressed: false,
             tablet_left_handed_applied: false,
@@ -637,7 +741,15 @@ impl TrackedDevice {
             tablet_proximity_timer_enabled: true,
             tablet_buttons_down: 0,
             tablet_held_buttons: Vec::new(),
+            tablet_ignored_initial_buttons: initial_tablet_buttons,
             tablet_pending_button_events: Vec::new(),
+            pad_ring_ranges,
+            pad_strip_ranges,
+            pad_ring_values,
+            pad_strip_values,
+            pad_changed_axes: 0,
+            pad_abs_misc_terminator: false,
+            pad_dial_values: [None; 2],
             mt_slots,
             current_slot: 0,
             protocol_a_tracking_id: None,
@@ -648,6 +760,9 @@ impl TrackedDevice {
             pinch_base_dist: 0.0,
             pinch_base_angle: 0.0,
             pinch_fingers: 0,
+            swipe_active: false,
+            swipe_fingers: 0,
+            mt_contact_count_changed: false,
             held_keys: Vec::new(),
             held_buttons: Vec::new(),
             last_typing_time: None,
@@ -1071,6 +1186,19 @@ unsafe fn tablet_tool_payload(
             0.0
         }
     });
+    let size_major = if td.tablet_size_major_resolution > 0 {
+        td.tablet_size_major / f64::from(td.tablet_size_major_resolution)
+    } else {
+        0.0
+    };
+    let size_minor = if td.tablet_size_minor_resolution > 0 {
+        td.tablet_size_minor / f64::from(td.tablet_size_minor_resolution)
+    } else {
+        0.0
+    };
+    (*lib_dev).tablet_current_tool_type = tool_type;
+    (*lib_dev).tablet_current_size_major = size_major;
+    (*lib_dev).tablet_current_size_minor = size_minor;
     TabletToolEvent {
         time_usec,
         tool,
@@ -1110,6 +1238,10 @@ unsafe fn tablet_tool_payload(
         wheel_delta: td.tablet_wheel_delta,
         wheel_discrete: td.tablet_wheel_discrete,
         wheel_changed: td.tablet_wheel_changed,
+        size_major,
+        size_minor,
+        size_major_changed: td.tablet_size_major_changed,
+        size_minor_changed: td.tablet_size_minor_changed,
         tip_state: u32::from(td.tablet_tip_down),
         button: 0,
         button_state: 0,
@@ -1191,6 +1323,27 @@ unsafe fn touch_arbitration_active(
     };
     if (*touch_device).has_gesture {
         return true;
+    }
+    if (*tablet).tablet_current_tool_type == 8 {
+        let Some((touch_x, touch_y)) = touch_point else {
+            return false;
+        };
+        let (tablet_x_min, _) = (*tablet).abs_x_range.unwrap_or((0, 0));
+        let (tablet_y_min, _) = (*tablet).abs_y_range.unwrap_or((0, 0));
+        let (touch_x_min, _) = (*touch_device).abs_x_range.unwrap_or((0, 0));
+        let (touch_y_min, _) = (*touch_device).abs_y_range.unwrap_or((0, 0));
+        let tablet_x_resolution = f64::from((*tablet).abs_x_resolution.unwrap_or(1).max(1));
+        let tablet_y_resolution = f64::from((*tablet).abs_y_resolution.unwrap_or(1).max(1));
+        let touch_x_resolution = f64::from((*touch_device).abs_x_resolution.unwrap_or(1).max(1));
+        let touch_y_resolution = f64::from((*touch_device).abs_y_resolution.unwrap_or(1).max(1));
+        let totem_x = ((*tablet).tablet_current_x - f64::from(tablet_x_min)) / tablet_x_resolution;
+        let totem_y = ((*tablet).tablet_current_y - f64::from(tablet_y_min)) / tablet_y_resolution;
+        let finger_x = (touch_x - f64::from(touch_x_min)) / touch_x_resolution;
+        let finger_y = (touch_y - f64::from(touch_y_min)) / touch_y_resolution;
+        let half_width = (*tablet).tablet_current_size_major * 0.5;
+        let half_height = (*tablet).tablet_current_size_minor * 0.5;
+        return (finger_x - totem_x).abs() <= half_width
+            && (finger_y - totem_y).abs() <= half_height;
     }
 
     // Direct touchscreens are the conservative fallback pairing until a
@@ -1471,6 +1624,15 @@ impl BackendState {
             };
             (d, None)
         };
+        {
+            use std::os::fd::AsRawFd;
+            let clock_id: libc::c_int = libc::CLOCK_MONOTONIC;
+            let request = ((1_u64 << 30)
+                | ((std::mem::size_of::<libc::c_int>() as u64) << 16)
+                | ((b'E' as u64) << 8)
+                | 0xa0) as libc::c_ulong;
+            let _ = libc::ioctl(device.as_raw_fd(), request, &clock_id);
+        }
 
         let name = device.name().unwrap_or("Unknown").to_string();
 
@@ -1495,6 +1657,8 @@ impl BackendState {
         let mut mt_y_range_raw = None;
         let mut mt_x_resolution = None;
         let mut mt_y_resolution = None;
+        let mut mt_size_major_resolution = None;
+        let mut mt_size_minor_resolution = None;
         if let Ok(absinfo) = device.get_absinfo() {
             for (axis, info) in absinfo {
                 has_abs_x |= axis == AbsoluteAxisCode::ABS_X;
@@ -1515,6 +1679,10 @@ impl BackendState {
                 } else if axis == AbsoluteAxisCode::ABS_MT_POSITION_Y {
                     mt_y_resolution = Some(info.resolution());
                     mt_y_range_raw = Some((info.minimum(), info.maximum()));
+                } else if axis == AbsoluteAxisCode::ABS_MT_TOUCH_MAJOR {
+                    mt_size_major_resolution = Some(info.resolution());
+                } else if axis == AbsoluteAxisCode::ABS_MT_TOUCH_MINOR {
+                    mt_size_minor_resolution = Some(info.resolution());
                 }
                 invalid_negative_resolution |= info.resolution() < 0;
 
@@ -1550,6 +1718,10 @@ impl BackendState {
             (mt_x_resolution, mt_y_resolution),
             (Some(x), Some(y)) if (x == 0) != (y == 0)
         );
+        let mt_size_resolution_mismatch = matches!(
+            (mt_size_major_resolution, mt_size_minor_resolution),
+            (Some(major), Some(minor)) if (major == 0) != (minor == 0)
+        );
         if has_abs_x != has_abs_y
             || ((has_abs_x && has_abs_y)
                 && (has_mt_slot || has_mt_x || has_mt_y)
@@ -1559,6 +1731,7 @@ impl BackendState {
             || invalid_negative_resolution
             || abs_resolution_mismatch
             || mt_resolution_mismatch
+            || mt_size_resolution_mismatch
         {
             return;
         }
@@ -1644,6 +1817,7 @@ impl BackendState {
         let input_id = device.input_id();
         let has_tablet_pad = tag_tablet_pad
             || (use_evdev_fallback
+                && !is_keyboard
                 && !has_pen
                 && !has_finger
                 && !has_touch_button
@@ -1760,6 +1934,76 @@ impl BackendState {
         }
         (*lib_dev).accel_available |= has_tablet;
         (*lib_dev).event_codes = event_codes;
+        (*lib_dev).left_handed_available = is_pointer;
+        if has_tablet_pad {
+            let mut pad_button_codes = Vec::new();
+            let mut pad_left_handed_available = true;
+            let database = libwacom_database_new();
+            if !database.is_null() {
+                let wacom = libwacom_new_from_usbid(
+                    database,
+                    libc::c_int::from(input_id.vendor()),
+                    libc::c_int::from(input_id.product()),
+                    std::ptr::null_mut(),
+                );
+                if !wacom.is_null() {
+                    pad_left_handed_available = libwacom_is_reversible(wacom) != 0;
+                    for index in 0..libwacom_get_num_buttons(wacom).max(0) {
+                        let code = libwacom_get_button_evdev_code(
+                            wacom,
+                            (b'A' + index as u8) as libc::c_char,
+                        );
+                        if code > 0
+                            && code <= i32::from(u16::MAX)
+                            && (*lib_dev).event_codes.contains(&(code as u16))
+                        {
+                            pad_button_codes.push(code as u16);
+                        }
+                    }
+                    libwacom_destroy(wacom);
+                }
+                libwacom_database_destroy(database);
+            }
+            if pad_button_codes.is_empty() {
+                for range in [0x100_u16..0x10a, 0x126..0x128, 0x130..0x136, 0x110..0x117] {
+                    pad_button_codes
+                        .extend(range.filter(|code| (*lib_dev).event_codes.contains(code)));
+                }
+            }
+            (*lib_dev).tablet_pad_button_codes = pad_button_codes;
+            (*lib_dev).left_handed_available = pad_left_handed_available;
+            (*lib_dev).tablet_pad_num_dials = u32::from(rel.is_some_and(|axes| {
+                axes.contains(RelativeAxisCode::REL_WHEEL)
+                    || axes.contains(RelativeAxisCode::REL_DIAL)
+            })) + u32::from(
+                rel.is_some_and(|axes| axes.contains(RelativeAxisCode::REL_HWHEEL)),
+            );
+            (*lib_dev).tablet_pad_num_rings =
+                u32::from(abs.is_some_and(|axes| axes.contains(AbsoluteAxisCode::ABS_WHEEL)))
+                    + u32::from(
+                        abs.is_some_and(|axes| axes.contains(AbsoluteAxisCode::ABS_THROTTLE)),
+                    );
+            (*lib_dev).tablet_pad_num_strips =
+                u32::from(abs.is_some_and(|axes| axes.contains(AbsoluteAxisCode::ABS_RX)))
+                    + u32::from(abs.is_some_and(|axes| axes.contains(AbsoluteAxisCode::ABS_RY)));
+            (*lib_dev).tablet_pad_mode_group =
+                Box::into_raw(Box::new(LibinputTabletPadModeGroup {
+                    refcount: std::sync::atomic::AtomicI32::new(1),
+                    user_data: std::ptr::null_mut(),
+                    device: lib_dev,
+                    index: 0,
+                    num_modes: if input_id.vendor() == 0x056a && input_id.product() == 0x034e {
+                        4
+                    } else {
+                        1
+                    },
+                    current_mode: 0,
+                    num_buttons: (*lib_dev).tablet_pad_button_codes.len() as u32,
+                    num_dials: (*lib_dev).tablet_pad_num_dials,
+                    num_rings: (*lib_dev).tablet_pad_num_rings,
+                    num_strips: (*lib_dev).tablet_pad_num_strips,
+                }));
+        }
         let has_left_button = (*lib_dev).event_codes.contains(&KeyCode::BTN_LEFT.0);
         let has_right_button = (*lib_dev).event_codes.contains(&KeyCode::BTN_RIGHT.0);
         let has_middle_button = (*lib_dev).event_codes.contains(&KeyCode::BTN_MIDDLE.0);
@@ -1999,7 +2243,6 @@ impl BackendState {
         }
         td.wheel_is_virtual = applied_quirks.is_virtual;
         td.is_lenovo_scrollpoint = applied_quirks.model_lenovo_scrollpoint;
-        self.devices.insert(fd, td);
 
         out.push(LibinputEvent {
             event_type: LibinputEventType::LIBINPUT_EVENT_DEVICE_ADDED,
@@ -2007,6 +2250,19 @@ impl BackendState {
             context: ctx,
             device: lib_dev,
         });
+        if td.tablet_tool_type == 8 && td.tablet_proximity_pending == Some(true) {
+            let mut initial_events = VecDeque::new();
+            Self::process_tablet_tool_event(
+                &InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0),
+                systime_to_usec(SystemTime::now()),
+                lib_dev,
+                ctx,
+                &mut td,
+                &mut initial_events,
+            );
+            out.extend(initial_events);
+        }
+        self.devices.insert(fd, td);
     }
 
     pub unsafe fn release_active_inputs(
@@ -2066,21 +2322,6 @@ impl BackendState {
         }
         if !tracked.tablet_tool.is_null() {
             let tool = tracked.tablet_tool;
-            if tracked.tablet_tip_down {
-                tracked.tablet_tip_down = false;
-                tracked.tablet_tip_pending = None;
-                (*tool)
-                    .refcount
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                out.push_back(LibinputEvent {
-                    event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_TIP,
-                    payload: EventPayload::TabletTool(tablet_tool_payload(
-                        tracked, device, time_usec, tool, 1,
-                    )),
-                    context: ctx,
-                    device,
-                });
-            }
             for button in std::mem::take(&mut tracked.tablet_held_buttons) {
                 let seat_button_count = release_seat_button(device);
                 (*tool)
@@ -2093,6 +2334,21 @@ impl BackendState {
                 out.push_back(LibinputEvent {
                     event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_BUTTON,
                     payload: EventPayload::TabletTool(payload),
+                    context: ctx,
+                    device,
+                });
+            }
+            if tracked.tablet_tip_down {
+                tracked.tablet_tip_down = false;
+                tracked.tablet_tip_pending = None;
+                (*tool)
+                    .refcount
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                out.push_back(LibinputEvent {
+                    event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_TIP,
+                    payload: EventPayload::TabletTool(tablet_tool_payload(
+                        tracked, device, time_usec, tool, 1,
+                    )),
                     context: ctx,
                     device,
                 });
@@ -2375,6 +2631,7 @@ impl BackendState {
                 && !unsafe { &*lib_dev }.has_touch
                 && !unsafe { &*lib_dev }.has_gesture
                 && !unsafe { &*lib_dev }.has_tablet_pad;
+            let is_tablet_pad = unsafe { &*lib_dev }.has_tablet_pad;
             let cfg_tap = unsafe { &*lib_dev }.tap_enabled;
             let cfg_nat = unsafe { &*lib_dev }.natural_scroll;
             let cfg_dwt = unsafe { &*lib_dev }.dwt_enabled;
@@ -2402,8 +2659,30 @@ impl BackendState {
             for ev in &batch {
                 let ts_usec = systime_to_usec(ev.timestamp());
 
+                if is_tablet_pad {
+                    Self::process_tablet_pad_event(ev, ts_usec, lib_dev, ctx, td, out);
+                    continue;
+                }
+
                 if is_tablet_tool {
                     Self::process_tablet_tool_event(ev, ts_usec, lib_dev, ctx, td, out);
+                    continue;
+                }
+
+                // Composite gaming mice and receiver nodes may expose both
+                // relative pointer axes and ordinary keyboard keys. Route the
+                // key range through the keyboard engine without stealing the
+                // device's BTN_* events from pointer handling.
+                if is_kbd && is_ptr && ev.event_type() == EventType::KEY && ev.code() < 0x100 {
+                    Self::process_keyboard_event(
+                        ev,
+                        ts_usec,
+                        lib_dev,
+                        ctx,
+                        td,
+                        out,
+                        &mut self.global_typing_time,
+                    );
                     continue;
                 }
 
@@ -2454,6 +2733,59 @@ impl BackendState {
                         touch_arbitrated,
                     );
                 }
+            }
+        }
+
+        // A tablet may become active without the paired touchscreen
+        // producing another frame. Cancel an already-reported contact in
+        // this dispatch cycle so clients cannot keep using a stale touch
+        // underneath a pen or totem.
+        for td in self.devices.values_mut() {
+            let lib_dev = td.lib_device;
+            let tablet_is_active =
+                (*lib_dev).has_touch && active_tablet_for_touch(ctx, lib_dev).is_some();
+            let tablet_just_activated = tablet_is_active && !td.touch_arbitration_tablet_was_active;
+            td.touch_arbitration_tablet_was_active = tablet_is_active;
+            if !tablet_just_activated
+                || !td.mt_slots.iter().any(|slot| {
+                    slot.reported && touch_arbitration_active(ctx, lib_dev, Some((slot.x, slot.y)))
+                })
+            {
+                continue;
+            }
+            td.touch_arbitration_suppressed = true;
+            let time_usec = systime_to_usec(SystemTime::now());
+            let mut cancelled = false;
+            for (slot_index, slot) in td.mt_slots.iter_mut().enumerate() {
+                if !slot.reported {
+                    continue;
+                }
+                let seat_slot = slot.seat_slot.take().unwrap_or(-1);
+                release_touch_seat_slot(ctx, seat_slot);
+                slot.reported = false;
+                slot.palm_suppressed = slot.active;
+                slot.dirty = false;
+                cancelled = true;
+                out.push_back(LibinputEvent {
+                    event_type: LibinputEventType::LIBINPUT_EVENT_TOUCH_CANCEL,
+                    payload: EventPayload::TouchCancel(TouchEvent {
+                        time_usec,
+                        slot: slot_index as i32,
+                        seat_slot,
+                        x: slot.x,
+                        y: slot.y,
+                    }),
+                    context: ctx,
+                    device: lib_dev,
+                });
+            }
+            if cancelled {
+                out.push_back(LibinputEvent {
+                    event_type: LibinputEventType::LIBINPUT_EVENT_TOUCH_FRAME,
+                    payload: EventPayload::TouchFrame { time_usec },
+                    context: ctx,
+                    device: lib_dev,
+                });
             }
         }
 
@@ -2760,6 +3092,227 @@ impl BackendState {
     // Keyboard event processing
     // -----------------------------------------------------------------------
 
+    unsafe fn process_tablet_pad_event(
+        ev: &InputEvent,
+        ts_usec: u64,
+        lib_dev: *mut LibinputDevice,
+        ctx: *mut LibinputContext,
+        td: &mut TrackedDevice,
+        out: &mut VecDeque<LibinputEvent>,
+    ) {
+        let payload = |time_usec, device: *mut LibinputDevice| TabletPadEvent {
+            time_usec,
+            button: 0,
+            button_state: 0,
+            key: 0,
+            key_state: 0,
+            dial_delta_v120: 0.0,
+            dial_number: 0,
+            mode: if (*device).tablet_pad_mode_group.is_null() {
+                0
+            } else {
+                (*(*device).tablet_pad_mode_group).current_mode
+            },
+            mode_group: (*device).tablet_pad_mode_group,
+            ring_number: 0,
+            ring_position: 0.0,
+            ring_source: 0,
+            strip_number: 0,
+            strip_position: 0.0,
+            strip_source: 0,
+        };
+
+        if ev.event_type() == EventType::KEY {
+            if ev.value() == 2 || ev.code() == KeyCode::BTN_STYLUS.0 {
+                return;
+            }
+            let state = u32::from(ev.value() != 0);
+            if (*lib_dev).vendor_id == 0x056a && matches!(ev.code(), 0x240 | 0x243 | 0x278) {
+                let mut event = payload(ts_usec, lib_dev);
+                event.key = u32::from(ev.code());
+                event.key_state = state;
+                out.push_back(LibinputEvent {
+                    event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_PAD_KEY,
+                    payload: EventPayload::TabletPad(event),
+                    context: ctx,
+                    device: lib_dev,
+                });
+                return;
+            }
+            let Some(button) = (*lib_dev)
+                .tablet_pad_button_codes
+                .iter()
+                .position(|code| *code == ev.code())
+            else {
+                return;
+            };
+            if state == 1 && (*lib_dev).vendor_id == 0x056a && (*lib_dev).product_id == 0x034e {
+                let mode = match ev.code() {
+                    0x109 => Some(0),
+                    0x130 => Some(1),
+                    0x131 => Some(2),
+                    0x132 => Some(3),
+                    _ => None,
+                };
+                if let Some(mode) = mode {
+                    (*(*lib_dev).tablet_pad_mode_group).current_mode = mode;
+                }
+            }
+            let mut event = payload(ts_usec, lib_dev);
+            event.button = button as u32;
+            event.button_state = state;
+            out.push_back(LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_PAD_BUTTON,
+                payload: EventPayload::TabletPad(event),
+                context: ctx,
+                device: lib_dev,
+            });
+            return;
+        }
+
+        if ev.event_type() == EventType::RELATIVE {
+            match ev.code() {
+                code if code == RelativeAxisCode::REL_DIAL.0 => {
+                    td.pad_dial_values[0] = Some(f64::from(ev.value()) * 120.0);
+                }
+                code if code == RelativeAxisCode::REL_WHEEL.0 => {
+                    if !td.supports_hi_res_vertical {
+                        td.pad_dial_values[0] = Some(f64::from(-ev.value()) * 120.0);
+                    }
+                }
+                code if code == RelativeAxisCode::REL_HWHEEL.0 => {
+                    if !td.supports_hi_res_horizontal {
+                        td.pad_dial_values[1] = Some(f64::from(ev.value()) * 120.0);
+                    }
+                }
+                code if code == RelativeAxisCode::REL_WHEEL_HI_RES.0 => {
+                    td.pad_dial_values[0] = Some(f64::from(-ev.value()));
+                }
+                code if code == RelativeAxisCode::REL_HWHEEL_HI_RES.0 => {
+                    td.pad_dial_values[1] = Some(f64::from(ev.value()));
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if ev.event_type() == EventType::ABSOLUTE {
+            let (axis_bit, slot) = if ev.code() == AbsoluteAxisCode::ABS_WHEEL.0 {
+                (Some(1_u8), Some((&mut td.pad_ring_values[0], 0_usize)))
+            } else if ev.code() == AbsoluteAxisCode::ABS_THROTTLE.0 {
+                (Some(2), Some((&mut td.pad_ring_values[1], 1)))
+            } else if ev.code() == AbsoluteAxisCode::ABS_RX.0 {
+                (Some(4), Some((&mut td.pad_strip_values[0], 2)))
+            } else if ev.code() == AbsoluteAxisCode::ABS_RY.0 {
+                (Some(8), Some((&mut td.pad_strip_values[1], 3)))
+            } else {
+                (None, None)
+            };
+            if ev.code() == AbsoluteAxisCode::ABS_MISC.0 {
+                td.pad_abs_misc_terminator = ev.value() == 0;
+            } else if let (Some(bit), Some((value, _))) = (axis_bit, slot) {
+                if td.pad_changed_axes & bit != 0 && ev.value() == 0 {
+                    td.pad_changed_axes &= !bit;
+                } else {
+                    *value = ev.value();
+                    td.pad_changed_axes |= bit;
+                }
+            }
+            return;
+        }
+
+        if ev.event_type() != EventType::SYNCHRONIZATION || ev.code() != 0 {
+            return;
+        }
+
+        for dial in 0..2 {
+            if let Some(delta) = td.pad_dial_values[dial].take() {
+                let mut event = payload(ts_usec, lib_dev);
+                event.dial_number = dial as u32;
+                event.dial_delta_v120 = delta;
+                out.push_back(LibinputEvent {
+                    event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_PAD_DIAL,
+                    payload: EventPayload::TabletPad(event),
+                    context: ctx,
+                    device: lib_dev,
+                });
+            }
+        }
+        for ring in 0..2 {
+            let bit = 1 << ring;
+            if td.pad_changed_axes & bit == 0 {
+                continue;
+            }
+            let mut position = td.pad_ring_ranges[ring]
+                .filter(|(minimum, maximum)| maximum > minimum)
+                .map(|(minimum, maximum)| {
+                    let mut normalized = f64::from(td.pad_ring_values[ring] - minimum)
+                        / f64::from(maximum - minimum + 1)
+                        - 0.25;
+                    if normalized < 0.0 {
+                        normalized += 1.0;
+                    }
+                    normalized * 360.0
+                })
+                .unwrap_or(0.0);
+            if td.pad_abs_misc_terminator {
+                position = -1.0;
+            } else if (*lib_dev).left_handed {
+                position = (position + 180.0) % 360.0;
+            }
+            let mut event = payload(ts_usec, lib_dev);
+            event.ring_number = ring as u32;
+            event.ring_position = position;
+            event.ring_source = 2;
+            out.push_back(LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_PAD_RING,
+                payload: EventPayload::TabletPad(event),
+                context: ctx,
+                device: lib_dev,
+            });
+        }
+        for strip in 0..2 {
+            let bit = 1 << (strip + 2);
+            if td.pad_changed_axes & bit == 0 {
+                continue;
+            }
+            let value = td.pad_strip_values[strip];
+            let mut position = td.pad_strip_ranges[strip]
+                .filter(|(minimum, maximum)| maximum > minimum)
+                .map(|(minimum, maximum)| {
+                    if value == 0 {
+                        0.0
+                    } else if (*lib_dev).vendor_id == 0x056a {
+                        if maximum <= 1 {
+                            0.0
+                        } else {
+                            f64::from(value).log2() / f64::from(maximum).log2()
+                        }
+                    } else {
+                        f64::from(value - minimum) / f64::from(maximum - minimum)
+                    }
+                })
+                .unwrap_or(0.0);
+            if td.pad_abs_misc_terminator {
+                position = -1.0;
+            } else if (*lib_dev).left_handed {
+                position = 1.0 - position;
+            }
+            let mut event = payload(ts_usec, lib_dev);
+            event.strip_number = strip as u32;
+            event.strip_position = position;
+            event.strip_source = 2;
+            out.push_back(LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_PAD_STRIP,
+                payload: EventPayload::TabletPad(event),
+                context: ctx,
+                device: lib_dev,
+            });
+        }
+        td.pad_changed_axes = 0;
+        td.pad_abs_misc_terminator = false;
+    }
+
     unsafe fn process_tablet_tool_event(
         ev: &InputEvent,
         ts_usec: u64,
@@ -2799,6 +3352,12 @@ impl BackendState {
             } else if ev.code() == AbsoluteAxisCode::ABS_WHEEL.0 {
                 td.tablet_slider = f64::from(ev.value());
                 td.tablet_slider_changed = true;
+            } else if ev.code() == AbsoluteAxisCode::ABS_MT_TOUCH_MAJOR.0 {
+                td.tablet_size_major = f64::from(ev.value());
+                td.tablet_size_major_changed = true;
+            } else if ev.code() == AbsoluteAxisCode::ABS_MT_TOUCH_MINOR.0 {
+                td.tablet_size_minor = f64::from(ev.value());
+                td.tablet_size_minor_changed = true;
             } else if ev.code() == AbsoluteAxisCode::ABS_MISC.0 && ev.value() >= 0 {
                 td.tablet_tool_id = ev.value() as u64;
             } else if ev.code() == AbsoluteAxisCode::ABS_MT_TOOL_TYPE.0 && ev.value() == 10 {
@@ -2847,6 +3406,16 @@ impl BackendState {
                 };
             if is_tool_button {
                 let pressed = ev.value() != 0;
+                if let Some(index) = td
+                    .tablet_ignored_initial_buttons
+                    .iter()
+                    .position(|button| *button == u32::from(ev.code()))
+                {
+                    if !pressed {
+                        td.tablet_ignored_initial_buttons.remove(index);
+                    }
+                    return;
+                }
                 if pressed {
                     if !td.tablet_held_buttons.contains(&u32::from(ev.code())) {
                         td.tablet_held_buttons.push(u32::from(ev.code()));
@@ -2954,6 +3523,8 @@ impl BackendState {
                     td.tablet_tilt_y_changed = false;
                     td.tablet_rotation_changed = false;
                     td.tablet_slider_changed = false;
+                    td.tablet_size_major_changed = false;
+                    td.tablet_size_minor_changed = false;
                     td.tablet_wheel_changed = false;
                     td.tablet_axes_changed = false;
                     return;
@@ -2978,6 +3549,8 @@ impl BackendState {
                 td.tablet_tilt_y_changed = false;
                 td.tablet_rotation_changed = false;
                 td.tablet_slider_changed = false;
+                td.tablet_size_major_changed = false;
+                td.tablet_size_minor_changed = false;
                 td.tablet_wheel_changed = false;
                 td.tablet_axes_changed = false;
                 return;
@@ -3033,6 +3606,8 @@ impl BackendState {
             td.tablet_last_event_tilt_y = td.tablet_tilt_y;
             td.tablet_last_event_rotation = td.tablet_rotation;
             td.tablet_last_event_slider = td.tablet_slider;
+            td.tablet_last_event_size_major = td.tablet_size_major;
+            td.tablet_last_event_size_minor = td.tablet_size_minor;
             td.tablet_x_changed = false;
             td.tablet_y_changed = false;
             td.tablet_pressure_changed = false;
@@ -3041,6 +3616,8 @@ impl BackendState {
             td.tablet_tilt_y_changed = false;
             td.tablet_rotation_changed = false;
             td.tablet_slider_changed = false;
+            td.tablet_size_major_changed = false;
+            td.tablet_size_minor_changed = false;
             td.tablet_wheel_delta = 0.0;
             td.tablet_wheel_discrete = 0;
             td.tablet_wheel_changed = false;
@@ -3097,6 +3674,8 @@ impl BackendState {
             td.tablet_tilt_y_changed = false;
             td.tablet_rotation_changed = false;
             td.tablet_slider_changed = false;
+            td.tablet_size_major_changed = false;
+            td.tablet_size_minor_changed = false;
             td.tablet_wheel_changed = false;
             td.tablet_axes_changed = false;
             return;
@@ -3132,6 +3711,8 @@ impl BackendState {
             td.tablet_tilt_y_changed = false;
             td.tablet_rotation_changed = false;
             td.tablet_slider_changed = false;
+            td.tablet_size_major_changed = false;
+            td.tablet_size_minor_changed = false;
             td.tablet_wheel_changed = false;
             td.tablet_axes_changed = false;
             (*ctx).arm_timer(Some(Duration::from_millis(30)));
@@ -3146,6 +3727,8 @@ impl BackendState {
             td.tablet_tilt_y,
             td.tablet_rotation,
             td.tablet_slider,
+            td.tablet_size_major,
+            td.tablet_size_minor,
         ));
         let converts_eraser_to_button = in_proximity
             && td.tablet_tool_type == 2
@@ -3189,6 +3772,8 @@ impl BackendState {
             td.tablet_tilt_y_changed = td.tablet_has_tilt;
             td.tablet_rotation_changed = td.tablet_has_rotation;
             td.tablet_slider_changed = td.tablet_has_slider;
+            td.tablet_size_major_changed = td.tablet_has_size;
+            td.tablet_size_minor_changed = td.tablet_has_size;
             td.tablet_wheel_changed = td.tablet_has_wheel;
         }
         let tool = if in_proximity {
@@ -3244,6 +3829,8 @@ impl BackendState {
             td.tablet_tilt_y = td.tablet_last_event_tilt_y;
             td.tablet_rotation = td.tablet_last_event_rotation;
             td.tablet_slider = td.tablet_last_event_slider;
+            td.tablet_size_major = td.tablet_last_event_size_major;
+            td.tablet_size_minor = td.tablet_last_event_size_minor;
             td.tablet_x_changed = false;
             td.tablet_y_changed = false;
             td.tablet_pressure_changed = false;
@@ -3252,6 +3839,8 @@ impl BackendState {
             td.tablet_tilt_y_changed = false;
             td.tablet_rotation_changed = false;
             td.tablet_slider_changed = false;
+            td.tablet_size_major_changed = false;
+            td.tablet_size_minor_changed = false;
             td.tablet_wheel_changed = false;
         }
         if eraser_return_to_pen {
@@ -3373,6 +3962,8 @@ impl BackendState {
             raw_tilt_y,
             raw_rotation,
             raw_slider,
+            raw_size_major,
+            raw_size_minor,
         )) = proximity_out_raw_axes
         {
             td.tablet_x = raw_x;
@@ -3383,6 +3974,8 @@ impl BackendState {
             td.tablet_tilt_y = raw_tilt_y;
             td.tablet_rotation = raw_rotation;
             td.tablet_slider = raw_slider;
+            td.tablet_size_major = raw_size_major;
+            td.tablet_size_minor = raw_size_minor;
         }
         td.tablet_last_event_x = td.tablet_x;
         td.tablet_last_event_y = td.tablet_y;
@@ -3392,6 +3985,8 @@ impl BackendState {
         td.tablet_last_event_tilt_y = td.tablet_tilt_y;
         td.tablet_last_event_rotation = td.tablet_rotation;
         td.tablet_last_event_slider = td.tablet_slider;
+        td.tablet_last_event_size_major = td.tablet_size_major;
+        td.tablet_last_event_size_minor = td.tablet_size_minor;
         td.tablet_x_changed = false;
         td.tablet_y_changed = false;
         td.tablet_pressure_changed = false;
@@ -3400,6 +3995,8 @@ impl BackendState {
         td.tablet_tilt_y_changed = false;
         td.tablet_rotation_changed = false;
         td.tablet_slider_changed = false;
+        td.tablet_size_major_changed = false;
+        td.tablet_size_minor_changed = false;
         td.tablet_wheel_delta = 0.0;
         td.tablet_wheel_discrete = 0;
         td.tablet_wheel_changed = false;
@@ -4534,10 +5131,13 @@ impl BackendState {
                     }
                 } else if code == KeyCode::BTN_TOOL_DOUBLETAP.0 {
                     td.touch_fingers = if value != 0 { 2 } else { 1 };
+                    td.mt_contact_count_changed = true;
                 } else if code == KeyCode::BTN_TOOL_TRIPLETAP.0 {
                     td.touch_fingers = if value != 0 { 3 } else { 2 };
+                    td.mt_contact_count_changed = true;
                 } else if code == KeyCode::BTN_TOOL_QUADTAP.0 {
                     td.touch_fingers = if value != 0 { 4 } else { 3 };
+                    td.mt_contact_count_changed = true;
                 } else {
                     // Physical click with finger-count remapping
                     let mut mapped = code;
@@ -4663,6 +5263,7 @@ impl BackendState {
                     let slot = td.current_slot;
                     if slot < td.mt_slots.len() {
                         let mt_slot = &mut td.mt_slots[slot];
+                        td.mt_contact_count_changed |= mt_slot.active != (val >= 0);
                         mt_slot.active = val >= 0;
                         mt_slot.tracking_id = val;
                         if val >= 0 {
@@ -4976,6 +5577,32 @@ impl BackendState {
                     return;
                 }
 
+                if std::mem::take(&mut td.mt_contact_count_changed) {
+                    let n_fingers = td.active_slot_count().max(td.touch_fingers as usize);
+                    if td.swipe_active && n_fingers < 3 {
+                        td.swipe_active = false;
+                        out.push_back(LibinputEvent {
+                            event_type: LibinputEventType::LIBINPUT_EVENT_GESTURE_SWIPE_END,
+                            payload: EventPayload::GestureSwipeEnd(GestureEvent {
+                                time_usec: ts_usec,
+                                finger_count: td.swipe_fingers,
+                                dx: 0.0,
+                                dy: 0.0,
+                                scale: 1.0,
+                                angle: 0.0,
+                                cancelled: false,
+                            }),
+                            context: ctx,
+                            device: lib_dev,
+                        });
+                    }
+                    td.current_dx = 0;
+                    td.current_dy = 0;
+                    td.remainder_x = 0.0;
+                    td.remainder_y = 0.0;
+                    return;
+                }
+
                 // ---- Pinch UPDATE on SYN_REPORT ----
                 if td.pinch_active && !dwt_active {
                     if let Some(dist) = td.primary_slot_distance() {
@@ -5086,17 +5713,38 @@ impl BackendState {
                 } else {
                     // 3+ fingers = swipe gesture
                     let gscale: f64 = 0.18;
+                    let (event_type, event_payload) = if td.swipe_active {
+                        (
+                            LibinputEventType::LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE,
+                            EventPayload::GestureSwipeUpdate(GestureEvent {
+                                time_usec: ts_usec,
+                                finger_count: td.swipe_fingers,
+                                dx: td.current_dx as f64 * gscale,
+                                dy: td.current_dy as f64 * gscale,
+                                scale: 1.0,
+                                angle: 0.0,
+                                cancelled: false,
+                            }),
+                        )
+                    } else {
+                        td.swipe_active = true;
+                        td.swipe_fingers = n_fingers as i32;
+                        (
+                            LibinputEventType::LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN,
+                            EventPayload::GestureSwipeBegin(GestureEvent {
+                                time_usec: ts_usec,
+                                finger_count: td.swipe_fingers,
+                                dx: 0.0,
+                                dy: 0.0,
+                                scale: 1.0,
+                                angle: 0.0,
+                                cancelled: false,
+                            }),
+                        )
+                    };
                     out.push_back(LibinputEvent {
-                        event_type: LibinputEventType::LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE,
-                        payload: EventPayload::GestureSwipeUpdate(GestureEvent {
-                            time_usec: ts_usec,
-                            finger_count: n_fingers as i32,
-                            dx: td.current_dx as f64 * gscale,
-                            dy: td.current_dy as f64 * gscale,
-                            scale: 1.0,
-                            angle: 0.0,
-                            cancelled: false,
-                        }),
+                        event_type,
+                        payload: event_payload,
                         context: ctx,
                         device: lib_dev,
                     });

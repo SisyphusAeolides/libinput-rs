@@ -13,7 +13,8 @@ mod udev;
 
 use crate::ffi_types::{
     BackendKind, EventPayload, LibinputContext, LibinputDevice, LibinputDeviceGroup, LibinputEvent,
-    LibinputEventType, LibinputInterface, LibinputSeat, LibinputTabletTool,
+    LibinputEventType, LibinputInterface, LibinputSeat, LibinputTabletPadModeGroup,
+    LibinputTabletTool,
 };
 
 use std::ffi::CStr;
@@ -1587,7 +1588,7 @@ pub unsafe extern "C" fn libinput_device_config_left_handed_is_available(
     if dev.is_null() {
         return 0;
     }
-    (*dev).has_pointer as libc::c_int
+    (*dev).left_handed_available as libc::c_int
 }
 
 #[no_mangle]
@@ -1595,7 +1596,7 @@ pub unsafe extern "C" fn libinput_device_config_left_handed_set(
     dev: *mut LibinputDevice,
     enabled: libc::c_int,
 ) -> u32 {
-    if dev.is_null() || !(*dev).has_pointer {
+    if dev.is_null() || !(*dev).left_handed_available {
         return 1;
     }
     (*dev).left_handed = enabled != 0;
@@ -2614,56 +2615,71 @@ pub unsafe extern "C" fn libinput_device_switch_has_switch(
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_tablet_pad_get_mode_group(
-    _dev: *const LibinputDevice,
-    _index: u32,
+    dev: *const LibinputDevice,
+    index: u32,
 ) -> *mut libc::c_void {
-    std::ptr::null_mut()
+    if dev.is_null() || !(*dev).has_tablet_pad || index != 0 {
+        return std::ptr::null_mut();
+    }
+    (*dev).tablet_pad_mode_group.cast()
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_tablet_pad_get_num_buttons(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    0
+    if dev.is_null() || !(*dev).has_tablet_pad {
+        return u32::MAX;
+    }
+    (*dev).tablet_pad_button_codes.len() as u32
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_tablet_pad_get_num_dials(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    0
+    if dev.is_null() || !(*dev).has_tablet_pad {
+        return u32::MAX;
+    }
+    (*dev).tablet_pad_num_dials
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_tablet_pad_get_num_mode_groups(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    0
+    u32::from(!dev.is_null() && (*dev).has_tablet_pad)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_tablet_pad_get_num_rings(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    0
+    if dev.is_null() || !(*dev).has_tablet_pad {
+        return u32::MAX;
+    }
+    (*dev).tablet_pad_num_rings
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_tablet_pad_get_num_strips(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    0
+    if dev.is_null() || !(*dev).has_tablet_pad {
+        return u32::MAX;
+    }
+    (*dev).tablet_pad_num_strips
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_tablet_pad_has_key(
     dev: *const LibinputDevice,
-    _code: u32,
+    code: u32,
 ) -> libc::c_int {
-    if dev.is_null() {
-        return 0;
+    if dev.is_null() || !(*dev).has_tablet_pad {
+        return -1;
     }
-    (*dev).has_tablet as libc::c_int
+    (code <= u16::MAX as u32 && (*dev).event_codes.contains(&(code as u16))) as libc::c_int
 }
 
 #[no_mangle]
@@ -2676,7 +2692,9 @@ pub unsafe extern "C" fn libinput_event_get_tablet_pad_event(
     match (*event).event_type {
         LibinputEventType::LIBINPUT_EVENT_TABLET_PAD_BUTTON
         | LibinputEventType::LIBINPUT_EVENT_TABLET_PAD_RING
-        | LibinputEventType::LIBINPUT_EVENT_TABLET_PAD_STRIP => event,
+        | LibinputEventType::LIBINPUT_EVENT_TABLET_PAD_STRIP
+        | LibinputEventType::LIBINPUT_EVENT_TABLET_PAD_KEY
+        | LibinputEventType::LIBINPUT_EVENT_TABLET_PAD_DIAL => event,
         _ => std::ptr::null_mut(),
     }
 }
@@ -2794,103 +2812,193 @@ pub unsafe extern "C" fn libinput_event_switch_get_time(event: *const LibinputEv
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_pad_get_button_number(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> u32 {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletPad(pad) => pad.button,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_pad_get_button_state(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> u32 {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletPad(pad) => pad.button_state,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_event_tablet_pad_get_key(_event: *const LibinputEvent) -> u32 {
-    0
+pub unsafe extern "C" fn libinput_event_tablet_pad_get_key(event: *const LibinputEvent) -> u32 {
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletPad(pad) => pad.key,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_pad_get_key_state(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> u32 {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletPad(pad) => pad.key_state,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_pad_get_dial_delta_v120(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> f64 {
-    0.0
+    if event.is_null() {
+        return 0.0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletPad(pad) => pad.dial_delta_v120,
+        _ => 0.0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_pad_get_dial_number(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> u32 {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletPad(pad) => pad.dial_number,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_event_tablet_pad_get_mode(_event: *const LibinputEvent) -> u32 {
-    0
+pub unsafe extern "C" fn libinput_event_tablet_pad_get_mode(event: *const LibinputEvent) -> u32 {
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletPad(pad) => pad.mode,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_pad_get_mode_group(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> *mut libc::c_void {
-    std::ptr::null_mut()
+    if event.is_null() {
+        return std::ptr::null_mut();
+    }
+    match &(*event).payload {
+        EventPayload::TabletPad(pad) => pad.mode_group.cast(),
+        _ => std::ptr::null_mut(),
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_pad_get_ring_number(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> u32 {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletPad(pad) => pad.ring_number,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_pad_get_ring_position(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> f64 {
-    0.0
+    if event.is_null() {
+        return 0.0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletPad(pad) => pad.ring_position,
+        _ => 0.0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_pad_get_ring_source(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> u32 {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletPad(pad) => pad.ring_source,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_pad_get_strip_number(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> u32 {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletPad(pad) => pad.strip_number,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_pad_get_strip_position(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> f64 {
-    0.0
+    if event.is_null() {
+        return 0.0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletPad(pad) => pad.strip_position,
+        _ => 0.0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_pad_get_strip_source(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> u32 {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletPad(pad) => pad.strip_source,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_pad_get_time_usec(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> u64 {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletPad(pad) => pad.time_usec,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
@@ -3091,16 +3199,28 @@ pub unsafe extern "C" fn libinput_event_tablet_tool_get_wheel_delta_discrete(
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_size_major(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> f64 {
-    0.0
+    if event.is_null() {
+        return 0.0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.size_major,
+        _ => 0.0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_size_minor(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> f64 {
-    0.0
+    if event.is_null() {
+        return 0.0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.size_minor,
+        _ => 0.0,
+    }
 }
 
 #[no_mangle]
@@ -3330,16 +3450,28 @@ pub unsafe extern "C" fn libinput_event_tablet_tool_wheel_has_changed(
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_size_major_has_changed(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> libc::c_int {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.size_major_changed as libc::c_int,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_size_minor_has_changed(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> libc::c_int {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.size_minor_changed as libc::c_int,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
@@ -3369,83 +3501,127 @@ pub unsafe extern "C" fn libinput_tablet_pad_mode_group_button_is_toggle(
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_pad_mode_group_get_index(
-    _group: *const libc::c_void,
+    group: *const libc::c_void,
 ) -> u32 {
-    0
+    if group.is_null() {
+        return 0;
+    }
+    (*group.cast::<LibinputTabletPadModeGroup>()).index
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_pad_mode_group_get_mode(
-    _group: *const libc::c_void,
+    group: *const libc::c_void,
 ) -> u32 {
-    0
+    if group.is_null() {
+        return 0;
+    }
+    (*group.cast::<LibinputTabletPadModeGroup>()).current_mode
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_pad_mode_group_get_num_modes(
-    _group: *const libc::c_void,
+    group: *const libc::c_void,
 ) -> u32 {
-    1
+    if group.is_null() {
+        return 0;
+    }
+    (*group.cast::<LibinputTabletPadModeGroup>()).num_modes
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_pad_mode_group_has_button(
-    _group: *const libc::c_void,
-    _button: u32,
+    group: *const libc::c_void,
+    button: u32,
 ) -> libc::c_int {
-    0
+    if group.is_null() {
+        return 0;
+    }
+    (button < (*group.cast::<LibinputTabletPadModeGroup>()).num_buttons) as libc::c_int
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_pad_mode_group_has_dial(
-    _group: *const libc::c_void,
-    _dial: u32,
+    group: *const libc::c_void,
+    dial: u32,
 ) -> libc::c_int {
-    0
+    if group.is_null() {
+        return 0;
+    }
+    (dial < (*group.cast::<LibinputTabletPadModeGroup>()).num_dials) as libc::c_int
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_pad_mode_group_has_ring(
-    _group: *const libc::c_void,
-    _ring: u32,
+    group: *const libc::c_void,
+    ring: u32,
 ) -> libc::c_int {
-    0
+    if group.is_null() {
+        return 0;
+    }
+    (ring < (*group.cast::<LibinputTabletPadModeGroup>()).num_rings) as libc::c_int
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_pad_mode_group_has_strip(
-    _group: *const libc::c_void,
-    _strip: u32,
+    group: *const libc::c_void,
+    strip: u32,
 ) -> libc::c_int {
-    0
+    if group.is_null() {
+        return 0;
+    }
+    (strip < (*group.cast::<LibinputTabletPadModeGroup>()).num_strips) as libc::c_int
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_pad_mode_group_ref(
     group: *mut libc::c_void,
 ) -> *mut libc::c_void {
+    if !group.is_null() {
+        (*group.cast::<LibinputTabletPadModeGroup>())
+            .refcount
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     group
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_pad_mode_group_unref(
-    _group: *mut libc::c_void,
+    group: *mut libc::c_void,
 ) -> *mut libc::c_void {
-    std::ptr::null_mut()
+    if group.is_null() {
+        return std::ptr::null_mut();
+    }
+    let group_ref = &*group.cast::<LibinputTabletPadModeGroup>();
+    let current = group_ref
+        .refcount
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if current > 1 {
+        group_ref
+            .refcount
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+    group
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_pad_mode_group_set_user_data(
-    _group: *mut libc::c_void,
-    _data: *mut libc::c_void,
+    group: *mut libc::c_void,
+    data: *mut libc::c_void,
 ) {
+    if !group.is_null() {
+        (*group.cast::<LibinputTabletPadModeGroup>()).user_data = data;
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_pad_mode_group_get_user_data(
-    _group: *const libc::c_void,
+    group: *const libc::c_void,
 ) -> *mut libc::c_void {
-    std::ptr::null_mut()
+    if group.is_null() {
+        return std::ptr::null_mut();
+    }
+    (*group.cast::<LibinputTabletPadModeGroup>()).user_data
 }
 
 #[no_mangle]

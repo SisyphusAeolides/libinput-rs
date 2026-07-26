@@ -70,6 +70,8 @@ pub enum LibinputEventType {
     LIBINPUT_EVENT_TABLET_PAD_BUTTON = 700,
     LIBINPUT_EVENT_TABLET_PAD_RING = 701,
     LIBINPUT_EVENT_TABLET_PAD_STRIP = 702,
+    LIBINPUT_EVENT_TABLET_PAD_KEY = 703,
+    LIBINPUT_EVENT_TABLET_PAD_DIAL = 704,
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +150,40 @@ pub struct SwitchEvent {
     pub state: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct TabletPadEvent {
+    pub time_usec: u64,
+    pub button: u32,
+    pub button_state: u32,
+    pub key: u32,
+    pub key_state: u32,
+    pub dial_delta_v120: f64,
+    pub dial_number: u32,
+    pub mode: u32,
+    pub mode_group: *mut LibinputTabletPadModeGroup,
+    pub ring_number: u32,
+    pub ring_position: f64,
+    pub ring_source: u32,
+    pub strip_number: u32,
+    pub strip_position: f64,
+    pub strip_source: u32,
+}
+
+pub struct LibinputTabletPadModeGroup {
+    pub refcount: AtomicI32,
+    pub user_data: *mut libc::c_void,
+    pub device: *mut LibinputDevice,
+    pub index: u32,
+    pub num_modes: u32,
+    pub current_mode: u32,
+    pub num_buttons: u32,
+    pub num_dials: u32,
+    pub num_rings: u32,
+    pub num_strips: u32,
+}
+
+unsafe impl Send for LibinputTabletPadModeGroup {}
+
 pub struct LibinputTabletTool {
     pub refcount: AtomicI32,
     pub user_data: *mut libc::c_void,
@@ -213,6 +249,10 @@ pub struct TabletToolEvent {
     pub wheel_delta: f64,
     pub wheel_discrete: i32,
     pub wheel_changed: bool,
+    pub size_major: f64,
+    pub size_minor: f64,
+    pub size_major_changed: bool,
+    pub size_minor_changed: bool,
     pub tip_state: u32,
     pub button: u32,
     pub button_state: u32,
@@ -239,6 +279,7 @@ pub enum EventPayload {
     GesturePinchEnd(GestureEvent),
     SwitchToggle(SwitchEvent),
     TabletTool(TabletToolEvent),
+    TabletPad(TabletPadEvent),
     DeviceAdded,
     DeviceRemoved,
 }
@@ -333,6 +374,11 @@ pub struct LibinputDevice {
     pub has_switch: bool,
     pub has_tablet: bool,
     pub has_tablet_pad: bool,
+    pub tablet_pad_button_codes: Vec<u16>,
+    pub tablet_pad_num_dials: u32,
+    pub tablet_pad_num_rings: u32,
+    pub tablet_pad_num_strips: u32,
+    pub tablet_pad_mode_group: *mut LibinputTabletPadModeGroup,
     pub accel_available: bool,
     pub supports_button_scroll: bool,
     pub event_codes: Vec<u16>,
@@ -351,6 +397,7 @@ pub struct LibinputDevice {
     pub accel_speed: f64,
     pub accel_profile: u32,
     pub left_handed: bool,
+    pub left_handed_available: bool,
     pub scroll_method: u32,
     pub scroll_default_method: u32,
     pub scroll_button: u32,
@@ -373,6 +420,9 @@ pub struct LibinputDevice {
     pub tablet_current_x: f64,
     pub tablet_current_y: f64,
     pub tablet_current_tilt_x: f64,
+    pub tablet_current_tool_type: u32,
+    pub tablet_current_size_major: f64,
+    pub tablet_current_size_minor: f64,
     pub refcount: AtomicI32,
     pub user_data: *mut libc::c_void,
     pub seat: *mut LibinputSeat,
@@ -405,6 +455,11 @@ impl LibinputDevice {
             has_switch: false,
             has_tablet: false,
             has_tablet_pad: false,
+            tablet_pad_button_codes: Vec::new(),
+            tablet_pad_num_dials: 0,
+            tablet_pad_num_rings: 0,
+            tablet_pad_num_strips: 0,
+            tablet_pad_mode_group: std::ptr::null_mut(),
             accel_available: false,
             supports_button_scroll: false,
             event_codes: Vec::new(),
@@ -423,6 +478,7 @@ impl LibinputDevice {
             accel_speed: 0.0,
             accel_profile: 2,
             left_handed: false,
+            left_handed_available: false,
             scroll_method: 2,
             scroll_default_method: 2,
             scroll_button: 0,
@@ -445,6 +501,9 @@ impl LibinputDevice {
             tablet_current_x: 0.0,
             tablet_current_y: 0.0,
             tablet_current_tilt_x: 0.0,
+            tablet_current_tool_type: 0,
+            tablet_current_size_major: 0.0,
+            tablet_current_size_minor: 0.0,
             refcount: AtomicI32::new(1),
             user_data: std::ptr::null_mut(),
             seat,
@@ -470,6 +529,12 @@ impl Drop for LibinputDevice {
                 }
             }
             self.group = std::ptr::null_mut();
+        }
+        if !self.tablet_pad_mode_group.is_null() {
+            unsafe {
+                drop(Box::from_raw(self.tablet_pad_mode_group));
+            }
+            self.tablet_pad_mode_group = std::ptr::null_mut();
         }
     }
 }
