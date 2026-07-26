@@ -13,10 +13,10 @@ constructor for that permission.
   sink is absent.
 - Idris 2 makes invalid runtime states unconstructable with indexed types and
   total transitions.
-- Austral represents the exclusive grab as a linear token that must be
-  consumed exactly once by `release`; restricted descriptors and udev hotplug
-  permission are linear for the same reason.
+- Fortran supplies an independent executable state-machine model. Its runtime
+  checks cover fail-open grabbing, exactly-once restricted-descriptor closure,
+  and the rule that only a udev backend may enable hotplug.
 
-Run `make proofs` to check the DNF-packaged Agda and Idris models. If the
-Austral compiler is installed, the same target also type-checks the Austral
-model; `make proofs-strict` requires all three compilers.
+Run `make proofs` to check the DNF-packaged Agda, Idris 2, and GNU Fortran
+models. `make proofs-strict` first verifies that all three compilers are
+installed.

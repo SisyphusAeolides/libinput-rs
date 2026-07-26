@@ -121,19 +121,18 @@ The fail-open state machine is modeled three ways under `proofs/`:
 - Agda proves that a grab cannot be authorized while the output sink is absent;
 - Idris 2 uses indexed states and total transitions so invalid runtime states
   are unconstructable;
-- Austral represents the exclusive grab as a linear token that must be
-  consumed exactly once on release.
+- Fortran provides an independently compiled executable reference model for
+  fail-open grabbing, exactly-once descriptor closure, and udev-only hotplug.
 
-Agda and Idris 2 are available through DNF on the supported Fedora and EPEL
-targets:
+Agda, Idris 2, and GNU Fortran are available through DNF on the supported
+Fedora and EPEL targets:
 
 ```bash
-sudo dnf install Agda idris2
+sudo dnf install Agda idris2 gcc-gfortran
 make proofs
 ```
 
-When the Austral compiler is installed, `make proofs` also type-checks the
-Austral model. `make proofs-strict` requires all three compilers.
+`make proofs-strict` requires all three compilers and runs every model.
 
 ## Reference behavior
 

@@ -2,7 +2,7 @@ PREFIX ?= /usr
 LIBDIR ?= $(PREFIX)/lib64
 UNITDIR ?= $(PREFIX)/lib/systemd/system
 DESTDIR ?=
-AUSTRAL ?= austral
+FC = gfortran
 REFERENCE_LIBINPUT ?= /usr/lib64/libinput.so.10
 
 .PHONY: all build shared check packaging-check test abi-check proofs proofs-strict install
@@ -38,19 +38,21 @@ proofs:
 	cd proofs/agda && agda ResourceLifecycle.agda
 	cd proofs/idris && idris2 --check FailOpen.idr
 	cd proofs/idris && idris2 --check ResourceLifecycle.idr
-	@if command -v "$(AUSTRAL)" >/dev/null 2>&1; then \
-		cd proofs/austral && \
-		"$(AUSTRAL)" compile --target-type=tc FailOpen.aui,FailOpen.aum && \
-		"$(AUSTRAL)" compile --target-type=tc ResourceLifecycle.aui,ResourceLifecycle.aum; \
-	else \
-		echo "Austral compiler not found; Agda and Idris proofs passed"; \
-	fi
+	mkdir -p proofs/fortran/build
+	$(FC) -std=f2018 -Wall -Wextra -Werror -fcheck=all \
+		-J proofs/fortran/build -o proofs/fortran/build/fail-open \
+		proofs/fortran/fail_open.f90
+	proofs/fortran/build/fail-open
+	$(FC) -std=f2018 -Wall -Wextra -Werror -fcheck=all \
+		-J proofs/fortran/build -o proofs/fortran/build/resource-lifecycle \
+		proofs/fortran/resource_lifecycle.f90
+	proofs/fortran/build/resource-lifecycle
 
 proofs-strict:
 	command -v agda >/dev/null
 	command -v idris2 >/dev/null
-	command -v "$(AUSTRAL)" >/dev/null
-	$(MAKE) proofs AUSTRAL="$(AUSTRAL)"
+	command -v "$(FC)" >/dev/null
+	$(MAKE) proofs FC="$(FC)"
 
 install: all
 	install -Dm755 target/release/libinput-rs $(DESTDIR)$(PREFIX)/bin/libinput-rs

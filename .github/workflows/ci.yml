@@ -61,18 +61,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install proof compilers and Austral DNF dependencies
-        run: >-
-          dnf -y install Agda idris2 git make gcc python3 ocaml ocaml-findlib
-          ocaml-dune ocaml-ppxlib-devel ocaml-ppx-deriving-devel
-          ocaml-ppx-sexp-conv-devel ocaml-sexplib-devel ocaml-ounit-devel
-          ocaml-menhir ocaml-zarith-devel ocaml-yojson-devel
+      - name: Install proof compilers
+        run: dnf -y install Agda idris2 gcc-gfortran make
 
-      - name: Build Austral from official source
-        run: |
-          git clone https://github.com/austral/austral.git target/austral
-          git -C target/austral checkout 0962d2a8a5d77f7daacd7f696819520733f4897d
-          make -C target/austral -j2
-
-      - name: Check Agda, Idris, and Austral models
-        run: make proofs-strict AUSTRAL="$PWD/target/austral/austral"
+      - name: Check Agda, Idris, and Fortran models
+        run: make proofs-strict

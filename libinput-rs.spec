@@ -11,7 +11,10 @@ Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  cargo >= 1.75
 BuildRequires:  rust >= 1.75
+BuildRequires:  Agda
+BuildRequires:  idris2
 BuildRequires:  gcc
+BuildRequires:  gcc-gfortran
 BuildRequires:  make
 BuildRequires:  systemd-devel
 BuildRequires:  systemd-rpm-macros
@@ -41,6 +44,7 @@ install -Dm644 packaging/libinput-rs.8 %{buildroot}%{_mandir}/man8/libinput-rs.8
 
 %check
 CARGO_NET_OFFLINE=true cargo test --frozen
+make proofs-strict
 test ! -e %{buildroot}%{_libdir}/libinput.so.10
 
 %post
@@ -65,5 +69,6 @@ test ! -e %{buildroot}%{_libdir}/libinput.so.10
 %changelog
 * Sun Jul 26 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.2.0-1
 - Convert packaging and CI to DNF and RPM
+- Validate safety models with Rust, Fortran, Idris 2, and Agda toolchains
 - Preserve the system libinput library and isolate the experimental ABI build
 - Make touchpad grabbing fail open and remove display-manager ordering

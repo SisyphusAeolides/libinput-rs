@@ -5,3 +5,4 @@ calltree.html
 error.html
 proofs/agda/*.agdai
 proofs/idris/build/
+proofs/fortran/build/
