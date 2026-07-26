@@ -15,6 +15,7 @@ BuildRequires:  gcc
 BuildRequires:  make
 BuildRequires:  systemd-devel
 BuildRequires:  systemd-rpm-macros
+BuildRequires:  libwacom-devel >= 2.18
 Requires:       %{_libdir}/libinput.so.10
 Requires:       systemd
 

@@ -30,6 +30,8 @@ pub struct AppliedQuirks {
     pub resolution_hint: Option<(f64, f64)>,
     pub disable_hi_res_wheel_vertical: bool,
     pub disable_hi_res_wheel_horizontal: bool,
+    pub disable_tablet_tilt_x: bool,
+    pub disable_tablet_tilt_y: bool,
     pub is_virtual: bool,
     pub model_lenovo_scrollpoint: bool,
     pub model_alps_serial_touchpad: bool,
@@ -161,6 +163,15 @@ fn apply_section(
             }
             if relative_code == "REL_HWHEEL_HI_RES" {
                 applied.disable_hi_res_wheel_horizontal = !enable;
+                continue;
+            }
+            let absolute_code = code_name.strip_prefix("EV_ABS:").unwrap_or(code_name);
+            if absolute_code == "ABS_TILT_X" {
+                applied.disable_tablet_tilt_x = !enable;
+                continue;
+            }
+            if absolute_code == "ABS_TILT_Y" {
+                applied.disable_tablet_tilt_y = !enable;
                 continue;
             }
             let Some(code) = parse_key_code(code_name) else {

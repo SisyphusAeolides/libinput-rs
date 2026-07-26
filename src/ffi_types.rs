@@ -147,6 +147,64 @@ pub struct SwitchEvent {
     pub state: u32,
 }
 
+pub struct LibinputTabletTool {
+    pub refcount: AtomicI32,
+    pub user_data: *mut libc::c_void,
+    pub serial: u64,
+    pub tool_id: u64,
+    pub name: Option<CString>,
+    pub tool_type: u32,
+    pub device: *mut LibinputDevice,
+    pub has_pressure: bool,
+    pub has_distance: bool,
+    pub has_tilt: bool,
+    pub has_rotation: bool,
+    pub has_slider: bool,
+    pub has_wheel: bool,
+    pub has_size: bool,
+    pub buttons: Vec<u32>,
+}
+
+unsafe impl Send for LibinputTabletTool {}
+
+#[derive(Debug, Clone)]
+pub struct TabletToolEvent {
+    pub time_usec: u64,
+    pub tool: *mut LibinputTabletTool,
+    pub proximity_state: u32,
+    pub x: f64,
+    pub y: f64,
+    pub x_min: f64,
+    pub x_max: f64,
+    pub y_min: f64,
+    pub y_max: f64,
+    pub x_resolution: f64,
+    pub y_resolution: f64,
+    pub x_changed: bool,
+    pub y_changed: bool,
+    pub pressure: f64,
+    pub pressure_min: f64,
+    pub pressure_max: f64,
+    pub pressure_changed: bool,
+    pub distance: f64,
+    pub distance_changed: bool,
+    pub tilt_x: f64,
+    pub tilt_y: f64,
+    pub tilt_x_changed: bool,
+    pub tilt_y_changed: bool,
+    pub rotation: f64,
+    pub rotation_changed: bool,
+    pub slider: f64,
+    pub slider_changed: bool,
+    pub wheel_delta: f64,
+    pub wheel_discrete: i32,
+    pub wheel_changed: bool,
+    pub tip_state: u32,
+    pub button: u32,
+    pub button_state: u32,
+    pub seat_button_count: u32,
+}
+
 #[derive(Debug, Clone)]
 pub enum EventPayload {
     PointerMotion(PointerMotionEvent),
@@ -166,6 +224,7 @@ pub enum EventPayload {
     GesturePinchUpdate(GestureEvent),
     GesturePinchEnd(GestureEvent),
     SwitchToggle(SwitchEvent),
+    TabletTool(TabletToolEvent),
     DeviceAdded,
     DeviceRemoved,
 }
@@ -183,6 +242,16 @@ pub struct LibinputEvent {
 
 impl Drop for LibinputEvent {
     fn drop(&mut self) {
+        if let EventPayload::TabletTool(event) = &mut self.payload {
+            if !event.tool.is_null() {
+                unsafe {
+                    if (*event.tool).refcount.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        drop(Box::from_raw(event.tool));
+                    }
+                }
+                event.tool = std::ptr::null_mut();
+            }
+        }
         if self.event_type != LibinputEventType::LIBINPUT_EVENT_DEVICE_REMOVED
             || self.device.is_null()
         {
@@ -390,6 +459,7 @@ pub struct LibinputContext {
     pub event_queue: VecDeque<LibinputEvent>,
     pub devices: Vec<*mut LibinputDevice>,
     pub touch_seat_slots: Vec<bool>,
+    pub tablet_tools: Vec<*mut LibinputTabletTool>,
     pub seat: *mut LibinputSeat,
     pub seats: Vec<*mut LibinputSeat>,
     pub refcount: AtomicI32,
@@ -443,6 +513,7 @@ impl LibinputContext {
             event_queue: VecDeque::new(),
             devices: Vec::new(),
             touch_seat_slots: Vec::new(),
+            tablet_tools: Vec::new(),
             seat,
             seats: vec![seat],
             refcount: AtomicI32::new(1),
@@ -579,6 +650,15 @@ impl Drop for LibinputContext {
                 unsafe {
                     if (*dev_ptr).refcount.fetch_sub(1, Ordering::AcqRel) == 1 {
                         drop(Box::from_raw(dev_ptr));
+                    }
+                }
+            }
+        }
+        for tool in self.tablet_tools.drain(..) {
+            if !tool.is_null() {
+                unsafe {
+                    if (*tool).refcount.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        drop(Box::from_raw(tool));
                     }
                 }
             }

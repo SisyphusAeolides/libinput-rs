@@ -13,7 +13,7 @@ mod udev;
 
 use crate::ffi_types::{
     BackendKind, EventPayload, LibinputContext, LibinputDevice, LibinputDeviceGroup, LibinputEvent,
-    LibinputEventType, LibinputInterface, LibinputSeat,
+    LibinputEventType, LibinputInterface, LibinputSeat, LibinputTabletTool,
 };
 
 use std::ffi::CStr;
@@ -2873,31 +2873,53 @@ pub unsafe extern "C" fn libinput_event_tablet_pad_get_time(event: *const Libinp
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_event_tablet_tool_get_button(
-    _event: *const LibinputEvent,
-) -> u32 {
-    0
+pub unsafe extern "C" fn libinput_event_tablet_tool_get_button(event: *const LibinputEvent) -> u32 {
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.button,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_button_state(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> u32 {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.button_state,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_seat_button_count(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> u32 {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.seat_button_count,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_distance(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> f64 {
-    0.0
+    if event.is_null() {
+        return 0.0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.distance,
+        _ => 0.0,
+    }
 }
 
 #[no_mangle]
@@ -2912,54 +2934,119 @@ pub unsafe extern "C" fn libinput_event_tablet_tool_get_dy(_event: *const Libinp
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_pressure(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> f64 {
-    0.0
+    if event.is_null() {
+        return 0.0;
+    }
+    if let EventPayload::TabletTool(tablet) = &(*event).payload {
+        let range = tablet.pressure_max - tablet.pressure_min;
+        if range > 0.0 {
+            ((tablet.pressure - tablet.pressure_min) / range).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_event_tablet_tool_get_x(_event: *const LibinputEvent) -> f64 {
-    0.0
+pub unsafe extern "C" fn libinput_event_tablet_tool_get_x(event: *const LibinputEvent) -> f64 {
+    if event.is_null() {
+        return 0.0;
+    }
+    if let EventPayload::TabletTool(tablet) = &(*event).payload {
+        if tablet.x_resolution > 0.0 {
+            (tablet.x - tablet.x_min) / tablet.x_resolution
+        } else {
+            tablet.x
+        }
+    } else {
+        0.0
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_event_tablet_tool_get_y(_event: *const LibinputEvent) -> f64 {
-    0.0
+pub unsafe extern "C" fn libinput_event_tablet_tool_get_y(event: *const LibinputEvent) -> f64 {
+    if event.is_null() {
+        return 0.0;
+    }
+    if let EventPayload::TabletTool(tablet) = &(*event).payload {
+        if tablet.y_resolution > 0.0 {
+            (tablet.y - tablet.y_min) / tablet.y_resolution
+        } else {
+            tablet.y
+        }
+    } else {
+        0.0
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_proximity_state(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> u32 {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    if let EventPayload::TabletTool(tablet) = &(*event).payload {
+        tablet.proximity_state
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_rotation(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> f64 {
-    0.0
+    if event.is_null() {
+        return 0.0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.rotation,
+        _ => 0.0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_slider_position(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> f64 {
-    0.0
+    if event.is_null() {
+        return 0.0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.slider,
+        _ => 0.0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_wheel_delta(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> f64 {
-    0.0
+    if event.is_null() {
+        return 0.0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.wheel_delta,
+        _ => 0.0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_wheel_delta_discrete(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> i32 {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.wheel_discrete,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
@@ -2978,23 +3065,42 @@ pub unsafe extern "C" fn libinput_event_tablet_tool_get_size_minor(
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_tilt_x(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> f64 {
-    0.0
+    if event.is_null() {
+        return 0.0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.tilt_x,
+        _ => 0.0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_tilt_y(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> f64 {
-    0.0
+    if event.is_null() {
+        return 0.0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.tilt_y,
+        _ => 0.0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_time_usec(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> u64 {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    if let EventPayload::TabletTool(tablet) = &(*event).payload {
+        tablet.time_usec
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
@@ -3004,95 +3110,186 @@ pub unsafe extern "C" fn libinput_event_tablet_tool_get_time(event: *const Libin
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_tip_state(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> u32 {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.tip_state,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_tool(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> *mut libc::c_void {
-    std::ptr::null_mut()
+    if event.is_null() {
+        return std::ptr::null_mut();
+    }
+    if let EventPayload::TabletTool(tablet) = &(*event).payload {
+        tablet.tool.cast()
+    } else {
+        std::ptr::null_mut()
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_x_transformed(
-    _event: *const LibinputEvent,
-    _width: u32,
+    event: *const LibinputEvent,
+    width: u32,
 ) -> f64 {
-    0.0
+    if event.is_null() {
+        return 0.0;
+    }
+    if let EventPayload::TabletTool(tablet) = &(*event).payload {
+        let range = tablet.x_max - tablet.x_min;
+        if range > 0.0 {
+            (tablet.x - tablet.x_min) * f64::from(width) / range
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_y_transformed(
-    _event: *const LibinputEvent,
-    _height: u32,
+    event: *const LibinputEvent,
+    height: u32,
 ) -> f64 {
-    0.0
+    if event.is_null() {
+        return 0.0;
+    }
+    if let EventPayload::TabletTool(tablet) = &(*event).payload {
+        let range = tablet.y_max - tablet.y_min;
+        if range > 0.0 {
+            (tablet.y - tablet.y_min) * f64::from(height) / range
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_x_has_changed(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> libc::c_int {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.x_changed as libc::c_int,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_y_has_changed(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> libc::c_int {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.y_changed as libc::c_int,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_pressure_has_changed(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> libc::c_int {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.pressure_changed as libc::c_int,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_distance_has_changed(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> libc::c_int {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.distance_changed as libc::c_int,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_tilt_x_has_changed(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> libc::c_int {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.tilt_x_changed as libc::c_int,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_tilt_y_has_changed(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> libc::c_int {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.tilt_y_changed as libc::c_int,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_rotation_has_changed(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> libc::c_int {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.rotation_changed as libc::c_int,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_slider_has_changed(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> libc::c_int {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.slider_changed as libc::c_int,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_wheel_has_changed(
-    _event: *const LibinputEvent,
+    event: *const LibinputEvent,
 ) -> libc::c_int {
-    0
+    if event.is_null() {
+        return 0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.wheel_changed as libc::c_int,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
@@ -3312,104 +3509,161 @@ pub unsafe extern "C" fn libinput_tablet_tool_config_eraser_button_get_default_b
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_tool_get_name(
-    _tool: *const libc::c_void,
+    tool: *const libc::c_void,
 ) -> *const libc::c_char {
-    std::ptr::null()
+    let tool = tool.cast::<LibinputTabletTool>();
+    if tool.is_null() {
+        return std::ptr::null();
+    }
+    (*tool)
+        .name
+        .as_ref()
+        .map_or(std::ptr::null(), |name| name.as_ptr())
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_tablet_tool_get_serial(_tool: *const libc::c_void) -> u64 {
-    0
+pub unsafe extern "C" fn libinput_tablet_tool_get_serial(tool: *const libc::c_void) -> u64 {
+    let tool = tool.cast::<LibinputTabletTool>();
+    if tool.is_null() {
+        0
+    } else {
+        (*tool).serial
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_tablet_tool_get_tool_id(_tool: *const libc::c_void) -> u64 {
-    0
+pub unsafe extern "C" fn libinput_tablet_tool_get_tool_id(tool: *const libc::c_void) -> u64 {
+    let tool = tool.cast::<LibinputTabletTool>();
+    if tool.is_null() {
+        0
+    } else {
+        (*tool).tool_id
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_tablet_tool_get_type(_tool: *const libc::c_void) -> u32 {
-    0
+pub unsafe extern "C" fn libinput_tablet_tool_get_type(tool: *const libc::c_void) -> u32 {
+    let tool = tool.cast::<LibinputTabletTool>();
+    if tool.is_null() {
+        0
+    } else {
+        (*tool).tool_type
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_tool_has_distance(
-    _tool: *const libc::c_void,
+    tool: *const libc::c_void,
 ) -> libc::c_int {
-    0
+    let tool = tool.cast::<LibinputTabletTool>();
+    (!tool.is_null() && (*tool).has_distance) as libc::c_int
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_tool_has_button(
-    _tool: *const libc::c_void,
-    _button: u32,
+    tool: *const libc::c_void,
+    button: u32,
 ) -> libc::c_int {
-    0
+    let tool = tool.cast::<LibinputTabletTool>();
+    (!tool.is_null() && (*tool).buttons.contains(&button)) as libc::c_int
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_tablet_tool_has_size(_tool: *const libc::c_void) -> libc::c_int {
-    0
+pub unsafe extern "C" fn libinput_tablet_tool_has_size(tool: *const libc::c_void) -> libc::c_int {
+    let tool = tool.cast::<LibinputTabletTool>();
+    (!tool.is_null() && (*tool).has_size) as libc::c_int
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_tablet_tool_is_unique(_tool: *const libc::c_void) -> libc::c_int {
-    0
+pub unsafe extern "C" fn libinput_tablet_tool_is_unique(tool: *const libc::c_void) -> libc::c_int {
+    let tool = tool.cast::<LibinputTabletTool>();
+    (!tool.is_null() && (*tool).serial != 0) as libc::c_int
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_tool_set_user_data(
-    _tool: *mut libc::c_void,
-    _data: *mut libc::c_void,
+    tool: *mut libc::c_void,
+    data: *mut libc::c_void,
 ) {
+    let tool = tool.cast::<LibinputTabletTool>();
+    if !tool.is_null() {
+        (*tool).user_data = data;
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_tool_get_user_data(
-    _tool: *const libc::c_void,
+    tool: *const libc::c_void,
 ) -> *mut libc::c_void {
-    std::ptr::null_mut()
+    let tool = tool.cast::<LibinputTabletTool>();
+    if tool.is_null() {
+        std::ptr::null_mut()
+    } else {
+        (*tool).user_data
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_tool_has_pressure(
-    _tool: *const libc::c_void,
+    tool: *const libc::c_void,
 ) -> libc::c_int {
-    0
+    let tool = tool.cast::<LibinputTabletTool>();
+    (!tool.is_null() && (*tool).has_pressure) as libc::c_int
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_tool_has_rotation(
-    _tool: *const libc::c_void,
+    tool: *const libc::c_void,
 ) -> libc::c_int {
-    0
+    let tool = tool.cast::<LibinputTabletTool>();
+    (!tool.is_null() && (*tool).has_rotation) as libc::c_int
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_tablet_tool_has_slider(
-    _tool: *const libc::c_void,
-) -> libc::c_int {
-    0
+pub unsafe extern "C" fn libinput_tablet_tool_has_slider(tool: *const libc::c_void) -> libc::c_int {
+    let tool = tool.cast::<LibinputTabletTool>();
+    (!tool.is_null() && (*tool).has_slider) as libc::c_int
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_tablet_tool_has_tilt(_tool: *const libc::c_void) -> libc::c_int {
-    0
+pub unsafe extern "C" fn libinput_tablet_tool_has_tilt(tool: *const libc::c_void) -> libc::c_int {
+    let tool = tool.cast::<LibinputTabletTool>();
+    (!tool.is_null() && (*tool).has_tilt) as libc::c_int
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_tablet_tool_has_wheel(_tool: *const libc::c_void) -> libc::c_int {
-    0
+pub unsafe extern "C" fn libinput_tablet_tool_has_wheel(tool: *const libc::c_void) -> libc::c_int {
+    let tool = tool.cast::<LibinputTabletTool>();
+    (!tool.is_null() && (*tool).has_wheel) as libc::c_int
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_tool_ref(tool: *mut libc::c_void) -> *mut libc::c_void {
+    let tablet_tool = tool.cast::<LibinputTabletTool>();
+    if !tablet_tool.is_null() {
+        (*tablet_tool)
+            .refcount
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     tool
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_tablet_tool_unref(_tool: *mut libc::c_void) -> *mut libc::c_void {
-    std::ptr::null_mut()
+pub unsafe extern "C" fn libinput_tablet_tool_unref(tool: *mut libc::c_void) -> *mut libc::c_void {
+    let tablet_tool = tool.cast::<LibinputTabletTool>();
+    if tablet_tool.is_null() {
+        return std::ptr::null_mut();
+    }
+    if (*tablet_tool)
+        .refcount
+        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+        == 1
+    {
+        drop(Box::from_raw(tablet_tool));
+        std::ptr::null_mut()
+    } else {
+        tool
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -15,9 +15,21 @@ use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
 
 use crate::ffi_types::{
     BackendKind, EventPayload, GestureEvent, KeyboardKeyEvent, LibinputContext, LibinputDevice,
-    LibinputEvent, LibinputEventType, PointerAxisEvent, PointerButtonEvent,
-    PointerMotionAbsoluteEvent, PointerMotionEvent, TouchEvent,
+    LibinputEvent, LibinputEventType, LibinputTabletTool, PointerAxisEvent, PointerButtonEvent,
+    PointerMotionAbsoluteEvent, PointerMotionEvent, TabletToolEvent, TouchEvent,
 };
+
+#[link(name = "wacom")]
+extern "C" {
+    fn libwacom_database_new() -> *mut libc::c_void;
+    fn libwacom_database_destroy(database: *mut libc::c_void);
+    fn libwacom_stylus_get_for_id(
+        database: *const libc::c_void,
+        tool_id: libc::c_int,
+    ) -> *const libc::c_void;
+    fn libwacom_stylus_get_name(stylus: *const libc::c_void) -> *const libc::c_char;
+    fn libwacom_stylus_is_generic(stylus: *const libc::c_void) -> libc::c_int;
+}
 
 struct RestrictedFdGuard {
     fd: RawFd,
@@ -172,6 +184,53 @@ struct TrackedDevice {
     active_click_button: Option<u16>,
     active_click_device: Option<*mut LibinputDevice>,
 
+    // --- tablet tool ---
+    tablet_serial: u64,
+    tablet_tool_id: u64,
+    tablet_tool_type: u32,
+    tablet_proximity_pending: Option<bool>,
+    tablet_tool: *mut LibinputTabletTool,
+    tablet_has_pressure: bool,
+    tablet_has_distance: bool,
+    tablet_has_tilt: bool,
+    tablet_has_rotation: bool,
+    tablet_has_slider: bool,
+    tablet_has_wheel: bool,
+    tablet_has_size: bool,
+    tablet_buttons: Vec<u32>,
+    tablet_x: f64,
+    tablet_y: f64,
+    tablet_x_changed: bool,
+    tablet_y_changed: bool,
+    tablet_axes_changed: bool,
+    tablet_pressure: f64,
+    tablet_pressure_range: Option<(i32, i32)>,
+    tablet_pressure_changed: bool,
+    tablet_distance: f64,
+    tablet_distance_range: Option<(i32, i32)>,
+    tablet_distance_changed: bool,
+    tablet_tilt_x: f64,
+    tablet_tilt_y: f64,
+    tablet_tilt_x_info: Option<(i32, i32, i32)>,
+    tablet_tilt_y_info: Option<(i32, i32, i32)>,
+    tablet_tilt_x_changed: bool,
+    tablet_tilt_y_changed: bool,
+    tablet_rotation: f64,
+    tablet_rotation_info: Option<(i32, i32)>,
+    tablet_rotation_changed: bool,
+    tablet_slider: f64,
+    tablet_slider_range: Option<(i32, i32)>,
+    tablet_slider_changed: bool,
+    tablet_wheel_delta: f64,
+    tablet_wheel_discrete: i32,
+    tablet_wheel_changed: bool,
+    tablet_tip_down: bool,
+    tablet_tip_pending: Option<bool>,
+    tablet_zero_pressure_since: Option<Instant>,
+    tablet_proximity_timer_enabled: bool,
+    tablet_buttons_down: u32,
+    tablet_held_buttons: Vec<u32>,
+
     // --- multi-touch slots (for pinch) ---
     mt_slots: Vec<MtSlot>,
     current_slot: usize,
@@ -221,6 +280,65 @@ impl TrackedDevice {
     ) -> Self {
         let is_absolute = uses_absolute_events;
         let relative_axes = device.supported_relative_axes();
+        let absolute_axes = device.supported_absolute_axes();
+        let tablet_has_pressure =
+            absolute_axes.is_some_and(|axes| axes.contains(AbsoluteAxisCode::ABS_PRESSURE));
+        let tablet_has_distance =
+            absolute_axes.is_some_and(|axes| axes.contains(AbsoluteAxisCode::ABS_DISTANCE));
+        let tablet_has_tilt = absolute_axes.is_some_and(|axes| {
+            axes.contains(AbsoluteAxisCode::ABS_TILT_X)
+                && axes.contains(AbsoluteAxisCode::ABS_TILT_Y)
+        });
+        let tablet_has_rotation = absolute_axes.is_some_and(|axes| {
+            axes.contains(AbsoluteAxisCode::ABS_Z)
+                || axes.contains(AbsoluteAxisCode::ABS_MT_ORIENTATION)
+        });
+        let tablet_has_slider =
+            absolute_axes.is_some_and(|axes| axes.contains(AbsoluteAxisCode::ABS_WHEEL));
+        let tablet_has_wheel =
+            relative_axes.is_some_and(|axes| axes.contains(RelativeAxisCode::REL_WHEEL));
+        let tablet_has_size = absolute_axes.is_some_and(|axes| {
+            axes.contains(AbsoluteAxisCode::ABS_MT_TOUCH_MAJOR)
+                && axes.contains(AbsoluteAxisCode::ABS_MT_TOUCH_MINOR)
+        });
+        let tablet_buttons = device
+            .supported_keys()
+            .map(|keys| {
+                [KeyCode::BTN_STYLUS.0, KeyCode::BTN_STYLUS2.0, 0x149, 0x100]
+                    .into_iter()
+                    .chain(0x110..=0x117)
+                    .filter(|code| keys.contains(KeyCode(*code)))
+                    .map(u32::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let initial_tablet_tool_type = {
+            use std::os::fd::AsRawFd;
+            let mut key_bits = [0_u8; 96];
+            let request =
+                ((2_u64 << 30) | ((key_bits.len() as u64) << 16) | ((b'E' as u64) << 8) | 0x18)
+                    as libc::c_ulong;
+            if unsafe { libc::ioctl(device.as_raw_fd(), request, key_bits.as_mut_ptr()) } >= 0 {
+                let is_down = |code: u16| {
+                    key_bits
+                        .get(usize::from(code / 8))
+                        .is_some_and(|byte| byte & (1 << (code % 8)) != 0)
+                };
+                [
+                    (KeyCode::BTN_TOOL_RUBBER.0, 2),
+                    (KeyCode::BTN_TOOL_BRUSH.0, 3),
+                    (KeyCode::BTN_TOOL_PENCIL.0, 4),
+                    (KeyCode::BTN_TOOL_AIRBRUSH.0, 5),
+                    (KeyCode::BTN_TOOL_MOUSE.0, 6),
+                    (KeyCode::BTN_TOOL_LENS.0, 7),
+                    (KeyCode::BTN_TOOL_PEN.0, 1),
+                ]
+                .into_iter()
+                .find_map(|(code, tool_type)| is_down(code).then_some(tool_type))
+            } else {
+                None
+            }
+        };
         let supports_hi_res_vertical =
             relative_axes.is_some_and(|axes| axes.contains(RelativeAxisCode::REL_WHEEL_HI_RES));
         let supports_hi_res_horizontal =
@@ -229,6 +347,18 @@ impl TrackedDevice {
         let mut abs_y_range = None;
         let mut current_abs_x = None;
         let mut current_abs_y = None;
+        let mut tablet_pressure = 0.0;
+        let mut tablet_pressure_range = None;
+        let mut tablet_distance = 0.0;
+        let mut tablet_distance_range = None;
+        let mut tablet_tilt_x = 0.0;
+        let mut tablet_tilt_y = 0.0;
+        let mut tablet_tilt_x_info = None;
+        let mut tablet_tilt_y_info = None;
+        let mut tablet_rotation = 0.0;
+        let mut tablet_rotation_info = None;
+        let mut tablet_slider = 0.0;
+        let mut tablet_slider_range = None;
         let mut has_mt = false;
         let mut has_mt_slot = false;
         let mut mt_slot_count = 10_usize;
@@ -242,6 +372,28 @@ impl TrackedDevice {
                 } else if axis == AbsoluteAxisCode::ABS_Y {
                     abs_y_range = Some((info.minimum(), info.maximum()));
                     current_abs_y = Some(info.value());
+                } else if axis == AbsoluteAxisCode::ABS_PRESSURE {
+                    tablet_pressure = f64::from(info.value());
+                    tablet_pressure_range = Some((info.minimum(), info.maximum()));
+                } else if axis == AbsoluteAxisCode::ABS_DISTANCE {
+                    tablet_distance = f64::from(info.value());
+                    tablet_distance_range = Some((info.minimum(), info.maximum()));
+                } else if axis == AbsoluteAxisCode::ABS_TILT_X {
+                    tablet_tilt_x = f64::from(info.value());
+                    tablet_tilt_x_info =
+                        Some((info.minimum(), info.maximum(), info.resolution()));
+                } else if axis == AbsoluteAxisCode::ABS_TILT_Y {
+                    tablet_tilt_y = f64::from(info.value());
+                    tablet_tilt_y_info =
+                        Some((info.minimum(), info.maximum(), info.resolution()));
+                } else if axis == AbsoluteAxisCode::ABS_Z
+                    || axis == AbsoluteAxisCode::ABS_MT_ORIENTATION
+                {
+                    tablet_rotation = f64::from(info.value());
+                    tablet_rotation_info = Some((info.minimum(), info.maximum()));
+                } else if axis == AbsoluteAxisCode::ABS_WHEEL {
+                    tablet_slider = f64::from(info.value());
+                    tablet_slider_range = Some((info.minimum(), info.maximum()));
                 } else if axis == AbsoluteAxisCode::ABS_MT_TRACKING_ID {
                     has_mt = true;
                 } else if axis == AbsoluteAxisCode::ABS_MT_SLOT {
@@ -352,6 +504,51 @@ impl TrackedDevice {
             last_movement_time: None,
             active_click_button: None,
             active_click_device: None,
+            tablet_serial: 0,
+            tablet_tool_id: 0,
+            tablet_tool_type: initial_tablet_tool_type.unwrap_or(1),
+            tablet_proximity_pending: initial_tablet_tool_type.map(|_| true),
+            tablet_tool: std::ptr::null_mut(),
+            tablet_has_pressure,
+            tablet_has_distance,
+            tablet_has_tilt,
+            tablet_has_rotation,
+            tablet_has_slider,
+            tablet_has_wheel,
+            tablet_has_size,
+            tablet_buttons,
+            tablet_x: current_abs_x.unwrap_or_default() as f64,
+            tablet_y: current_abs_y.unwrap_or_default() as f64,
+            tablet_x_changed: false,
+            tablet_y_changed: false,
+            tablet_axes_changed: false,
+            tablet_pressure,
+            tablet_pressure_range,
+            tablet_pressure_changed: false,
+            tablet_distance,
+            tablet_distance_range,
+            tablet_distance_changed: false,
+            tablet_tilt_x,
+            tablet_tilt_y,
+            tablet_tilt_x_info,
+            tablet_tilt_y_info,
+            tablet_tilt_x_changed: false,
+            tablet_tilt_y_changed: false,
+            tablet_rotation,
+            tablet_rotation_info,
+            tablet_rotation_changed: false,
+            tablet_slider,
+            tablet_slider_range,
+            tablet_slider_changed: false,
+            tablet_wheel_delta: 0.0,
+            tablet_wheel_discrete: 0,
+            tablet_wheel_changed: false,
+            tablet_tip_down: false,
+            tablet_tip_pending: None,
+            tablet_zero_pressure_since: None,
+            tablet_proximity_timer_enabled: true,
+            tablet_buttons_down: 0,
+            tablet_held_buttons: Vec::new(),
             mt_slots,
             current_slot: 0,
             protocol_a_tracking_id: None,
@@ -526,6 +723,197 @@ unsafe fn release_touch_seat_slot(ctx: *mut LibinputContext, seat_slot: i32) {
     }
 }
 
+unsafe fn tablet_tool_for(
+    ctx: *mut LibinputContext,
+    device: *mut LibinputDevice,
+    serial: u64,
+    tool_id: u64,
+    tool_type: u32,
+    capabilities: [bool; 7],
+    buttons: &[u32],
+) -> *mut LibinputTabletTool {
+    if let Some(tool) = (*ctx).tablet_tools.iter().copied().find(|tool| {
+        !tool.is_null()
+            && (**tool).tool_type == tool_type
+            && if serial == 0 {
+                (**tool).serial == 0 && (**tool).device == device
+            } else {
+                (**tool).serial == serial
+            }
+    }) {
+        (*tool).device = device;
+        return tool;
+    }
+    let name = i32::try_from(tool_id).ok().and_then(|tool_id| {
+        let database = libwacom_database_new();
+        if database.is_null() {
+            return None;
+        }
+        let stylus = libwacom_stylus_get_for_id(database, tool_id);
+        let name = if stylus.is_null() || libwacom_stylus_is_generic(stylus) != 0 {
+            None
+        } else {
+            let value = libwacom_stylus_get_name(stylus);
+            (!value.is_null()).then(|| std::ffi::CStr::from_ptr(value).to_owned())
+        };
+        libwacom_database_destroy(database);
+        name
+    });
+    let tool = Box::into_raw(Box::new(LibinputTabletTool {
+        refcount: std::sync::atomic::AtomicI32::new(1),
+        user_data: std::ptr::null_mut(),
+        serial,
+        tool_id,
+        name,
+        tool_type,
+        device,
+        has_pressure: capabilities[0],
+        has_distance: capabilities[1],
+        has_tilt: capabilities[2] && !matches!(tool_type, 6 | 7),
+        has_rotation: capabilities[3] || (capabilities[2] && matches!(tool_type, 6 | 7)),
+        has_slider: capabilities[4],
+        has_wheel: capabilities[5],
+        has_size: capabilities[6],
+        buttons: buttons
+            .iter()
+            .copied()
+            .filter(|button| match tool_type {
+                6 | 7 => (0x110..=0x117).contains(button),
+                8 => *button == 0x100,
+                _ => matches!(*button, 0x149 | 0x14b | 0x14c),
+            })
+            .collect(),
+    }));
+    (*ctx).tablet_tools.push(tool);
+    tool
+}
+
+unsafe fn tablet_tool_payload(
+    td: &TrackedDevice,
+    lib_dev: *mut LibinputDevice,
+    time_usec: u64,
+    tool: *mut LibinputTabletTool,
+    proximity_state: u32,
+) -> TabletToolEvent {
+    let (x_min, x_max) = (*lib_dev).abs_x_range.unwrap_or((0, 0));
+    let (y_min, y_max) = (*lib_dev).abs_y_range.unwrap_or((0, 0));
+    let (pressure_min, pressure_max) = td.tablet_pressure_range.unwrap_or((0, 0));
+    let pressure_lower = f64::from(pressure_min)
+        + (f64::from(pressure_max - pressure_min) * 0.01).trunc();
+    let pressure_is_active = td.tablet_pressure > pressure_lower;
+    let distance = td.tablet_distance_range.map_or(0.0, |(minimum, maximum)| {
+        let range = f64::from(maximum - minimum);
+        if pressure_is_active || range <= 0.0 {
+            0.0
+        } else {
+            ((td.tablet_distance - f64::from(minimum)) / range).clamp(0.0, 1.0)
+        }
+    });
+    let x_range = f64::from(x_max - x_min);
+    let y_range = f64::from(y_max - y_min);
+    let normalized_x = if x_range > 0.0 {
+        (td.tablet_x - f64::from(x_min)) / x_range
+    } else {
+        0.0
+    };
+    let normalized_y = if y_range > 0.0 {
+        (td.tablet_y - f64::from(y_min)) / y_range
+    } else {
+        0.0
+    };
+    let matrix = (*lib_dev).calibration.map(f64::from);
+    let transformed_x = matrix[0] * normalized_x + matrix[1] * normalized_y + matrix[2];
+    let transformed_y = matrix[3] * normalized_x + matrix[4] * normalized_y + matrix[5];
+    let normalize_tilt = |value: f64, info: Option<(i32, i32, i32)>| {
+        let Some((minimum, maximum, resolution)) = info else {
+            return 0.0;
+        };
+        if resolution != 0 && minimum < 0 && maximum > 0 {
+            (value / f64::from(resolution)).to_degrees()
+        } else {
+            let adjusted_maximum = if (maximum - minimum + 1) % 2 == 0 {
+                maximum.saturating_add(1)
+            } else {
+                maximum
+            };
+            let range = f64::from(adjusted_maximum - minimum);
+            if range > 0.0 {
+                ((value - f64::from(minimum)) / range * 2.0 - 1.0) * 64.0
+            } else {
+                0.0
+            }
+        }
+    };
+    let tilt_x = normalize_tilt(td.tablet_tilt_x, td.tablet_tilt_x_info);
+    let tilt_y = normalize_tilt(td.tablet_tilt_y, td.tablet_tilt_y_info);
+    let tool_type = (*tool).tool_type;
+    let rotation = if matches!(tool_type, 6 | 7) {
+        ((-tilt_x).atan2(tilt_y).to_degrees() - 5.0).rem_euclid(360.0)
+    } else if tool_type == 8 {
+        (360.0 - td.tablet_rotation).rem_euclid(360.0)
+    } else if let Some((minimum, maximum)) = td.tablet_rotation_info {
+        let range = f64::from(maximum - minimum + 1);
+        if range > 0.0 {
+            (((td.tablet_rotation - f64::from(minimum)) / range) * 360.0 + 90.0)
+                .rem_euclid(360.0)
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+    let slider = td.tablet_slider_range.map_or(0.0, |(minimum, maximum)| {
+        let range = f64::from(maximum - minimum);
+        if range > 0.0 {
+            ((td.tablet_slider - f64::from(minimum)) / range) * 2.0 - 1.0
+        } else {
+            0.0
+        }
+    });
+    TabletToolEvent {
+        time_usec,
+        tool,
+        proximity_state,
+        x: transformed_x * x_range + f64::from(x_min),
+        y: transformed_y * y_range + f64::from(y_min),
+        x_min: f64::from(x_min),
+        x_max: f64::from(x_max),
+        y_min: f64::from(y_min),
+        y_max: f64::from(y_max),
+        x_resolution: f64::from((*lib_dev).abs_x_resolution.unwrap_or(0)),
+        y_resolution: f64::from((*lib_dev).abs_y_resolution.unwrap_or(0)),
+        x_changed: (matrix[0] != 0.0 && td.tablet_x_changed)
+            || (matrix[1] != 0.0 && td.tablet_y_changed),
+        y_changed: (matrix[3] != 0.0 && td.tablet_x_changed)
+            || (matrix[4] != 0.0 && td.tablet_y_changed),
+        pressure: td.tablet_pressure,
+        pressure_min: pressure_lower,
+        pressure_max: f64::from(pressure_max),
+        pressure_changed: td.tablet_pressure_changed && pressure_is_active,
+        distance,
+        distance_changed: td.tablet_distance_changed && !pressure_is_active,
+        tilt_x,
+        tilt_y,
+        tilt_x_changed: td.tablet_tilt_x_changed,
+        tilt_y_changed: td.tablet_tilt_y_changed,
+        rotation,
+        rotation_changed: if matches!(tool_type, 6 | 7) {
+            td.tablet_tilt_x_changed || td.tablet_tilt_y_changed
+        } else {
+            td.tablet_rotation_changed
+        },
+        slider,
+        slider_changed: td.tablet_slider_changed,
+        wheel_delta: td.tablet_wheel_delta,
+        wheel_discrete: td.tablet_wheel_discrete,
+        wheel_changed: td.tablet_wheel_changed,
+        tip_state: u32::from(td.tablet_tip_down),
+        button: 0,
+        button_state: 0,
+        seat_button_count: 0,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BackendState
 // ---------------------------------------------------------------------------
@@ -659,6 +1047,8 @@ impl BackendState {
         let mut abs_y_resolution = None;
         let mut abs_x_range_raw = None;
         let mut abs_y_range_raw = None;
+        let mut mt_x_range_raw = None;
+        let mut mt_y_range_raw = None;
         let mut mt_x_resolution = None;
         let mut mt_y_resolution = None;
         if let Ok(absinfo) = device.get_absinfo() {
@@ -677,8 +1067,10 @@ impl BackendState {
                     abs_y_range_raw = Some((info.minimum(), info.maximum()));
                 } else if axis == AbsoluteAxisCode::ABS_MT_POSITION_X {
                     mt_x_resolution = Some(info.resolution());
+                    mt_x_range_raw = Some((info.minimum(), info.maximum()));
                 } else if axis == AbsoluteAxisCode::ABS_MT_POSITION_Y {
                     mt_y_resolution = Some(info.resolution());
+                    mt_y_range_raw = Some((info.minimum(), info.maximum()));
                 }
                 invalid_negative_resolution |= info.resolution() < 0;
 
@@ -725,6 +1117,14 @@ impl BackendState {
             || mt_resolution_mismatch
         {
             return;
+        }
+        if abs_x_range_raw.is_none() {
+            abs_x_range_raw = mt_x_range_raw;
+            abs_x_resolution = mt_x_resolution;
+        }
+        if abs_y_range_raw.is_none() {
+            abs_y_range_raw = mt_y_range_raw;
+            abs_y_resolution = mt_y_resolution;
         }
 
         let props = device.properties();
@@ -1145,6 +1545,9 @@ impl BackendState {
         if applied_quirks.disable_hi_res_wheel_horizontal {
             td.supports_hi_res_horizontal = false;
         }
+        if applied_quirks.disable_tablet_tilt_x || applied_quirks.disable_tablet_tilt_y {
+            td.tablet_has_tilt = false;
+        }
         td.wheel_is_virtual = applied_quirks.is_virtual;
         td.is_lenovo_scrollpoint = applied_quirks.model_lenovo_scrollpoint;
         self.devices.insert(fd, td);
@@ -1212,6 +1615,39 @@ impl BackendState {
                 device: event_device,
             });
         }
+        if !tracked.tablet_tool.is_null() {
+            let tool = tracked.tablet_tool;
+            for button in std::mem::take(&mut tracked.tablet_held_buttons) {
+                let seat_button_count = release_seat_button(device);
+                (*tool)
+                    .refcount
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut payload = tablet_tool_payload(tracked, device, time_usec, tool, 1);
+                payload.button = button;
+                payload.button_state = 0;
+                payload.seat_button_count = seat_button_count;
+                out.push_back(LibinputEvent {
+                    event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_BUTTON,
+                    payload: EventPayload::TabletTool(payload),
+                    context: ctx,
+                    device,
+                });
+            }
+            (*tool)
+                .refcount
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            out.push_back(LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_PROXIMITY,
+                payload: EventPayload::TabletTool(tablet_tool_payload(
+                    tracked, device, time_usec, tool, 0,
+                )),
+                context: ctx,
+                device,
+            });
+            tracked.tablet_tool = std::ptr::null_mut();
+            tracked.tablet_zero_pressure_since = None;
+            tracked.tablet_buttons_down = 0;
+        }
         if tracked.touch_active && (*device).has_touch {
             tracked.touch_active = false;
             tracked.touch_fingers = 0;
@@ -1250,6 +1686,42 @@ impl BackendState {
     // Main drain loop
     // -----------------------------------------------------------------------
 
+    unsafe fn emit_forced_tablet_proximity_out(
+        &mut self,
+        ctx: *mut LibinputContext,
+        out: &mut VecDeque<LibinputEvent>,
+    ) {
+        for td in self.devices.values_mut() {
+            if !td.tablet_proximity_timer_enabled || td.tablet_buttons_down != 0 {
+                continue;
+            }
+            let Some(since) = td.tablet_zero_pressure_since else {
+                continue;
+            };
+            if since.elapsed() < Duration::from_millis(150) || td.tablet_tool.is_null() {
+                continue;
+            }
+            let tool = td.tablet_tool;
+            (*tool)
+                .refcount
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            out.push_back(LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_PROXIMITY,
+                payload: EventPayload::TabletTool(tablet_tool_payload(
+                    td,
+                    td.lib_device,
+                    systime_to_usec(SystemTime::now()),
+                    tool,
+                    0,
+                )),
+                context: ctx,
+                device: td.lib_device,
+            });
+            td.tablet_tool = std::ptr::null_mut();
+            td.tablet_zero_pressure_since = None;
+        }
+    }
+
     pub unsafe fn drain_into_queue(
         &mut self,
         ctx: *mut LibinputContext,
@@ -1260,6 +1732,7 @@ impl BackendState {
 
         // --- synthetic key-repeat before reading new events ---
         self.emit_key_repeats(ctx, out);
+        self.emit_forced_tablet_proximity_out(ctx, out);
 
         // A lone left/right press is held briefly while middle-button
         // emulation waits for a possible chord. Once the chord window has
@@ -1364,6 +1837,9 @@ impl BackendState {
             let is_abs = td.is_absolute;
             let is_kbd = td.is_keyboard;
             let is_ptr = td.is_pointer;
+            let is_tablet_tool = unsafe { &*lib_dev }.has_tablet
+                && !unsafe { &*lib_dev }.has_touch
+                && !unsafe { &*lib_dev }.has_tablet_pad;
             let cfg_tap = unsafe { &*lib_dev }.tap_enabled;
             let cfg_nat = unsafe { &*lib_dev }.natural_scroll;
             let cfg_dwt = unsafe { &*lib_dev }.dwt_enabled;
@@ -1390,6 +1866,11 @@ impl BackendState {
 
             for ev in &batch {
                 let ts_usec = systime_to_usec(ev.timestamp());
+
+                if is_tablet_tool {
+                    Self::process_tablet_tool_event(ev, ts_usec, lib_dev, ctx, td, out);
+                    continue;
+                }
 
                 if td.is_absolute_pointer {
                     Self::process_absolute_pointer_event(ev, ts_usec, lib_dev, ctx, td, out);
@@ -1712,6 +2193,350 @@ impl BackendState {
     // -----------------------------------------------------------------------
     // Keyboard event processing
     // -----------------------------------------------------------------------
+
+    unsafe fn process_tablet_tool_event(
+        ev: &InputEvent,
+        ts_usec: u64,
+        lib_dev: *mut LibinputDevice,
+        ctx: *mut LibinputContext,
+        td: &mut TrackedDevice,
+        out: &mut VecDeque<LibinputEvent>,
+    ) {
+        if ev.event_type() == EventType::ABSOLUTE {
+            if ev.code() == AbsoluteAxisCode::ABS_X.0
+                || ev.code() == AbsoluteAxisCode::ABS_MT_POSITION_X.0
+            {
+                td.tablet_x = f64::from(ev.value());
+                td.tablet_x_changed = true;
+            } else if ev.code() == AbsoluteAxisCode::ABS_Y.0
+                || ev.code() == AbsoluteAxisCode::ABS_MT_POSITION_Y.0
+            {
+                td.tablet_y = f64::from(ev.value());
+                td.tablet_y_changed = true;
+            } else if ev.code() == AbsoluteAxisCode::ABS_PRESSURE.0 {
+                td.tablet_pressure = f64::from(ev.value());
+                td.tablet_pressure_changed = true;
+            } else if ev.code() == AbsoluteAxisCode::ABS_DISTANCE.0 {
+                td.tablet_distance = f64::from(ev.value());
+                td.tablet_distance_changed = true;
+            } else if ev.code() == AbsoluteAxisCode::ABS_TILT_X.0 {
+                td.tablet_tilt_x = f64::from(ev.value());
+                td.tablet_tilt_x_changed = true;
+            } else if ev.code() == AbsoluteAxisCode::ABS_TILT_Y.0 {
+                td.tablet_tilt_y = f64::from(ev.value());
+                td.tablet_tilt_y_changed = true;
+            } else if ev.code() == AbsoluteAxisCode::ABS_Z.0
+                || ev.code() == AbsoluteAxisCode::ABS_MT_ORIENTATION.0
+            {
+                td.tablet_rotation = f64::from(ev.value());
+                td.tablet_rotation_changed = true;
+            } else if ev.code() == AbsoluteAxisCode::ABS_WHEEL.0 {
+                td.tablet_slider = f64::from(ev.value());
+                td.tablet_slider_changed = true;
+            } else if ev.code() == AbsoluteAxisCode::ABS_MISC.0 && ev.value() >= 0 {
+                td.tablet_tool_id = ev.value() as u64;
+            } else if ev.code() == AbsoluteAxisCode::ABS_MT_TOOL_TYPE.0 && ev.value() == 10 {
+                td.tablet_tool_type = 8;
+                td.tablet_proximity_timer_enabled = false;
+                td.tablet_zero_pressure_since = None;
+            } else if ev.code() == AbsoluteAxisCode::ABS_MT_TRACKING_ID.0 {
+                td.tablet_tool_type = 8;
+                td.tablet_proximity_timer_enabled = false;
+                td.tablet_zero_pressure_since = None;
+                td.tablet_proximity_pending = Some(ev.value() >= 0);
+            }
+            td.tablet_axes_changed = true;
+            return;
+        }
+        if ev.event_type() == EventType::RELATIVE && ev.code() == RelativeAxisCode::REL_WHEEL.0 {
+            td.tablet_wheel_discrete = -ev.value();
+            td.tablet_wheel_delta = f64::from(td.tablet_wheel_discrete)
+                * (*lib_dev).wheel_click_angle_vertical;
+            td.tablet_wheel_changed = true;
+            td.tablet_axes_changed = true;
+            return;
+        }
+        if ev.event_type() == EventType::KEY {
+            if ev.code() == KeyCode::BTN_TOUCH.0 {
+                td.tablet_tip_down = ev.value() != 0;
+                td.tablet_tip_pending = Some(td.tablet_tip_down);
+                return;
+            }
+            let is_tool_button = td.tablet_buttons.contains(&u32::from(ev.code()))
+                && match td.tablet_tool_type {
+                    8 => ev.code() == 0x100,
+                    _ => matches!(ev.code(), 0x149 | 0x14b | 0x14c)
+                        || (0x110..=0x117).contains(&ev.code()),
+                };
+            if is_tool_button {
+                let tool = td.tablet_tool;
+                if tool.is_null() {
+                    return;
+                }
+                let pressed = ev.value() != 0;
+                if pressed {
+                    if !td.tablet_held_buttons.contains(&u32::from(ev.code())) {
+                        td.tablet_held_buttons.push(u32::from(ev.code()));
+                    }
+                } else {
+                    td.tablet_held_buttons
+                        .retain(|button| *button != u32::from(ev.code()));
+                }
+                td.tablet_buttons_down = td.tablet_held_buttons.len() as u32;
+                let seat_button_count = if pressed {
+                    press_seat_button(lib_dev)
+                } else {
+                    release_seat_button(lib_dev)
+                };
+                (*tool)
+                    .refcount
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut payload = tablet_tool_payload(td, lib_dev, ts_usec, tool, 1);
+                payload.button = u32::from(ev.code());
+                payload.button_state = u32::from(pressed);
+                payload.seat_button_count = seat_button_count;
+                out.push_back(LibinputEvent {
+                    event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_BUTTON,
+                    payload: EventPayload::TabletTool(payload),
+                    context: ctx,
+                    device: lib_dev,
+                });
+                return;
+            }
+            td.tablet_tool_type = match ev.code() {
+                code if code == KeyCode::BTN_TOOL_RUBBER.0 => 2,
+                code if code == KeyCode::BTN_TOOL_BRUSH.0 => 3,
+                code if code == KeyCode::BTN_TOOL_PENCIL.0 => 4,
+                code if code == KeyCode::BTN_TOOL_AIRBRUSH.0 => 5,
+                code if code == KeyCode::BTN_TOOL_MOUSE.0 => 6,
+                code if code == KeyCode::BTN_TOOL_LENS.0 => 7,
+                code if code == KeyCode::BTN_TOOL_PEN.0 => 1,
+                _ => return,
+            };
+            if td.tablet_tool_type != 1 || ev.value() == 0 {
+                td.tablet_proximity_timer_enabled = false;
+                td.tablet_zero_pressure_since = None;
+            }
+            td.tablet_proximity_pending = Some(ev.value() != 0);
+            return;
+        }
+        if ev.event_type().0 == 4 && ev.code() == 0 {
+            if ev.value() >= 0 {
+                td.tablet_serial = ev.value() as u64;
+            }
+            return;
+        }
+        if ev.event_type() != EventType::SYNCHRONIZATION || ev.code() != 0 {
+            return;
+        }
+        if td.tablet_proximity_timer_enabled && !td.tablet_tool.is_null() {
+            td.tablet_zero_pressure_since = Some(Instant::now());
+        }
+        if td.tablet_pressure_changed {
+            if let Some((minimum, maximum)) = td.tablet_pressure_range {
+                let range = f64::from(maximum - minimum);
+                let lower = f64::from(minimum) + (range * 0.01).trunc();
+                let upper = f64::from(minimum) + (range * 0.05).trunc();
+                let next_tip_state = if td.tablet_tip_down {
+                    td.tablet_pressure > lower
+                } else {
+                    td.tablet_pressure >= upper
+                };
+                if next_tip_state != td.tablet_tip_down {
+                    td.tablet_tip_down = next_tip_state;
+                    td.tablet_tip_pending = Some(next_tip_state);
+                }
+            }
+        }
+        // Tablets handled by the proximity watchdog may never expose a
+        // BTN_TOOL_PEN key. For those devices, the first axis frame is the
+        // only reliable indication that a pen is in range. The same rule
+        // restores proximity after the watchdog synthesized an out event.
+        if td.tablet_proximity_timer_enabled
+            && td.tablet_tool.is_null()
+            && td.tablet_axes_changed
+            && td.tablet_proximity_pending.is_none()
+        {
+            td.tablet_tool_type = 1;
+            td.tablet_proximity_pending = Some(true);
+        }
+        let Some(in_proximity) = td.tablet_proximity_pending.take() else {
+            let is_tip_event = td.tablet_tip_pending.take().is_some();
+            if td.tablet_tool.is_null() || (!td.tablet_axes_changed && !is_tip_event) {
+                return;
+            }
+            let tool = td.tablet_tool;
+            (*tool)
+                .refcount
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            out.push_back(LibinputEvent {
+                event_type: if is_tip_event {
+                    LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_TIP
+                } else {
+                    LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_AXIS
+                },
+                payload: EventPayload::TabletTool(tablet_tool_payload(
+                    td, lib_dev, ts_usec, tool, 1,
+                )),
+                context: ctx,
+                device: lib_dev,
+            });
+            td.tablet_x_changed = false;
+            td.tablet_y_changed = false;
+            td.tablet_pressure_changed = false;
+            td.tablet_distance_changed = false;
+            td.tablet_tilt_x_changed = false;
+            td.tablet_tilt_y_changed = false;
+            td.tablet_rotation_changed = false;
+            td.tablet_slider_changed = false;
+            td.tablet_wheel_delta = 0.0;
+            td.tablet_wheel_discrete = 0;
+            td.tablet_wheel_changed = false;
+            td.tablet_axes_changed = false;
+            return;
+        };
+        if in_proximity
+            && !td.tablet_tool.is_null()
+            && (*td.tablet_tool).tool_type != td.tablet_tool_type
+        {
+            let previous_tool = td.tablet_tool;
+            (*previous_tool)
+                .refcount
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            out.push_back(LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_PROXIMITY,
+                payload: EventPayload::TabletTool(tablet_tool_payload(
+                    td,
+                    lib_dev,
+                    ts_usec,
+                    previous_tool,
+                    0,
+                )),
+                context: ctx,
+                device: lib_dev,
+            });
+            td.tablet_tool = std::ptr::null_mut();
+        }
+        if in_proximity {
+            // Proximity-in establishes a complete coordinate state even
+            // when evdev suppresses an unchanged axis from the frame.
+            td.tablet_x_changed = true;
+            td.tablet_y_changed = true;
+            td.tablet_pressure_changed = td.tablet_has_pressure;
+            td.tablet_distance_changed = td.tablet_has_distance;
+            td.tablet_tilt_x_changed = td.tablet_has_tilt;
+            td.tablet_tilt_y_changed = td.tablet_has_tilt;
+            td.tablet_rotation_changed = td.tablet_has_rotation;
+            td.tablet_slider_changed = td.tablet_has_slider;
+            td.tablet_wheel_changed = td.tablet_has_wheel;
+        }
+        let tool = if in_proximity {
+            let tool = tablet_tool_for(
+                ctx,
+                lib_dev,
+                td.tablet_serial,
+                td.tablet_tool_id,
+                td.tablet_tool_type,
+                [
+                    td.tablet_has_pressure,
+                    td.tablet_has_distance,
+                    td.tablet_has_tilt,
+                    td.tablet_has_rotation,
+                    td.tablet_has_slider,
+                    td.tablet_has_wheel,
+                    td.tablet_has_size,
+                ],
+                &td.tablet_buttons,
+            );
+            td.tablet_tool = tool;
+            tool
+        } else {
+            td.tablet_tool
+        };
+        if tool.is_null() {
+            return;
+        }
+        let tip_before_proximity = !in_proximity && td.tablet_tip_pending == Some(false);
+        if tip_before_proximity {
+            (*tool)
+                .refcount
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            out.push_back(LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_TIP,
+                payload: EventPayload::TabletTool(tablet_tool_payload(
+                    td, lib_dev, ts_usec, tool, 1,
+                )),
+                context: ctx,
+                device: lib_dev,
+            });
+            td.tablet_tip_pending = None;
+        }
+        if !in_proximity {
+            for button in std::mem::take(&mut td.tablet_held_buttons) {
+                let seat_button_count = release_seat_button(lib_dev);
+                (*tool)
+                    .refcount
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut payload = tablet_tool_payload(td, lib_dev, ts_usec, tool, 1);
+                payload.button = button;
+                payload.button_state = 0;
+                payload.seat_button_count = seat_button_count;
+                out.push_back(LibinputEvent {
+                    event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_BUTTON,
+                    payload: EventPayload::TabletTool(payload),
+                    context: ctx,
+                    device: lib_dev,
+                });
+            }
+            td.tablet_buttons_down = 0;
+        }
+        (*tool)
+            .refcount
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        out.push_back(LibinputEvent {
+            event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_PROXIMITY,
+            payload: EventPayload::TabletTool(tablet_tool_payload(
+                td,
+                lib_dev,
+                ts_usec,
+                tool,
+                u32::from(in_proximity),
+            )),
+            context: ctx,
+            device: lib_dev,
+        });
+        if in_proximity && td.tablet_tip_pending.take().is_some() {
+            (*tool)
+                .refcount
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            out.push_back(LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_TIP,
+                payload: EventPayload::TabletTool(tablet_tool_payload(
+                    td, lib_dev, ts_usec, tool, 1,
+                )),
+                context: ctx,
+                device: lib_dev,
+            });
+        }
+        if !in_proximity {
+            td.tablet_tool = std::ptr::null_mut();
+            td.tablet_zero_pressure_since = None;
+        } else if td.tablet_proximity_timer_enabled && td.tablet_tool_type == 1 {
+            td.tablet_zero_pressure_since = Some(Instant::now());
+        }
+        td.tablet_x_changed = false;
+        td.tablet_y_changed = false;
+        td.tablet_pressure_changed = false;
+        td.tablet_distance_changed = false;
+        td.tablet_tilt_x_changed = false;
+        td.tablet_tilt_y_changed = false;
+        td.tablet_rotation_changed = false;
+        td.tablet_slider_changed = false;
+        td.tablet_wheel_delta = 0.0;
+        td.tablet_wheel_discrete = 0;
+        td.tablet_wheel_changed = false;
+        td.tablet_axes_changed = false;
+    }
 
     unsafe fn process_keyboard_event(
         ev: &InputEvent,
