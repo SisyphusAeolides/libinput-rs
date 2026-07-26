@@ -60,7 +60,7 @@ pub(crate) unsafe fn emit_debug_log(ctx: *mut LibinputContext, message: &str) {
     let Some(handler) = (*ctx).log_handler else {
         return;
     };
-    let Ok(message) = std::ffi::CString::new(format!("{message}\n")) else {
+    let Ok(message) = std::ffi::CString::new(format!("{}\n", message.replace('%', "%%"))) else {
         return;
     };
     input_emit_log(
@@ -78,7 +78,7 @@ pub(crate) unsafe fn emit_error_log(ctx: *mut LibinputContext, message: &str) {
     let Some(handler) = (*ctx).log_handler else {
         return;
     };
-    let Ok(message) = std::ffi::CString::new(format!("{message}\n")) else {
+    let Ok(message) = std::ffi::CString::new(format!("{}\n", message.replace('%', "%%"))) else {
         return;
     };
     input_emit_log(
@@ -96,7 +96,7 @@ pub(crate) unsafe fn emit_info_log(ctx: *mut LibinputContext, message: &str) {
     let Some(handler) = (*ctx).log_handler else {
         return;
     };
-    let Ok(message) = std::ffi::CString::new(format!("{message}\n")) else {
+    let Ok(message) = std::ffi::CString::new(format!("{}\n", message.replace('%', "%%"))) else {
         return;
     };
     input_emit_log(
@@ -1476,7 +1476,9 @@ pub unsafe extern "C" fn libinput_device_config_accel_get_profiles(
     if dev.is_null() {
         return 0;
     }
-    if (*dev).accel_available {
+    if (*dev).accel_available
+        && !((*dev).has_tablet && !(*dev).has_gesture && !(*dev).has_tablet_pad)
+    {
         0b111
     } else {
         0
@@ -1508,7 +1510,9 @@ pub unsafe extern "C" fn libinput_device_config_accel_get_profile(
     if dev.is_null() {
         return 0;
     }
-    if (*dev).accel_available {
+    if (*dev).accel_available
+        && !((*dev).has_tablet && !(*dev).has_gesture && !(*dev).has_tablet_pad)
+    {
         (*dev).accel_profile
     } else {
         0
@@ -1519,7 +1523,10 @@ pub unsafe extern "C" fn libinput_device_config_accel_get_profile(
 pub unsafe extern "C" fn libinput_device_config_accel_get_default_profile(
     dev: *const LibinputDevice,
 ) -> u32 {
-    if dev.is_null() || !(*dev).accel_available {
+    if dev.is_null()
+        || !(*dev).accel_available
+        || ((*dev).has_tablet && !(*dev).has_gesture && !(*dev).has_tablet_pad)
+    {
         0
     } else {
         2
@@ -2294,32 +2301,51 @@ pub unsafe extern "C" fn libinput_device_config_area_has_rectangle(
     if dev.is_null() {
         return 0;
     }
-    (*dev).has_touch as libc::c_int
+    (*dev).area_available as libc::c_int
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_area_set_rectangle(
     dev: *mut LibinputDevice,
-    _x1: f64,
-    _y1: f64,
-    _x2: f64,
-    _y2: f64,
+    rectangle: *const LibinputConfigAreaRectangle,
 ) -> u32 {
-    if dev.is_null() {
+    if dev.is_null() || !(*dev).area_available {
         return 1;
+    }
+    if rectangle.is_null() {
+        return 2;
+    }
+    let rectangle = &*rectangle;
+    if rectangle.x1 >= rectangle.x2
+        || rectangle.y1 >= rectangle.y2
+        || rectangle.x1 < 0.0
+        || rectangle.x2 > 1.0
+        || rectangle.y1 < 0.0
+        || rectangle.y2 > 1.0
+    {
+        return 2;
+    }
+    (*dev).wanted_area = [rectangle.x1, rectangle.y1, rectangle.x2, rectangle.y2];
+    if !(*dev).tablet_in_proximity {
+        (*dev).area = (*dev).wanted_area;
     }
     0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_area_get_rectangle(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> LibinputConfigAreaRectangle {
+    let area = if dev.is_null() || !(*dev).area_available {
+        [0.0, 0.0, 1.0, 1.0]
+    } else {
+        (*dev).area
+    };
     LibinputConfigAreaRectangle {
-        x1: 0.0,
-        y1: 0.0,
-        x2: 1.0,
-        y2: 1.0,
+        x1: area[0],
+        y1: area[1],
+        x2: area[2],
+        y2: area[3],
     }
 }
 
@@ -2923,13 +2949,27 @@ pub unsafe extern "C" fn libinput_event_tablet_tool_get_distance(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_event_tablet_tool_get_dx(_event: *const LibinputEvent) -> f64 {
-    0.0
+pub unsafe extern "C" fn libinput_event_tablet_tool_get_dx(event: *const LibinputEvent) -> f64 {
+    if event.is_null() || (*event).event_type != LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_AXIS
+    {
+        return 0.0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.dx,
+        _ => 0.0,
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_event_tablet_tool_get_dy(_event: *const LibinputEvent) -> f64 {
-    0.0
+pub unsafe extern "C" fn libinput_event_tablet_tool_get_dy(event: *const LibinputEvent) -> f64 {
+    if event.is_null() || (*event).event_type != LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_AXIS
+    {
+        return 0.0;
+    }
+    match &(*event).payload {
+        EventPayload::TabletTool(tablet) => tablet.dy,
+        _ => 0.0,
+    }
 }
 
 #[no_mangle]
@@ -2960,7 +3000,7 @@ pub unsafe extern "C" fn libinput_event_tablet_tool_get_x(event: *const Libinput
         if tablet.x_resolution > 0.0 {
             (tablet.x - tablet.x_min) / tablet.x_resolution
         } else {
-            tablet.x
+            tablet.x - tablet.x_min
         }
     } else {
         0.0
@@ -2976,7 +3016,7 @@ pub unsafe extern "C" fn libinput_event_tablet_tool_get_y(event: *const Libinput
         if tablet.y_resolution > 0.0 {
             (tablet.y - tablet.y_min) / tablet.y_resolution
         } else {
-            tablet.y
+            tablet.y - tablet.y_min
         }
     } else {
         0.0
@@ -3064,9 +3104,7 @@ pub unsafe extern "C" fn libinput_event_tablet_tool_get_size_minor(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_event_tablet_tool_get_tilt_x(
-    event: *const LibinputEvent,
-) -> f64 {
+pub unsafe extern "C" fn libinput_event_tablet_tool_get_tilt_x(event: *const LibinputEvent) -> f64 {
     if event.is_null() {
         return 0.0;
     }
@@ -3077,9 +3115,7 @@ pub unsafe extern "C" fn libinput_event_tablet_tool_get_tilt_x(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_event_tablet_tool_get_tilt_y(
-    event: *const LibinputEvent,
-) -> f64 {
+pub unsafe extern "C" fn libinput_event_tablet_tool_get_tilt_y(event: *const LibinputEvent) -> f64 {
     if event.is_null() {
         return 0.0;
     }
@@ -3144,7 +3180,7 @@ pub unsafe extern "C" fn libinput_event_tablet_tool_get_x_transformed(
         return 0.0;
     }
     if let EventPayload::TabletTool(tablet) = &(*event).payload {
-        let range = tablet.x_max - tablet.x_min;
+        let range = tablet.x_max - tablet.x_min + 1.0;
         if range > 0.0 {
             (tablet.x - tablet.x_min) * f64::from(width) / range
         } else {
@@ -3164,7 +3200,7 @@ pub unsafe extern "C" fn libinput_event_tablet_tool_get_y_transformed(
         return 0.0;
     }
     if let EventPayload::TabletTool(tablet) = &(*event).payload {
-        let range = tablet.y_max - tablet.y_min;
+        let range = tablet.y_max - tablet.y_min + 1.0;
         if range > 0.0 {
             (tablet.y - tablet.y_min) * f64::from(height) / range
         } else {
@@ -3414,32 +3450,48 @@ pub unsafe extern "C" fn libinput_tablet_pad_mode_group_get_user_data(
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_tool_config_pressure_range_is_available(
-    _tool: *const libc::c_void,
+    tool: *const LibinputTabletTool,
 ) -> libc::c_int {
-    0
+    (!tool.is_null() && (*tool).has_pressure) as libc::c_int
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_tool_config_pressure_range_set(
-    _tool: *mut libc::c_void,
-    _min: f64,
-    _max: f64,
+    tool: *mut LibinputTabletTool,
+    minimum: f64,
+    maximum: f64,
 ) -> u32 {
-    1
+    if tool.is_null() || !(*tool).has_pressure {
+        return 1;
+    }
+    if minimum < 0.0 || maximum > 1.0 || minimum >= maximum {
+        return 2;
+    }
+    (*tool).wanted_pressure_range_minimum = minimum;
+    (*tool).wanted_pressure_range_maximum = maximum;
+    0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_tool_config_pressure_range_get_minimum(
-    _tool: *const libc::c_void,
+    tool: *const LibinputTabletTool,
 ) -> f64 {
-    0.0
+    if tool.is_null() {
+        0.0
+    } else {
+        (*tool).wanted_pressure_range_minimum
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_tool_config_pressure_range_get_maximum(
-    _tool: *const libc::c_void,
+    tool: *const LibinputTabletTool,
 ) -> f64 {
-    1.0
+    if tool.is_null() {
+        1.0
+    } else {
+        (*tool).wanted_pressure_range_maximum
+    }
 }
 
 #[no_mangle]

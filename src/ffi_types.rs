@@ -5,6 +5,7 @@ use std::ffi::CString;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use crate::backend::BackendState;
 
@@ -162,6 +163,10 @@ pub struct LibinputTabletTool {
     pub has_slider: bool,
     pub has_wheel: bool,
     pub has_size: bool,
+    pub pressure_range_minimum: f64,
+    pub pressure_range_maximum: f64,
+    pub wanted_pressure_range_minimum: f64,
+    pub wanted_pressure_range_maximum: f64,
     pub buttons: Vec<u32>,
 }
 
@@ -174,6 +179,8 @@ pub struct TabletToolEvent {
     pub proximity_state: u32,
     pub x: f64,
     pub y: f64,
+    pub dx: f64,
+    pub dy: f64,
     pub x_min: f64,
     pub x_max: f64,
     pub y_min: f64,
@@ -352,6 +359,13 @@ pub struct LibinputDevice {
     pub calibration_available: bool,
     pub calibration: [f32; 6],
     pub default_calibration: [f32; 6],
+    pub area_available: bool,
+    pub area: [f64; 4],
+    pub wanted_area: [f64; 4],
+    pub tablet_in_proximity: bool,
+    pub tablet_current_x: f64,
+    pub tablet_current_y: f64,
+    pub tablet_current_tilt_x: f64,
     pub refcount: AtomicI32,
     pub user_data: *mut libc::c_void,
     pub seat: *mut LibinputSeat,
@@ -417,6 +431,13 @@ impl LibinputDevice {
             calibration_available: false,
             calibration: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
             default_calibration: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            area_available: false,
+            area: [0.0, 0.0, 1.0, 1.0],
+            wanted_area: [0.0, 0.0, 1.0, 1.0],
+            tablet_in_proximity: false,
+            tablet_current_x: 0.0,
+            tablet_current_y: 0.0,
+            tablet_current_tilt_x: 0.0,
             refcount: AtomicI32::new(1),
             user_data: std::ptr::null_mut(),
             seat,
@@ -472,6 +493,7 @@ pub struct LibinputContext {
         ),
     >,
     pub log_priority: u32,
+    pub touch_arbitration_until: Option<Instant>,
     pub backend: Mutex<BackendState>,
     pub backend_kind: BackendKind,
     pub seat_assigned: bool,
@@ -519,6 +541,7 @@ impl LibinputContext {
             refcount: AtomicI32::new(1),
             log_handler: None,
             log_priority: 30,
+            touch_arbitration_until: None,
             backend: Mutex::new(backend),
             backend_kind,
             seat_assigned: false,
