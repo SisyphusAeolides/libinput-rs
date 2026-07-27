@@ -38,8 +38,9 @@ packaging-check:
 	test -x scripts/verify-rpm-devel.sh
 
 crate-package-check:
-	cargo package --locked --no-verify --package libinput-rs
-	! cargo package --locked --list --package libinput-rs | grep -Eq '/(vendor|\.cargo)/'
+	cargo metadata --locked --offline --no-deps >/dev/null
+	cargo package --locked --no-verify --package libinput-rs-evdev
+	! cargo package --locked --list --package libinput-rs-evdev | grep -Eq '/(vendor|\.cargo)/'
 
 rpm-devel-check:
 	test -n "$(RPM_RUNTIME)"
