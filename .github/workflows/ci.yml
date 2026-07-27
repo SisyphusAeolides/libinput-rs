@@ -35,8 +35,18 @@ jobs:
       - name: Lint Rust workspace
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      - name: Format Rust workspace
+        run: cargo fmt --all
+
       - name: Check Rust formatting
-        run: cargo fmt --all -- --check
+        run: git diff --exit-code
+
+      - name: Upload formatted Rust source
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: formatted-rust-source
+          path: compat/evdev/src/lib.rs
 
       - name: Test Rust workspace
         run: make test
