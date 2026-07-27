@@ -20,7 +20,7 @@ crate-type = ["staticlib"]
 path = "src/lib.rs"
 
 [dependencies]
-evdev = { package = "libinput-rs-evdev", path = "compat/evdev" }
+evdev = { package = "libinput-rs-evdev", version = "0.1.0", path = "compat/evdev" }
 mio = { version = "1", features = ["os-poll", "os-ext", "net"] }
 nix = { version = "0.29", features = ["ioctl", "fs", "inotify"] }
 serde = { version = "1.0", features = ["derive"] }
