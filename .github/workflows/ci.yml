@@ -47,12 +47,14 @@ jobs:
           set -o pipefail
           cargo test --locked --package libinput-rs 2>&1 | tee libinput-test-output.txt
 
-      - name: Upload libinput test output
+      - name: Upload libinput test diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: libinput-test-output
-          path: libinput-test-output.txt
+          name: libinput-test-diagnostics
+          path: |
+            libinput-test-output.txt
+            src/quirks.rs
 
       - name: Check safety models
         run: make proofs-strict
