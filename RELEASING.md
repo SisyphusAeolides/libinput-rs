@@ -27,11 +27,18 @@ The resulting file is written below `$HOME/rpmbuild/SRPMS/`.
 
 ## Publish to COPR
 
-Install and configure the COPR client once:
+Install the COPR client:
 
 ```bash
 sudo dnf install copr-cli
-copr-cli create-token
+```
+
+Download your API configuration from the COPR API page into
+`~/.config/copr`, then verify authentication:
+
+```bash
+chmod 600 ~/.config/copr
+copr-cli whoami
 ```
 
 Create the project if it does not already exist:
@@ -54,7 +61,8 @@ announcing the repository.
 
 ## Publish to crates.io
 
-Authenticate once with a crates.io API token:
+Authenticate once with a crates.io API token. Run `cargo login` and paste the
+token at its prompt so it is not written into shell history:
 
 ```bash
 cargo login
@@ -67,10 +75,16 @@ cargo publish --dry-run --locked --package libinput-rs-evdev
 cargo publish --locked --package libinput-rs-evdev
 ```
 
-Wait until version `0.1.0` is visible in the crates.io index, then publish the
-main package:
+Wait until version `0.1.0` is visible in the crates.io index:
 
 ```bash
+cargo info libinput-rs-evdev@0.1.0
+```
+
+Then validate and publish the main package:
+
+```bash
+make main-crate-package-check
 cargo publish --dry-run --locked --package libinput-rs
 cargo publish --locked --package libinput-rs
 ```
