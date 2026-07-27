@@ -44,25 +44,29 @@ chmod 600 ~/.config/copr
 copr-cli whoami
 ```
 
-Create the project if it does not already exist. Fedora 45 is currently the
-rawhide target in COPR, so publish against Fedora 44 and Fedora rawhide:
+Create the project if it does not already exist:
 
 ```bash
 copr-cli create libinput-rs \
+  --chroot epel-9-x86_64 \
+  --chroot epel-10-x86_64 \
   --chroot fedora-44-x86_64 \
   --chroot fedora-rawhide-x86_64 \
+  --chroot rhel-9-x86_64 \
+  --chroot rhel-10-x86_64 \
   --description "Rust drop-in replacement for libinput" \
-  --instructions "Test from a text console or SSH session and keep rollback available."
+  --instructions "Install from a text console or SSH-capable system. The companion daemon is enabled automatically on first installation and can be disabled with systemctl disable --now libinput-rs.service."
 ```
-
-EPEL and RHEL chroots are not enabled because they do not provide the libwacom
-ABI required by this implementation.
 
 Submit the source RPM:
 
 ```bash
-copr-cli build libinput-rs "$HOME/rpmbuild/SRPMS/libinput-rs-0.2.1-3.fc45.src.rpm"
+copr-cli build libinput-rs "$HOME/rpmbuild/SRPMS/libinput-rs-0.2.1-4.fc45.src.rpm"
 ```
+
+Formal proof compilers are verified separately in Fedora CI and are not COPR
+build dependencies. The shared library does not link to libwacom because this
+implementation does not call its API.
 
 After the build succeeds, verify that the runtime RPM contains
 `/usr/lib/systemd/system-preset/90-libinput-rs.preset`, then test installation,
@@ -99,8 +103,8 @@ cargo publish --dry-run --locked --package libinput-rs
 cargo publish --locked --package libinput-rs
 ```
 
-The crates.io packages distribute Rust source. Fedora system replacement users
-should install the runtime and development RPMs from COPR.
+The crates.io packages distribute Rust source. System replacement users should
+install the runtime and development RPMs from COPR.
 
 ## Tag the release
 
