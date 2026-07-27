@@ -231,6 +231,10 @@ struct TrackedDevice {
     touch_arbitration_suppressed: bool,
     touch_arbitration_tablet_was_active: bool,
     tap_emitted: bool,
+    tap_button_down: Option<u16>,
+    tap_release_since: Option<Instant>,
+    tap_drag_active: bool,
+    tap_fingers: u32,
     touch_start_time: Option<Instant>,
     last_movement_time: Option<Instant>,
     active_click_button: Option<u16>,
@@ -342,6 +346,11 @@ struct TrackedDevice {
     hold_fingers: i32,
     hold_blocked: bool,
     hold_contact_changed: bool,
+    drag_3fg_candidate_since: Option<Instant>,
+    drag_3fg_candidate_time_usec: u64,
+    drag_3fg_active: bool,
+    drag_3fg_button_down: bool,
+    drag_3fg_release_since: Option<Instant>,
 
     // --- keyboard repeat ---
     held_keys: Vec<HeldKey>,
@@ -662,6 +671,10 @@ impl TrackedDevice {
             touch_arbitration_suppressed: false,
             touch_arbitration_tablet_was_active: false,
             tap_emitted: false,
+            tap_button_down: None,
+            tap_release_since: None,
+            tap_drag_active: false,
+            tap_fingers: 0,
             touch_start_time: None,
             last_movement_time: None,
             active_click_button: None,
@@ -779,6 +792,11 @@ impl TrackedDevice {
             hold_fingers: 0,
             hold_blocked: false,
             hold_contact_changed: false,
+            drag_3fg_candidate_since: None,
+            drag_3fg_candidate_time_usec: 0,
+            drag_3fg_active: false,
+            drag_3fg_button_down: false,
+            drag_3fg_release_since: None,
             held_keys: Vec::new(),
             held_buttons: Vec::new(),
             last_typing_time: None,
@@ -844,7 +862,7 @@ impl TrackedDevice {
     fn classify_gesture_contacts(&mut self, button_areas: bool) {
         let button_top = self
             .abs_y_range
-            .map(|(minimum, maximum)| f64::from(minimum + (maximum - minimum) * 4 / 5));
+            .map(|(minimum, maximum)| f64::from(minimum + (maximum - minimum) * 9 / 10));
         for slot in &mut self.mt_slots {
             if slot.active && slot.button_area_classification_pending {
                 slot.button_area_excluded =
@@ -1703,6 +1721,7 @@ impl BackendState {
         let mut has_mt_x = false;
         let mut has_mt_y = false;
         let mut has_mt_slot = false;
+        let mut mt_slot_count = 0;
         let mut invalid_coordinate_range = false;
         let mut invalid_other_range = false;
         let mut invalid_negative_resolution = false;
@@ -1723,6 +1742,9 @@ impl BackendState {
                 has_mt_x |= axis == AbsoluteAxisCode::ABS_MT_POSITION_X;
                 has_mt_y |= axis == AbsoluteAxisCode::ABS_MT_POSITION_Y;
                 has_mt_slot |= axis == AbsoluteAxisCode::ABS_MT_SLOT;
+                if axis == AbsoluteAxisCode::ABS_MT_SLOT {
+                    mt_slot_count = (info.maximum() - info.minimum() + 1).max(0);
+                }
 
                 if axis == AbsoluteAxisCode::ABS_X {
                     abs_x_resolution = Some(info.resolution());
@@ -1925,6 +1947,7 @@ impl BackendState {
         (*lib_dev).has_keyboard = is_keyboard;
         (*lib_dev).has_touch = has_touch;
         (*lib_dev).has_gesture = is_touchpad && !props.contains(evdev::PropType::SEMI_MT);
+        (*lib_dev).mt_slot_count = if has_mt_slot { mt_slot_count } else { 0 };
         (*lib_dev).has_switch = has_switch;
         (*lib_dev).has_tablet = has_tablet;
         (*lib_dev).has_tablet_pad = has_tablet_pad;
@@ -2377,6 +2400,40 @@ impl BackendState {
                 device: event_device,
             });
         }
+        if let Some(button) = tracked.tap_button_down.take() {
+            tracked.tap_release_since = None;
+            tracked.tap_drag_active = false;
+            let seat_button_count = release_seat_button(device);
+            out.push_back(LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
+                payload: EventPayload::PointerButton(PointerButtonEvent {
+                    time_usec,
+                    button: button as u32,
+                    state: 0,
+                    seat_button_count,
+                }),
+                context: ctx,
+                device,
+            });
+        }
+        if std::mem::take(&mut tracked.drag_3fg_button_down) {
+            tracked.drag_3fg_active = false;
+            tracked.drag_3fg_candidate_since = None;
+            tracked.drag_3fg_candidate_time_usec = 0;
+            tracked.drag_3fg_release_since = None;
+            let seat_button_count = release_seat_button(device);
+            out.push_back(LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
+                payload: EventPayload::PointerButton(PointerButtonEvent {
+                    time_usec,
+                    button: KeyCode::BTN_LEFT.0 as u32,
+                    state: 0,
+                    seat_button_count,
+                }),
+                context: ctx,
+                device,
+            });
+        }
         if !tracked.tablet_tool.is_null() {
             let tool = tracked.tablet_tool;
             for button in std::mem::take(&mut tracked.tablet_held_buttons) {
@@ -2582,7 +2639,10 @@ impl BackendState {
 
         // --- synthetic key-repeat before reading new events ---
         self.emit_key_repeats(ctx, out);
+        let quick_hold_timeout = Duration::from_millis(40);
         let hold_timeout = Duration::from_millis(180);
+        let tap_release_timeout = Duration::from_millis(180);
+        let drag_3fg_release_timeout = Duration::from_millis(700);
         // A lone left/right press is held briefly while middle-button
         // emulation waits for a possible chord. Once the chord window has
         // elapsed, deliver the original press before processing newer input.
@@ -2834,12 +2894,17 @@ impl BackendState {
         // contact already queued by the kernel join the hold before its begin
         // event is emitted.
         for tracked in self.devices.values_mut() {
+            let timeout = if tracked.hold_fingers <= 2 {
+                quick_hold_timeout
+            } else {
+                hold_timeout
+            };
             if !(*tracked.lib_device).has_gesture
                 || tracked.hold_active
                 || tracked.hold_blocked
                 || !tracked
                     .hold_started_at
-                    .is_some_and(|start| start.elapsed() >= hold_timeout)
+                    .is_some_and(|start| start.elapsed() >= timeout)
             {
                 continue;
             }
@@ -2863,6 +2928,61 @@ impl BackendState {
                     scale: 1.0,
                     angle: 0.0,
                     cancelled: false,
+                }),
+                context: ctx,
+                device: tracked.lib_device,
+            });
+        }
+
+        // A second contact arriving before this deadline converts the tap
+        // into a drag and clears tap_release_since while input is processed.
+        // Only release here, after input has had that opportunity.
+        for tracked in self.devices.values_mut() {
+            if !tracked
+                .tap_release_since
+                .is_some_and(|since| since.elapsed() >= tap_release_timeout)
+            {
+                continue;
+            }
+            tracked.tap_release_since = None;
+            tracked.tap_drag_active = false;
+            let Some(button) = tracked.tap_button_down.take() else {
+                continue;
+            };
+            let seat_button_count = release_seat_button(tracked.lib_device);
+            out.push_back(LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
+                payload: EventPayload::PointerButton(PointerButtonEvent {
+                    time_usec: systime_to_usec(SystemTime::now()),
+                    button: button as u32,
+                    state: 0,
+                    seat_button_count,
+                }),
+                context: ctx,
+                device: tracked.lib_device,
+            });
+        }
+
+        for tracked in self.devices.values_mut() {
+            if !tracked
+                .drag_3fg_release_since
+                .is_some_and(|since| since.elapsed() >= drag_3fg_release_timeout)
+            {
+                continue;
+            }
+            tracked.drag_3fg_release_since = None;
+            tracked.drag_3fg_active = false;
+            if !std::mem::take(&mut tracked.drag_3fg_button_down) {
+                continue;
+            }
+            let seat_button_count = release_seat_button(tracked.lib_device);
+            out.push_back(LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
+                payload: EventPayload::PointerButton(PointerButtonEvent {
+                    time_usec: systime_to_usec(SystemTime::now()),
+                    button: KeyCode::BTN_LEFT.0 as u32,
+                    state: 0,
+                    seat_button_count,
                 }),
                 context: ctx,
                 device: tracked.lib_device,
@@ -2983,8 +3103,28 @@ impl BackendState {
             .devices
             .values()
             .filter(|tracked| !tracked.hold_active && !tracked.hold_blocked)
-            .filter_map(|tracked| tracked.hold_started_at)
-            .map(|since| hold_timeout.saturating_sub(since.elapsed()))
+            .filter_map(|tracked| {
+                tracked.hold_started_at.map(|since| {
+                    let timeout = if tracked.hold_fingers <= 2 {
+                        quick_hold_timeout
+                    } else {
+                        hold_timeout
+                    };
+                    timeout.saturating_sub(since.elapsed())
+                })
+            })
+            .min();
+        let next_tap_timeout = self
+            .devices
+            .values()
+            .filter_map(|tracked| tracked.tap_release_since)
+            .map(|since| tap_release_timeout.saturating_sub(since.elapsed()))
+            .min();
+        let next_drag_3fg_timeout = self
+            .devices
+            .values()
+            .filter_map(|tracked| tracked.drag_3fg_release_since)
+            .map(|since| drag_3fg_release_timeout.saturating_sub(since.elapsed()))
             .min();
         let next_timeout = [
             next_middle_timeout,
@@ -2992,6 +3132,8 @@ impl BackendState {
             next_tablet_timeout,
             next_eraser_timeout,
             next_hold_timeout,
+            next_tap_timeout,
+            next_drag_3fg_timeout,
         ]
         .into_iter()
         .flatten()
@@ -5163,39 +5305,44 @@ impl BackendState {
                         }
                     }
                     if td.touch_active {
+                        let continues_tap_drag =
+                            td.tap_button_down.is_some() && td.tap_release_since.take().is_some();
+                        td.tap_drag_active = continues_tap_drag;
                         td.touch_start_time = Some(Instant::now());
-                        td.tap_emitted = td.touch_arbitration_suppressed;
+                        td.tap_emitted = td.touch_arbitration_suppressed || continues_tap_drag;
+                        if continues_tap_drag {
+                            td.hold_started_at = None;
+                            td.hold_blocked = true;
+                        }
                         td.touch_fingers = td.active_slot_count().max(1) as u32;
+                        td.tap_fingers = td.touch_fingers;
                         td.last_x = None;
                         td.last_y = None;
-                        // Pinch BEGIN if 2+ fingers just landed
-                        if !td.touch_arbitration_suppressed
-                            && td.touch_fingers >= 2
-                            && !td.pinch_active
-                        {
-                            if let Some(dist) = td.primary_slot_distance() {
-                                td.pinch_active = true;
-                                td.pinch_base_dist = dist;
-                                td.pinch_base_angle = td.primary_slot_angle();
-                                td.pinch_fingers = td.touch_fingers as i32;
-                                out.push_back(LibinputEvent {
-                                    event_type:
-                                        LibinputEventType::LIBINPUT_EVENT_GESTURE_PINCH_BEGIN,
-                                    payload: EventPayload::GesturePinchBegin(GestureEvent {
-                                        time_usec: ts_usec,
-                                        finger_count: td.pinch_fingers,
-                                        dx: 0.0,
-                                        dy: 0.0,
-                                        scale: 1.0,
-                                        angle: 0.0,
-                                        cancelled: false,
-                                    }),
-                                    context: ctx,
-                                    device: lib_dev,
-                                });
-                            }
-                        }
                     } else {
+                        // BTN_TOUCH=0 terminates the complete contact set. End
+                        // an active hold before tap-to-click emits its button
+                        // pair so clients observe the gesture lifecycle in
+                        // chronological order.
+                        if td.hold_active {
+                            out.push_back(LibinputEvent {
+                                event_type: LibinputEventType::LIBINPUT_EVENT_GESTURE_HOLD_END,
+                                payload: EventPayload::GestureHoldEnd(GestureEvent {
+                                    time_usec: ts_usec,
+                                    finger_count: td.hold_fingers,
+                                    dx: 0.0,
+                                    dy: 0.0,
+                                    scale: 1.0,
+                                    angle: 0.0,
+                                    cancelled: false,
+                                }),
+                                context: ctx,
+                                device: lib_dev,
+                            });
+                            td.hold_active = false;
+                            td.hold_started_at = None;
+                            td.hold_blocked = false;
+                        }
+
                         // Finger lift — end pinch
                         if td.pinch_active {
                             td.pinch_active = false;
@@ -5224,43 +5371,82 @@ impl BackendState {
                             });
                         }
 
-                        // Tap-to-click
-                        if cfg_tap
+                        // A tap during the drag-lock window terminates the
+                        // locked drag before the tap's own button sequence.
+                        let resumed_drag_tap = td.drag_3fg_active
+                            && cfg_tap
+                            && !td.tap_emitted
+                            && td.tap_fingers <= 3
+                            && td
+                                .touch_start_time
+                                .is_some_and(|start| start.elapsed() < Duration::from_millis(250));
+                        if td.drag_3fg_button_down && (!td.drag_3fg_active || resumed_drag_tap) {
+                            td.drag_3fg_button_down = false;
+                            td.drag_3fg_active = false;
+                            td.drag_3fg_release_since = None;
+                            let released_count = release_seat_button(lib_dev);
+                            out.push_back(LibinputEvent {
+                                event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
+                                payload: EventPayload::PointerButton(PointerButtonEvent {
+                                    time_usec: ts_usec,
+                                    button: KeyCode::BTN_LEFT.0 as u32,
+                                    state: 0,
+                                    seat_button_count: released_count,
+                                }),
+                                context: ctx,
+                                device: lib_dev,
+                            });
+                        }
+
+                        // Tap-to-drag keeps the tap button held across the
+                        // second contact and releases it when that contact
+                        // lifts. A standalone tap is released by its timer.
+                        if td.tap_drag_active {
+                            if let Some(button) = td.tap_button_down.take() {
+                                let released_count = release_seat_button(lib_dev);
+                                out.push_back(LibinputEvent {
+                                    event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
+                                    payload: EventPayload::PointerButton(PointerButtonEvent {
+                                        time_usec: ts_usec,
+                                        button: button as u32,
+                                        state: 0,
+                                        seat_button_count: released_count,
+                                    }),
+                                    context: ctx,
+                                    device: lib_dev,
+                                });
+                            }
+                            td.tap_release_since = None;
+                            td.tap_drag_active = false;
+                        } else if cfg_tap
                             && !td.tap_emitted
                             && !dwt_active
                             && !td.touch_arbitration_suppressed
+                            && td
+                                .touch_start_time
+                                .is_some_and(|start| start.elapsed() < Duration::from_millis(250))
                         {
-                            if let Some(start) = td.touch_start_time {
-                                if start.elapsed() < Duration::from_millis(250)
-                                    && td.touch_fingers <= 1
-                                {
-                                    let pressed_count = press_seat_button(lib_dev);
-                                    out.push_back(LibinputEvent {
-                                        event_type:
-                                            LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
-                                        payload: EventPayload::PointerButton(PointerButtonEvent {
-                                            time_usec: ts_usec,
-                                            button: KeyCode::BTN_LEFT.0 as u32,
-                                            state: 1,
-                                            seat_button_count: pressed_count,
-                                        }),
-                                        context: ctx,
-                                        device: lib_dev,
-                                    });
-                                    let released_count = release_seat_button(lib_dev);
-                                    out.push_back(LibinputEvent {
-                                        event_type:
-                                            LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
-                                        payload: EventPayload::PointerButton(PointerButtonEvent {
-                                            time_usec: ts_usec,
-                                            button: KeyCode::BTN_LEFT.0 as u32,
-                                            state: 0,
-                                            seat_button_count: released_count,
-                                        }),
-                                        context: ctx,
-                                        device: lib_dev,
-                                    });
-                                }
+                            let button = match td.tap_fingers {
+                                1 => Some(KeyCode::BTN_LEFT.0),
+                                2 => Some(KeyCode::BTN_RIGHT.0),
+                                3 => Some(KeyCode::BTN_MIDDLE.0),
+                                _ => None,
+                            };
+                            if let Some(button) = button {
+                                let pressed_count = press_seat_button(lib_dev);
+                                out.push_back(LibinputEvent {
+                                    event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
+                                    payload: EventPayload::PointerButton(PointerButtonEvent {
+                                        time_usec: ts_usec,
+                                        button: button as u32,
+                                        state: 1,
+                                        seat_button_count: pressed_count,
+                                    }),
+                                    context: ctx,
+                                    device: lib_dev,
+                                });
+                                td.tap_button_down = Some(button);
+                                td.tap_release_since = Some(Instant::now());
                             }
                         }
                         td.last_x = None;
@@ -5269,15 +5455,19 @@ impl BackendState {
                         td.current_dy = 0;
                         td.touch_start_time = None;
                         td.touch_fingers = 0;
+                        td.tap_fingers = 0;
                     }
                 } else if code == KeyCode::BTN_TOOL_DOUBLETAP.0 {
                     td.touch_fingers = if value != 0 { 2 } else { 1 };
+                    td.tap_fingers = td.tap_fingers.max(td.touch_fingers);
                     td.mt_contact_count_changed = true;
                 } else if code == KeyCode::BTN_TOOL_TRIPLETAP.0 {
                     td.touch_fingers = if value != 0 { 3 } else { 2 };
+                    td.tap_fingers = td.tap_fingers.max(td.touch_fingers);
                     td.mt_contact_count_changed = true;
                 } else if code == KeyCode::BTN_TOOL_QUADTAP.0 {
                     td.touch_fingers = if value != 0 { 4 } else { 3 };
+                    td.tap_fingers = td.tap_fingers.max(td.touch_fingers);
                     td.mt_contact_count_changed = true;
                 } else {
                     // Physical click with finger-count remapping
@@ -5727,6 +5917,66 @@ impl BackendState {
                     let button_areas = (*lib_dev).click_method == 1;
                     td.classify_gesture_contacts(button_areas);
                     let n_fingers = td.gesture_finger_count(button_areas);
+                    let eligible_tracked_contacts = td
+                        .mt_slots
+                        .iter()
+                        .filter(|slot| slot.active && (!button_areas || !slot.button_area_excluded))
+                        .count();
+                    if td.touch_active {
+                        td.tap_fingers = td.tap_fingers.max(n_fingers as u32);
+                    }
+                    let drag_fingers = match (*lib_dev).drag_3fg_enabled {
+                        1 => 3,
+                        2 => 4,
+                        _ => 0,
+                    };
+                    if drag_fingers != 0 && n_fingers == drag_fingers {
+                        if td.drag_3fg_button_down && td.drag_3fg_release_since.take().is_some() {
+                            td.drag_3fg_active = true;
+                            td.drag_3fg_candidate_since = None;
+                            td.drag_3fg_candidate_time_usec = 0;
+                            td.hold_started_at = None;
+                            td.hold_blocked = true;
+                        } else if !td.drag_3fg_button_down {
+                            if td.drag_3fg_candidate_since.is_none() {
+                                td.drag_3fg_candidate_since = Some(Instant::now());
+                                td.drag_3fg_candidate_time_usec = ts_usec;
+                            }
+                            if !(*lib_dev).tap_enabled && !td.swipe_active {
+                                td.swipe_active = true;
+                                td.swipe_fingers = n_fingers as i32;
+                                out.push_back(LibinputEvent {
+                                    event_type:
+                                        LibinputEventType::LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN,
+                                    payload: EventPayload::GestureSwipeBegin(GestureEvent {
+                                        time_usec: ts_usec,
+                                        finger_count: td.swipe_fingers,
+                                        dx: 0.0,
+                                        dy: 0.0,
+                                        scale: 1.0,
+                                        angle: 0.0,
+                                        cancelled: false,
+                                    }),
+                                    context: ctx,
+                                    device: lib_dev,
+                                });
+                            }
+                        }
+                    } else if n_fingers == 0 {
+                        td.drag_3fg_candidate_since = None;
+                        td.drag_3fg_candidate_time_usec = 0;
+                        if td.drag_3fg_active && td.drag_3fg_button_down {
+                            td.drag_3fg_active = false;
+                            td.drag_3fg_release_since = Some(Instant::now());
+                        }
+                    } else if !td.drag_3fg_button_down {
+                        td.drag_3fg_candidate_since = None;
+                        td.drag_3fg_candidate_time_usec = 0;
+                    }
+                    if td.drag_3fg_button_down {
+                        td.hold_started_at = None;
+                        td.hold_blocked = true;
+                    }
                     td.hold_contact_changed = true;
                     if !td.hold_active {
                         if n_fingers == 0 {
@@ -5738,7 +5988,9 @@ impl BackendState {
                             td.hold_fingers = td.hold_fingers.max(n_fingers as i32);
                         }
                     }
-                    if n_fingers != 2 && td.finger_scroll_axes != 0 {
+                    if (n_fingers == 0 || n_fingers > 2 || eligible_tracked_contacts == 0)
+                        && td.finger_scroll_axes != 0
+                    {
                         for axis in 0..2 {
                             if td.finger_scroll_axes & (1 << axis) == 0 {
                                 continue;
@@ -5786,6 +6038,13 @@ impl BackendState {
                     td.remainder_x = 0.0;
                     td.remainder_y = 0.0;
                     td.gesture_last_centroid = td.gesture_centroid(button_areas);
+                    if !td.pinch_active && n_fingers >= 2 {
+                        if let Some(distance) = td.primary_slot_distance() {
+                            td.pinch_base_dist = distance;
+                            td.pinch_base_angle = td.primary_slot_angle();
+                            td.pinch_fingers = n_fingers as i32;
+                        }
+                    }
                     return;
                 }
 
@@ -5840,11 +6099,147 @@ impl BackendState {
                     td.tap_emitted = true;
                     return;
                 }
-                if !has_movement {
+                let n_fingers = td.gesture_finger_count((*lib_dev).click_method == 1);
+                let drag_fingers = match (*lib_dev).drag_3fg_enabled {
+                    1 => 3,
+                    2 => 4,
+                    _ => 0,
+                };
+
+                if td.drag_3fg_button_down
+                    && !td.drag_3fg_active
+                    && td.drag_3fg_release_since.is_some()
+                    && n_fingers != drag_fingers
+                    && has_movement
+                {
+                    td.drag_3fg_release_since = None;
+                    td.drag_3fg_button_down = false;
+                    let seat_button_count = release_seat_button(lib_dev);
+                    out.push_back(LibinputEvent {
+                        event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
+                        payload: EventPayload::PointerButton(PointerButtonEvent {
+                            time_usec: ts_usec,
+                            button: KeyCode::BTN_LEFT.0 as u32,
+                            state: 0,
+                            seat_button_count,
+                        }),
+                        context: ctx,
+                        device: lib_dev,
+                    });
+                }
+
+                let activates_3fg_drag = drag_fingers != 0
+                    && n_fingers == drag_fingers
+                    && !td.drag_3fg_button_down
+                    && td.drag_3fg_candidate_since.is_some()
+                    && (td
+                        .drag_3fg_candidate_since
+                        .is_some_and(|since| since.elapsed() >= Duration::from_millis(80))
+                        || ts_usec.saturating_sub(td.drag_3fg_candidate_time_usec) >= 80_000);
+                if activates_3fg_drag {
+                    if !td.swipe_active {
+                        td.swipe_fingers = n_fingers as i32;
+                        out.push_back(LibinputEvent {
+                            event_type: LibinputEventType::LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN,
+                            payload: EventPayload::GestureSwipeBegin(GestureEvent {
+                                time_usec: ts_usec,
+                                finger_count: td.swipe_fingers,
+                                dx: 0.0,
+                                dy: 0.0,
+                                scale: 1.0,
+                                angle: 0.0,
+                                cancelled: false,
+                            }),
+                            context: ctx,
+                            device: lib_dev,
+                        });
+                    }
+                    td.swipe_active = false;
+                    out.push_back(LibinputEvent {
+                        event_type: LibinputEventType::LIBINPUT_EVENT_GESTURE_SWIPE_END,
+                        payload: EventPayload::GestureSwipeEnd(GestureEvent {
+                            time_usec: ts_usec,
+                            finger_count: td.swipe_fingers,
+                            dx: 0.0,
+                            dy: 0.0,
+                            scale: 1.0,
+                            angle: 0.0,
+                            cancelled: true,
+                        }),
+                        context: ctx,
+                        device: lib_dev,
+                    });
+                    td.drag_3fg_candidate_since = None;
+                    td.drag_3fg_candidate_time_usec = 0;
+                    td.drag_3fg_active = true;
+                    td.drag_3fg_button_down = true;
+                    td.hold_started_at = None;
+                    td.hold_blocked = true;
+                    td.tap_emitted = true;
+                    let seat_button_count = press_seat_button(lib_dev);
+                    out.push_back(LibinputEvent {
+                        event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
+                        payload: EventPayload::PointerButton(PointerButtonEvent {
+                            time_usec: ts_usec,
+                            button: KeyCode::BTN_LEFT.0 as u32,
+                            state: 1,
+                            seat_button_count,
+                        }),
+                        context: ctx,
+                        device: lib_dev,
+                    });
+                }
+
+                if td.drag_3fg_active {
+                    td.tap_emitted = true;
+                    if has_movement {
+                        let scale = 0.18;
+                        out.push_back(LibinputEvent {
+                            event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_MOTION,
+                            payload: EventPayload::PointerMotion(PointerMotionEvent {
+                                time_usec: ts_usec,
+                                dx: td.current_dx as f64 * scale,
+                                dy: td.current_dy as f64 * scale,
+                                dx_unaccel: td.current_dx as f64 * scale,
+                                dy_unaccel: td.current_dy as f64 * scale,
+                            }),
+                            context: ctx,
+                            device: lib_dev,
+                        });
+                    }
+                    td.current_dx = 0;
+                    td.current_dy = 0;
                     return;
                 }
 
-                if td.hold_active {
+                let pinch_distance = td.primary_slot_distance();
+                let button_areas = (*lib_dev).click_method == 1;
+                let eligible_tracked_contacts = td
+                    .mt_slots
+                    .iter()
+                    .filter(|slot| slot.active && (!button_areas || !slot.button_area_excluded))
+                    .count();
+                let pinch_is_trackable = eligible_tracked_contacts >= 2
+                    && td.touch_fingers as usize <= td.active_slot_count();
+                let centroid_distance = f64::from(td.current_dx).hypot(f64::from(td.current_dy));
+                let starts_pinch = !td.pinch_active
+                    && !td.swipe_active
+                    && td.drag_3fg_candidate_since.is_none()
+                    && pinch_is_trackable
+                    && n_fingers >= 2
+                    && td.pinch_base_dist > 0.0
+                    && pinch_distance.is_some_and(|distance| {
+                        let distance_delta = (distance - td.pinch_base_dist).abs();
+                        distance_delta > 0.5
+                            && (centroid_distance == 0.0
+                                || distance_delta > centroid_distance * 2.0)
+                    });
+                if !has_movement && !starts_pinch {
+                    return;
+                }
+
+                let motion_ends_hold = n_fingers >= 2 || starts_pinch;
+                if td.hold_active && motion_ends_hold {
                     out.push_back(LibinputEvent {
                         event_type: LibinputEventType::LIBINPUT_EVENT_GESTURE_HOLD_END,
                         payload: EventPayload::GestureHoldEnd(GestureEvent {
@@ -5862,14 +6257,35 @@ impl BackendState {
                     td.hold_active = false;
                     td.hold_blocked = true;
                     td.hold_started_at = None;
-                } else if td.hold_started_at.is_some() {
+                } else if !td.hold_active && motion_ends_hold && td.hold_started_at.is_some() {
                     td.hold_started_at = None;
                     td.hold_blocked = true;
                 }
 
+                if starts_pinch {
+                    td.pinch_active = true;
+                    td.pinch_fingers = n_fingers as i32;
+                    out.push_back(LibinputEvent {
+                        event_type: LibinputEventType::LIBINPUT_EVENT_GESTURE_PINCH_BEGIN,
+                        payload: EventPayload::GesturePinchBegin(GestureEvent {
+                            time_usec: ts_usec,
+                            finger_count: td.pinch_fingers,
+                            dx: 0.0,
+                            dy: 0.0,
+                            scale: 1.0,
+                            angle: 0.0,
+                            cancelled: false,
+                        }),
+                        context: ctx,
+                        device: lib_dev,
+                    });
+                    td.current_dx = 0;
+                    td.current_dy = 0;
+                    return;
+                }
+
                 td.tap_emitted = true;
                 let hw_scale: f32 = 0.18;
-                let n_fingers = td.gesture_finger_count((*lib_dev).click_method == 1);
 
                 if n_fingers <= 1 {
                     let total_x = (td.current_dx as f32 * hw_scale) * cfg_accel + td.remainder_x;

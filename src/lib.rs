@@ -980,14 +980,26 @@ pub unsafe extern "C" fn libinput_event_gesture_get_dy(event: *const LibinputEve
 pub unsafe extern "C" fn libinput_event_gesture_get_dx_unaccelerated(
     event: *const LibinputEvent,
 ) -> f64 {
-    libinput_event_gesture_get_dx(event)
+    if event.is_null() {
+        return 0.0;
+    }
+    match &(*event).payload {
+        EventPayload::GestureSwipeUpdate(e) | EventPayload::GesturePinchUpdate(e) => e.dx / 1.2,
+        _ => 0.0,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_gesture_get_dy_unaccelerated(
     event: *const LibinputEvent,
 ) -> f64 {
-    libinput_event_gesture_get_dy(event)
+    if event.is_null() {
+        return 0.0;
+    }
+    match &(*event).payload {
+        EventPayload::GestureSwipeUpdate(e) | EventPayload::GesturePinchUpdate(e) => e.dy / 1.2,
+        _ => 0.0,
+    }
 }
 
 #[no_mangle]
@@ -1338,28 +1350,38 @@ pub unsafe extern "C" fn libinput_device_config_tap_get_default_button_map(
 pub unsafe extern "C" fn libinput_device_config_3fg_drag_get_finger_count(
     dev: *const LibinputDevice,
 ) -> libc::c_int {
-    if dev.is_null() || !(*dev).has_touch {
+    if dev.is_null() || !(*dev).has_gesture {
         return 0;
     }
-    0
+    (*dev).mt_slot_count
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_3fg_drag_set_enabled(
     dev: *mut LibinputDevice,
-    _enable: u32,
+    enable: u32,
 ) -> u32 {
     if dev.is_null() {
         return 1;
     }
-    1
+    if !matches!(enable, 0..=2) {
+        return 2;
+    }
+    if libinput_device_config_3fg_drag_get_finger_count(dev) < 3 {
+        return 1;
+    }
+    (*dev).drag_3fg_enabled = enable;
+    0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_3fg_drag_get_enabled(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    0
+    if dev.is_null() {
+        return 0;
+    }
+    (*dev).drag_3fg_enabled
 }
 
 #[no_mangle]
