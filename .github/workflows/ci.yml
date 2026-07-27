@@ -58,8 +58,24 @@ jobs:
             echo "System libinput reference is unavailable; skipping ABI comparison."
           fi
 
-      - name: Check source packaging
-        run: make crate-package-check
+      - name: Check package metadata
+        run: cargo metadata --locked --offline --no-deps >/dev/null
+
+      - name: Package compatibility crate
+        run: cargo package --locked --no-verify --package libinput-rs-evdev
+
+      - name: Inspect compatibility crate contents
+        run: |
+          ! cargo package --locked --list --package libinput-rs-evdev \
+            | grep -Eq '/(vendor|\.cargo|rpmbuild)'
+
+      - name: Package main crate
+        run: cargo package --locked --no-verify --package libinput-rs
+
+      - name: Inspect main crate contents
+        run: |
+          ! cargo package --locked --list --package libinput-rs \
+            | grep -Eq '/(vendor|\.cargo|rpmbuild)'
 
       - name: Verify ABI isolation
         run: |
