@@ -78,8 +78,8 @@ install: all
 	install -Dm644 src/config.json $(DESTDIR)/etc/libinput-rs/config.json
 	install -Dm644 systemd/libinput-rs.service $(DESTDIR)$(UNITDIR)/libinput-rs.service
 	install -Dm755 target/release/libinput.so $(DESTDIR)$(LIBDIR)/libinput.so.10.13.0
-	ln -s libinput.so.10.13.0 $(DESTDIR)$(LIBDIR)/libinput.so.10
-	ln -s libinput.so.10 $(DESTDIR)$(LIBDIR)/libinput.so
+	ln -sf libinput.so.10.13.0 $(DESTDIR)$(LIBDIR)/libinput.so.10
+	ln -sf libinput.so.10 $(DESTDIR)$(LIBDIR)/libinput.so
 	install -Dm644 packaging/libinput.h $(DESTDIR)$(PREFIX)/include/libinput.h
 	install -d $(DESTDIR)$(LIBDIR)/pkgconfig
 	sed 's|@LIBDIR@|$(LIBDIR)|g' packaging/libinput-rs.pc.in > $(DESTDIR)$(LIBDIR)/pkgconfig/libinput.pc
