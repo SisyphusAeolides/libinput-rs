@@ -75,10 +75,14 @@ The daemon reads `/etc/libinput-rs/config.json`:
 {
   "tap_to_click": true,
   "natural_scrolling": true,
-  "pointer_acceleration": 1.0,
+  "pointer_acceleration": 3.0,
   "disable_while_typing": true
 }
 ```
+
+`pointer_acceleration` is a multiplier applied after touchpad absolute motion is
+converted to relative pointer motion. The shipped default is `3.0`, validated on
+the Fedora 45 touchpad used for live replacement testing.
 
 ## Drop-in replacement
 

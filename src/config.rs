@@ -1,7 +1,9 @@
 use serde::Deserialize;
 use std::fs;
 
-#[derive(Deserialize, Debug)]
+pub const DEFAULT_POINTER_ACCELERATION: f32 = 3.0;
+
+#[derive(Deserialize, Debug, PartialEq)]
 pub struct InputConfig {
     pub tap_to_click: bool,
     pub natural_scrolling: bool,
@@ -14,7 +16,7 @@ impl Default for InputConfig {
         Self {
             tap_to_click: true,
             natural_scrolling: true,
-            pointer_acceleration: 1.0,
+            pointer_acceleration: DEFAULT_POINTER_ACCELERATION,
             disable_while_typing: true,
         }
     }
@@ -27,5 +29,19 @@ pub fn load_config() -> Option<InputConfig> {
         serde_json::from_str(&data).ok()
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shipped_config_matches_runtime_defaults() {
+        let shipped: InputConfig = serde_json::from_str(include_str!("config.json"))
+            .expect("the shipped companion configuration must remain valid JSON");
+
+        assert_eq!(shipped, InputConfig::default());
+        assert_eq!(shipped.pointer_acceleration, DEFAULT_POINTER_ACCELERATION);
     }
 }
