@@ -79,17 +79,23 @@ jobs:
       - name: Rebuild binary RPM
         run: rpmbuild --rebuild "$PWD"/rpmbuild/SRPMS/*.src.rpm --define "_topdir $PWD/rpmbuild"
 
-      - name: Verify RPM payload
+      - name: Locate binary RPM
         run: |
           package=$(find "$PWD/rpmbuild/RPMS" -name 'libinput-rs-[0-9]*.rpm' -print -quit)
           test -n "$package"
-          make rpm-check RPM_PACKAGE="$package"
+          echo "RPM_PACKAGE=$package" >> "$GITHUB_ENV"
+
+      - name: Inspect RPM metadata
+        run: |
+          rpm -qpl "$RPM_PACKAGE"
+          rpm -qp --provides "$RPM_PACKAGE"
+          rpm -qp --obsoletes "$RPM_PACKAGE"
+
+      - name: Verify RPM payload
+        run: make rpm-check RPM_PACKAGE="$RPM_PACKAGE"
 
       - name: Lint RPM
-        run: |
-          package=$(find "$PWD/rpmbuild/RPMS" -name 'libinput-rs-[0-9]*.rpm' -print -quit)
-          test -n "$package"
-          rpmlint "$package"
+        run: rpmlint "$RPM_PACKAGE"
 
   proofs:
     name: Safety proofs
