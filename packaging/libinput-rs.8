@@ -28,6 +28,10 @@ The service is disabled by default and is not required by the ABI replacement.
 .SH CONFIGURATION
 Companion-daemon configuration is read from
 .IR /etc/libinput-rs/config.json .
+The
+.B pointer_acceleration
+field multiplies relative pointer motion after touchpad coordinate conversion.
+Its shipped default is 3.0.
 .SH FILES
 .TP
 .I /usr/lib64/libinput.so.10.13.0
