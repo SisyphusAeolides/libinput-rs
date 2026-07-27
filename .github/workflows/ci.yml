@@ -23,7 +23,7 @@ jobs:
       - name: Install DNF dependencies
         run: >-
           dnf -y -q install Agda idris2 cpio elfutils gcc gcc-gfortran libwacom-devel make
-          pkgconf-pkg-config rust cargo clippy rustfmt binutils rpm-build rpmdevtools rpmlint
+          pkgconf-pkg-config ripgrep rust cargo clippy rustfmt binutils rpm-build rpmdevtools rpmlint
           systemd-devel systemd-rpm-macros
 
       - name: Check packaging inputs
