@@ -1,13 +1,14 @@
+%global libinput_compat_version 1.31.3
+%global libinput_replace_before 1.32.0
+
 Name:           libinput-rs
 Version:        0.2.0
-Release:        1%{?dist}
-Summary:        Fail-open Rust touchpad companion
+Release:        2%{?dist}
+Summary:        Rust drop-in replacement for libinput
 
-Provides:       libinput = %{version}-%{release}
-Provides:       libinput%{?_isa} = %{version}-%{release}
-Provides:       libinput-devel = %{version}-%{release}
-Obsoletes:      libinput < 0.2.0-1
-Obsoletes:      libinput-devel < 0.2.0-1
+Provides:       libinput = %{libinput_compat_version}
+Provides:       libinput%{?_isa} = %{libinput_compat_version}
+Obsoletes:      libinput < %{libinput_replace_before}
 
 License:        MIT AND Unicode-3.0
 URL:            https://github.com/SisyphusAeolides/libinput-rs
@@ -27,9 +28,22 @@ BuildRequires:  libwacom-devel >= 2.18
 Requires:       systemd
 
 %description
-libinput-rs provides an optional touchpad companion daemon with fail-open
-device handling. It also installs a libinput ABI implementation
-that replaces the system libinput package and its shared library.
+libinput-rs installs a Rust implementation of the libinput.so.10 ABI in the
+system library path. It also includes an optional fail-open touchpad companion
+daemon. The companion service is disabled by default and is not required by
+the ABI replacement.
+
+%package devel
+Summary:        Development files for the libinput-rs replacement
+Requires:       %{name}%{?_isa} = %{version}-%{release}
+Requires:       pkgconfig(libudev)
+Provides:       libinput-devel = %{libinput_compat_version}
+Provides:       libinput-devel%{?_isa} = %{libinput_compat_version}
+Obsoletes:      libinput-devel < %{libinput_replace_before}
+
+%description devel
+Headers, linker name, and pkg-config metadata for developing software against
+the libinput-rs implementation of the libinput ABI.
 
 %prep
 %autosetup
@@ -53,7 +67,7 @@ sed 's|@LIBDIR@|%{_libdir}|g' packaging/libinput-rs.pc.in \
 install -Dm644 packaging/libinput-rs.8 %{buildroot}%{_mandir}/man8/libinput-rs.8
 
 %check
-CARGO_NET_OFFLINE=true cargo test --frozen
+CARGO_NET_OFFLINE=true cargo test --frozen --workspace
 make proofs-strict
 test -e %{buildroot}%{_libdir}/libinput.so.10
 
@@ -76,12 +90,20 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 %{_unitdir}/libinput-rs.service
 %{_libdir}/libinput.so.10.13.0
 %{_libdir}/libinput.so.10
+%{_mandir}/man8/libinput-rs.8*
+
+%files devel
+%license LICENSE
 %{_libdir}/libinput.so
 %{_includedir}/libinput.h
 %{_libdir}/pkgconfig/libinput.pc
-%{_mandir}/man8/libinput-rs.8*
 
 %changelog
+* Mon Jul 27 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.2.0-2
+- Preserve discovery of devices behind restricted-open callbacks
+- Split runtime and development payloads into policy-compliant RPMs
+- Validate Rust, Fortran, Idris 2, and Agda safety guarantees
+
 * Sun Jul 26 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.2.0-1
 - Convert packaging and CI to DNF and RPM
 - Validate safety models with Rust, Fortran, Idris 2, and Agda toolchains
