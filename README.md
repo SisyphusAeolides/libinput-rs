@@ -24,23 +24,25 @@ remains available even if the graphical session cannot start.
 ```bash
 sudo dnf install dnf-plugins-core
 sudo dnf copr enable sisyphuscode/libinput-rs
-sudo systemctl disable --now libinput-rs.service 2>/dev/null || true
 sudo dnf install libinput-rs libinput-rs-devel --allowerasing
 sudo ldconfig
 sudo systemctl reboot
 ```
 
-The companion daemon is optional and remains disabled after package
-installation. Test the ABI replacement first. Only then test the companion from
-a text console or SSH session:
+The runtime RPM ships a vendor preset that enables `libinput-rs.service` on
+first installation. The daemon starts automatically on the next boot. An
+administrator's explicit enable or disable choice is preserved during package
+upgrades.
+
+After boot, verify the service:
 
 ```bash
-sudo systemctl start libinput-rs.service
+systemctl is-enabled libinput-rs.service
+systemctl is-active libinput-rs.service
 systemctl status libinput-rs.service
-sudo systemctl enable libinput-rs.service
 ```
 
-To stop using the companion daemon without changing the ABI replacement:
+To opt out of the companion daemon without changing the ABI replacement:
 
 ```bash
 sudo systemctl disable --now libinput-rs.service
