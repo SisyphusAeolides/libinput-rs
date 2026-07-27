@@ -23,7 +23,7 @@ jobs:
       - name: Install DNF dependencies
         run: >-
           dnf -y -q install Agda idris2 cpio elfutils gcc gcc-gfortran libwacom-devel make
-          pkgconf-pkg-config ripgrep rust cargo clippy rustfmt binutils rpm-build rpmdevtools rpmlint
+          pkgconf-pkg-config ripgrep rust cargo clippy rustfmt binutils rpm-build rpmdevtools
           systemd-devel systemd-rpm-macros
 
       - name: Check packaging inputs
@@ -105,8 +105,24 @@ jobs:
       - name: Verify RPM payload
         run: make rpm-check RPM_PACKAGE="$RPM_PACKAGE"
 
+  rpm-lint:
+    name: RPM lint
+    needs: rust-rpm
+    runs-on: ubuntu-latest
+    container: fedora:44
+
+    steps:
+      - name: Install rpmlint
+        run: dnf -y -q install rpmlint
+
+      - name: Download binary RPM
+        uses: actions/download-artifact@v4
+        with:
+          name: libinput-rs-rpm
+          path: rpm
+
       - name: Lint RPM
-        run: rpmlint "$RPM_PACKAGE"
+        run: rpmlint rpm/*.rpm
 
   proofs:
     name: Safety proofs
