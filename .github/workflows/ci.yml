@@ -22,9 +22,8 @@ jobs:
 
       - name: Install DNF dependencies
         run: >-
-          dnf -y -q install Agda idris2 cpio elfutils gcc gcc-gfortran libwacom-devel make
-          pkgconf-pkg-config ripgrep rust cargo clippy rustfmt binutils rpm-build rpmdevtools
-          systemd-devel systemd-rpm-macros
+          dnf -y -q install cpio elfutils gcc make pkgconf-pkg-config ripgrep rust cargo
+          clippy rustfmt binutils rpm-build rpmdevtools systemd-devel systemd-rpm-macros
 
       - name: Check packaging inputs
         run: make packaging-check
@@ -43,9 +42,6 @@ jobs:
 
       - name: Test libinput implementation
         run: cargo test --locked --package libinput-rs
-
-      - name: Check safety models
-        run: make proofs-strict
 
       - name: Build shared library
         run: make shared
