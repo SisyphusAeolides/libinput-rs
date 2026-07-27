@@ -55,8 +55,10 @@ abi-check: shared
 proofs:
 	cd proofs/agda && agda FailOpen.agda
 	cd proofs/agda && agda ResourceLifecycle.agda
+	cd proofs/agda && agda RestrictedDiscovery.agda
 	cd proofs/idris && idris2 --check FailOpen.idr
 	cd proofs/idris && idris2 --check ResourceLifecycle.idr
+	cd proofs/idris && idris2 --check RestrictedDiscovery.idr
 	mkdir -p proofs/fortran/build
 	$(FC) -std=f2018 -Wall -Wextra -Werror -fcheck=all \
 		-J proofs/fortran/build -o proofs/fortran/build/fail-open \
@@ -66,6 +68,10 @@ proofs:
 		-J proofs/fortran/build -o proofs/fortran/build/resource-lifecycle \
 		proofs/fortran/resource_lifecycle.f90
 	proofs/fortran/build/resource-lifecycle
+	$(FC) -std=f2018 -Wall -Wextra -Werror -fcheck=all \
+		-J proofs/fortran/build -o proofs/fortran/build/restricted-discovery \
+		proofs/fortran/restricted_discovery.f90
+	proofs/fortran/build/restricted-discovery
 
 proofs-strict:
 	command -v agda >/dev/null
