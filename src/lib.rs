@@ -1938,10 +1938,7 @@ pub unsafe extern "C" fn libinput_device_config_middle_emulation_get_default_ena
 pub unsafe extern "C" fn libinput_device_config_dwt_is_available(
     dev: *const LibinputDevice,
 ) -> libc::c_int {
-    if dev.is_null() {
-        return 0;
-    }
-    ((*dev).has_pointer || (*dev).has_touch) as libc::c_int
+    (!dev.is_null() && (*dev).dwt_available) as libc::c_int
 }
 
 #[no_mangle]
@@ -1952,13 +1949,19 @@ pub unsafe extern "C" fn libinput_device_config_dwt_set_enabled(
     if dev.is_null() {
         return 1;
     }
-    (*dev).dwt_enabled = enabled != 0;
+    if !matches!(enabled, 0 | 1) {
+        return 2;
+    }
+    if !(*dev).dwt_available {
+        return if enabled == 0 { 0 } else { 1 };
+    }
+    (*dev).dwt_enabled = enabled == 1;
     0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_dwt_get_enabled(dev: *const LibinputDevice) -> u32 {
-    if dev.is_null() {
+    if dev.is_null() || !(*dev).dwt_available {
         return 0;
     }
     (*dev).dwt_enabled as u32
@@ -1966,91 +1969,132 @@ pub unsafe extern "C" fn libinput_device_config_dwt_get_enabled(dev: *const Libi
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_dwt_get_default_enabled(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    1
+    (!dev.is_null() && (*dev).dwt_available) as u32
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_dwt_set_timeout(
     dev: *mut LibinputDevice,
-    _millis: u32,
+    millis: u32,
 ) -> u32 {
     if dev.is_null() {
         return 1;
     }
-    1
+    if millis == 0 {
+        return 2;
+    }
+    if !(*dev).dwt_available {
+        return 1;
+    }
+    if !(100..=5000).contains(&millis) {
+        return 2;
+    }
+    (*dev).dwt_timeout = millis;
+    0
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_device_config_dwt_get_timeout(
-    _dev: *const LibinputDevice,
-) -> u32 {
-    500
+pub unsafe extern "C" fn libinput_device_config_dwt_get_timeout(dev: *const LibinputDevice) -> u32 {
+    if dev.is_null() || !(*dev).dwt_available {
+        0
+    } else {
+        (*dev).dwt_timeout
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_dwt_get_default_timeout(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    500
+    (!dev.is_null() && (*dev).dwt_available)
+        .then_some(500)
+        .unwrap_or(0)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_dwtp_is_available(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> libc::c_int {
-    0
+    (!dev.is_null() && (*dev).dwtp_available) as libc::c_int
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_dwtp_set_enabled(
     dev: *mut LibinputDevice,
-    _enabled: u32,
+    enabled: u32,
 ) -> u32 {
     if dev.is_null() {
         return 1;
     }
-    1
+    if !matches!(enabled, 0 | 1) {
+        return 2;
+    }
+    if !(*dev).dwtp_available {
+        return if enabled == 0 { 0 } else { 1 };
+    }
+    (*dev).dwtp_enabled = enabled == 1;
+    0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_dwtp_get_enabled(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    0
+    if dev.is_null() || !(*dev).dwtp_available {
+        0
+    } else {
+        (*dev).dwtp_enabled as u32
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_dwtp_get_default_enabled(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    0
+    (!dev.is_null() && (*dev).dwtp_available) as u32
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_dwtp_set_timeout(
     dev: *mut LibinputDevice,
-    _millis: u32,
+    millis: u32,
 ) -> u32 {
     if dev.is_null() {
         return 1;
     }
-    1
+    if millis == 0 {
+        return 2;
+    }
+    if !(*dev).dwtp_available {
+        return 1;
+    }
+    if !(100..=5000).contains(&millis) {
+        return 2;
+    }
+    (*dev).dwtp_timeout = millis;
+    0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_dwtp_get_timeout(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    500
+    if dev.is_null() || !(*dev).dwtp_available {
+        0
+    } else {
+        (*dev).dwtp_timeout
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_dwtp_get_default_timeout(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    500
+    (!dev.is_null() && (*dev).dwtp_available)
+        .then_some(300)
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------

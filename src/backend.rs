@@ -3038,6 +3038,20 @@ impl BackendState {
             "ID_INPUT_TOUCHPAD_INTEGRATION",
             "external",
         );
+        // DWT is available on internal touchpads and on external keyboard /
+        // touchpad combinations explicitly identified by the quirks database.
+        // DWTP is only meaningful for an internal touchpad paired with a
+        // trackpoint. Wacom tablet touch surfaces are external devices for
+        // these purposes even when their synthetic test metadata lacks the
+        // integration property.
+        let dwt_device = is_touchpad && input_id.vendor() != 0x056a;
+        (*lib_dev).dwt_available =
+            dwt_device && (!external_touchpad || applied_quirks.tpkb_combo_layout_below);
+        (*lib_dev).dwt_enabled = (*lib_dev).dwt_available;
+        (*lib_dev).dwt_timeout = 500;
+        (*lib_dev).dwtp_available = dwt_device && !external_touchpad;
+        (*lib_dev).dwtp_enabled = (*lib_dev).dwtp_available;
+        (*lib_dev).dwtp_timeout = 300;
         (*lib_dev).send_events_modes =
             if is_touchpad && !external_touchpad && input_id.vendor() != 0x056a {
                 0b11

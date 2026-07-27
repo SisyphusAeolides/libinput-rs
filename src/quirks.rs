@@ -15,6 +15,7 @@ struct Section {
     model_apple_touchpad: bool,
     model_apple_touchpad_onebutton: bool,
     model_clickfinger_default: bool,
+    tpkb_combo_layout_below: bool,
 }
 
 struct DeviceIdentity<'a> {
@@ -42,6 +43,7 @@ pub struct AppliedQuirks {
     pub model_apple_touchpad: bool,
     pub model_apple_touchpad_onebutton: bool,
     pub model_clickfinger_default: bool,
+    pub tpkb_combo_layout_below: bool,
 }
 
 pub fn apply_quirks(
@@ -123,6 +125,8 @@ fn apply_file(
             section.size_hint = parse_dimensions(value);
         } else if key.trim() == "AttrResolutionHint" {
             section.resolution_hint = parse_dimensions(value);
+        } else if key.trim() == "AttrTPKComboLayout" {
+            section.tpkb_combo_layout_below = value.trim().eq_ignore_ascii_case("below");
         } else if key.trim() == "AttrIsVirtual" {
             section.is_virtual = value.trim() == "1";
         } else if key.trim() == "ModelLenovoScrollPoint" {
@@ -237,6 +241,7 @@ fn apply_section(
     applied.model_apple_touchpad |= section.model_apple_touchpad;
     applied.model_apple_touchpad_onebutton |= section.model_apple_touchpad_onebutton;
     applied.model_clickfinger_default |= section.model_clickfinger_default;
+    applied.tpkb_combo_layout_below |= section.tpkb_combo_layout_below;
 }
 
 fn match_property(key: &str, value: &str, identity: &DeviceIdentity<'_>) -> bool {
