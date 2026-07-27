@@ -117,9 +117,47 @@ impl Drop for RestrictedFdGuard {
     }
 }
 
+/// Drop input records that were queued before libinput took ownership of a
+/// device file description.  In particular, an `open_restricted` callback is
+/// allowed to hand us a still-open descriptor that was previously used by a
+/// removed device.  Those records belong to the former device lifecycle and
+/// must not be replayed for the newly-added device.
+///
+/// This mirrors upstream's `evdev_drain_fd()` setup step.  The descriptor is
+/// nonblocking by the time this is called, so a short read or a non-interrupt
+/// error means there are no more records to discard.
+fn discard_pending_input_events(fd: RawFd) {
+    let mut events = [std::mem::MaybeUninit::<libc::input_event>::uninit(); 24];
+    let bytes = std::mem::size_of_val(&events);
+    loop {
+        let read = unsafe { libc::read(fd, events.as_mut_ptr().cast(), bytes) };
+        if read == bytes as libc::ssize_t
+            || (read < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted)
+        {
+            continue;
+        }
+        break;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Multi-touch slot
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum EdgeScrollState {
+    #[default]
+    None,
+    New,
+    Active,
+    Area,
+}
+
+const EDGE_RIGHT: u8 = 1;
+const EDGE_BOTTOM: u8 = 2;
+const AXIS_VERTICAL: u8 = 1;
+const AXIS_HORIZONTAL: u8 = 2;
 
 #[derive(Clone, Default)]
 struct MtSlot {
@@ -130,6 +168,22 @@ struct MtSlot {
     cancel_pending: bool,
     button_area_classification_pending: bool,
     button_area_excluded: bool,
+    button_area_initial_x: f64,
+    button_area_initial_y: f64,
+    button_area_down_usec: u64,
+    gesture_initial_x: f64,
+    gesture_initial_y: f64,
+    gesture_rebase_pending: bool,
+    gesture_position_seen: bool,
+    edge_classification_pending: bool,
+    edge_state: EdgeScrollState,
+    edge_mask: u8,
+    edge_initial_x: f64,
+    edge_initial_y: f64,
+    edge_last_x: f64,
+    edge_last_y: f64,
+    edge_started_at: Option<Instant>,
+    edge_axis: u8,
     seat_slot: Option<i32>,
     tracking_id: i32,
     tool_type: i32,
@@ -169,6 +223,7 @@ struct TrackedDevice {
     mt_y_fuzz: i32,
     is_keyboard: bool,
     is_pointer: bool,
+    is_clickpad: bool,
     is_topbuttonpad: bool,
     is_pointing_stick: bool,
     supports_hi_res_vertical: bool,
@@ -217,6 +272,7 @@ struct TrackedDevice {
     remainder_x: f32,
     remainder_y: f32,
     finger_scroll_axes: u8,
+    finger_scroll_constraint: FingerScrollConstraint,
 
     // --- absolute / touchpad ---
     touch_active: bool,
@@ -340,6 +396,7 @@ struct TrackedDevice {
     swipe_active: bool,
     swipe_fingers: i32,
     mt_contact_count_changed: bool,
+    pinch_base_centroid: Option<(f64, f64)>,
     gesture_last_centroid: Option<(f64, f64)>,
     hold_started_at: Option<Instant>,
     hold_active: bool,
@@ -366,6 +423,203 @@ struct TrackedDevice {
 unsafe impl Send for TrackedDevice {}
 
 #[derive(Default)]
+struct FingerScrollConstraint {
+    active_horizontal: bool,
+    active_vertical: bool,
+    vector_x_mm: f64,
+    vector_y_mm: f64,
+    last_motion_usec: Option<u64>,
+    horizontal_duration_usec: u64,
+    vertical_duration_usec: u64,
+}
+
+impl FingerScrollConstraint {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn constrain(
+        &mut self,
+        time_usec: u64,
+        mut scroll_x: f64,
+        mut scroll_y: f64,
+        delta_x_mm: f64,
+        delta_y_mm: f64,
+    ) -> (f64, f64) {
+        const ACTIVE_THRESHOLD_USEC: u64 = 100_000;
+        const INACTIVE_THRESHOLD_USEC: u64 = 50_000;
+        const EVENT_TIMEOUT_USEC: u64 = 100_000;
+        const DEGREE_75: f64 = 3.73;
+        const DEGREE_60: f64 = 1.73;
+        const DEGREE_30: f64 = 0.57;
+        const DEGREE_15: f64 = 0.27;
+        const MIN_VECTOR_MM: f64 = 0.15;
+
+        if self.active_horizontal && self.active_vertical {
+            return (scroll_x, scroll_y);
+        }
+
+        let time_delta_usec = self
+            .last_motion_usec
+            .map(|previous| time_usec.saturating_sub(previous))
+            .filter(|delta| *delta <= EVENT_TIMEOUT_USEC)
+            .unwrap_or(0);
+        self.last_motion_usec = Some(time_usec);
+
+        let vector_decay = if time_delta_usec == 0 {
+            0.0
+        } else {
+            let delta = time_delta_usec as f64;
+            if delta <= EVENT_TIMEOUT_USEC as f64 * 0.33 {
+                ((EVENT_TIMEOUT_USEC as f64 / 2.0) - delta) / (EVENT_TIMEOUT_USEC as f64 / 2.0)
+            } else {
+                (EVENT_TIMEOUT_USEC as f64 - delta) / (EVENT_TIMEOUT_USEC as f64 * 2.0)
+            }
+        };
+        self.vector_x_mm = self.vector_x_mm * vector_decay + delta_x_mm;
+        self.vector_y_mm = self.vector_y_mm * vector_decay + delta_y_mm;
+        let vector_length = self.vector_x_mm.hypot(self.vector_y_mm);
+        let slope = if self.vector_x_mm != 0.0 {
+            (self.vector_y_mm / self.vector_x_mm).abs()
+        } else {
+            f64::INFINITY
+        };
+
+        if slope >= DEGREE_30 && vector_length > MIN_VECTOR_MM {
+            self.vertical_duration_usec = self
+                .vertical_duration_usec
+                .saturating_add(time_delta_usec)
+                .min(ACTIVE_THRESHOLD_USEC);
+            if slope >= DEGREE_75 {
+                self.horizontal_duration_usec = self
+                    .horizontal_duration_usec
+                    .saturating_sub(time_delta_usec);
+            }
+        }
+        if slope < DEGREE_60 && vector_length > MIN_VECTOR_MM {
+            self.horizontal_duration_usec = self
+                .horizontal_duration_usec
+                .saturating_add(time_delta_usec)
+                .min(ACTIVE_THRESHOLD_USEC);
+            if slope < DEGREE_15 {
+                self.vertical_duration_usec =
+                    self.vertical_duration_usec.saturating_sub(time_delta_usec);
+            }
+        }
+
+        if self.horizontal_duration_usec == ACTIVE_THRESHOLD_USEC {
+            self.active_horizontal = true;
+            if self.vertical_duration_usec < INACTIVE_THRESHOLD_USEC {
+                self.active_vertical = false;
+            }
+        }
+        if self.vertical_duration_usec == ACTIVE_THRESHOLD_USEC {
+            self.active_vertical = true;
+            if self.horizontal_duration_usec < INACTIVE_THRESHOLD_USEC {
+                self.active_horizontal = false;
+            }
+        }
+
+        if vector_length > 5.0 && (DEGREE_30..DEGREE_60).contains(&slope) {
+            self.active_horizontal = true;
+            self.active_vertical = true;
+        }
+
+        if !self.active_horizontal && self.active_vertical {
+            scroll_x = 0.0;
+        }
+        if self.active_horizontal && !self.active_vertical {
+            scroll_y = 0.0;
+        }
+        if !self.active_horizontal && !self.active_vertical {
+            if slope >= DEGREE_60 {
+                scroll_x = 0.0;
+            }
+            if slope < DEGREE_30 {
+                scroll_y = 0.0;
+            }
+        }
+
+        (scroll_x, scroll_y)
+    }
+}
+
+#[derive(Default)]
+struct EdgeScrollFrame {
+    scrolls: Vec<(u8, f64)>,
+    stop_axes: u8,
+    suppress_normal_motion: bool,
+}
+
+fn touchpad_delta_mm(
+    raw_delta: f64,
+    resolution: Option<i32>,
+    range: Option<(i32, i32)>,
+    size_mm: Option<f64>,
+) -> f64 {
+    if let Some(resolution) = resolution.filter(|resolution| *resolution > 0) {
+        return raw_delta / f64::from(resolution);
+    }
+    if let (Some((minimum, maximum)), Some(size_mm)) = (range, size_mm) {
+        let span = f64::from(maximum) - f64::from(minimum);
+        if span > 0.0 && size_mm.is_finite() && size_mm > 0.0 {
+            return raw_delta * size_mm / span;
+        }
+    }
+    raw_delta
+}
+
+/// Return the physical-motion octants used by libinput's gesture
+/// disambiguation. Small vectors deliberately cover the neighbouring octants
+/// as well, matching the tolerance used for noisy touchpad hardware.
+fn gesture_direction_mask(x: f64, y: f64) -> u8 {
+    const N: u8 = 1 << 0;
+    const NE: u8 = 1 << 1;
+    const E: u8 = 1 << 2;
+    const SE: u8 = 1 << 3;
+    const S: u8 = 1 << 4;
+    const SW: u8 = 1 << 5;
+    const W: u8 = 1 << 6;
+    const NW: u8 = 1 << 7;
+
+    if x.abs() < 2.0 && y.abs() < 2.0 {
+        return if x > 0.0 && y > 0.0 {
+            S | SE | E
+        } else if x > 0.0 && y < 0.0 {
+            N | NE | E
+        } else if x < 0.0 && y > 0.0 {
+            S | SW | W
+        } else if x < 0.0 && y < 0.0 {
+            N | NW | W
+        } else if x > 0.0 {
+            NE | E | SE
+        } else if x < 0.0 {
+            NW | W | SW
+        } else if y > 0.0 {
+            SE | S | SW
+        } else if y < 0.0 {
+            NE | N | NW
+        } else {
+            u8::MAX
+        };
+    }
+
+    let angle = (y.atan2(x) + 2.5 * std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI)
+        * 4.0
+        / std::f64::consts::PI;
+    let primary = (angle + 0.9) as u32 % 8;
+    let adjacent = (angle + 0.1) as u32 % 8;
+    (1 << primary) | (1 << adjacent)
+}
+
+fn gesture_directions_overlap(first: u8, second: u8) -> bool {
+    ((first | (first >> 1)) & second) != 0
+        || ((second | (second >> 1)) & first) != 0
+        || (first & (1 << 7) != 0 && second & 1 != 0)
+        || (second & (1 << 7) != 0 && first & 1 != 0)
+}
+
+#[derive(Default)]
 struct DebounceButton {
     delivered_down: bool,
     window_since: Option<Instant>,
@@ -384,6 +638,7 @@ impl TrackedDevice {
         is_absolute_pointer: bool,
         is_keyboard: bool,
         is_pointer: bool,
+        is_clickpad: bool,
         is_topbuttonpad: bool,
         is_pointing_stick: bool,
     ) -> Self {
@@ -613,6 +868,7 @@ impl TrackedDevice {
             mt_y_fuzz,
             is_keyboard,
             is_pointer,
+            is_clickpad,
             is_topbuttonpad,
             is_pointing_stick,
             supports_hi_res_vertical,
@@ -659,6 +915,7 @@ impl TrackedDevice {
             remainder_x: 0.0,
             remainder_y: 0.0,
             finger_scroll_axes: 0,
+            finger_scroll_constraint: FingerScrollConstraint::default(),
             touch_active: false,
             touch_fingers: 0,
             last_x: None,
@@ -786,6 +1043,7 @@ impl TrackedDevice {
             swipe_active: false,
             swipe_fingers: 0,
             mt_contact_count_changed: false,
+            pinch_base_centroid: None,
             gesture_last_centroid: None,
             hold_started_at: None,
             hold_active: false,
@@ -859,17 +1117,577 @@ impl TrackedDevice {
         (count != 0).then(|| (x / count as f64, y / count as f64))
     }
 
-    fn classify_gesture_contacts(&mut self, button_areas: bool) {
-        let button_top = self
-            .abs_y_range
-            .map(|(minimum, maximum)| f64::from(minimum + (maximum - minimum) * 9 / 10));
+    fn reset_gesture_contact_initials(&mut self, button_areas: bool) {
+        for slot in &mut self.mt_slots {
+            if slot.active && (!button_areas || !slot.button_area_excluded) {
+                slot.gesture_initial_x = slot.x;
+                slot.gesture_initial_y = slot.y;
+            }
+        }
+    }
+
+    fn gesture_contact_rebase_ready(&self) -> bool {
+        self.mt_slots
+            .iter()
+            .all(|slot| !slot.active || !slot.gesture_rebase_pending || slot.gesture_position_seen)
+    }
+
+    fn complete_gesture_contact_rebase(&mut self) {
+        for slot in &mut self.mt_slots {
+            if slot.active && slot.gesture_rebase_pending {
+                slot.gesture_rebase_pending = false;
+                slot.gesture_position_seen = false;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gesture_contact_moved_at_least(
+        &self,
+        button_areas: bool,
+        x_resolution: Option<i32>,
+        y_resolution: Option<i32>,
+        x_range: Option<(i32, i32)>,
+        y_range: Option<(i32, i32)>,
+        width_mm: Option<f64>,
+        height_mm: Option<f64>,
+        minimum_mm: f64,
+    ) -> Option<bool> {
+        let mut any_eligible = false;
+        for slot in &self.mt_slots {
+            if !slot.active || (button_areas && slot.button_area_excluded) {
+                continue;
+            }
+            any_eligible = true;
+            let moved_mm = touchpad_delta_mm(
+                slot.x - slot.gesture_initial_x,
+                x_resolution,
+                x_range,
+                width_mm,
+            )
+            .hypot(touchpad_delta_mm(
+                slot.y - slot.gesture_initial_y,
+                y_resolution,
+                y_range,
+                height_mm,
+            ));
+            if moved_mm >= minimum_mm {
+                return Some(true);
+            }
+        }
+        any_eligible.then_some(false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gesture_contacts_same_direction(
+        &self,
+        button_areas: bool,
+        x_resolution: Option<i32>,
+        y_resolution: Option<i32>,
+        x_range: Option<(i32, i32)>,
+        y_range: Option<(i32, i32)>,
+        width_mm: Option<f64>,
+        height_mm: Option<f64>,
+    ) -> Option<bool> {
+        const PINCH_DISAMBIGUATION_MOVE_THRESHOLD_MM: f64 = 1.5;
+
+        let mut contacts = self
+            .mt_slots
+            .iter()
+            .filter(|slot| slot.active && (!button_areas || !slot.button_area_excluded));
+        let (Some(first), Some(second)) = (contacts.next(), contacts.next()) else {
+            return None;
+        };
+
+        let first_delta = (
+            touchpad_delta_mm(
+                first.x - first.gesture_initial_x,
+                x_resolution,
+                x_range,
+                width_mm,
+            ),
+            touchpad_delta_mm(
+                first.y - first.gesture_initial_y,
+                y_resolution,
+                y_range,
+                height_mm,
+            ),
+        );
+        let second_delta = (
+            touchpad_delta_mm(
+                second.x - second.gesture_initial_x,
+                x_resolution,
+                x_range,
+                width_mm,
+            ),
+            touchpad_delta_mm(
+                second.y - second.gesture_initial_y,
+                y_resolution,
+                y_range,
+                height_mm,
+            ),
+        );
+        if first_delta.0.hypot(first_delta.1) < PINCH_DISAMBIGUATION_MOVE_THRESHOLD_MM
+            || second_delta.0.hypot(second_delta.1) < PINCH_DISAMBIGUATION_MOVE_THRESHOLD_MM
+        {
+            return None;
+        }
+
+        // Parallel contact motion is a two-finger scroll even if its contact
+        // separation is noisy. Keep the result tri-state: before both
+        // contacts have moved far enough, existing pinch buildup remains the
+        // more reliable signal on devices with coarse coordinate resolution.
+        Some(gesture_directions_overlap(
+            gesture_direction_mask(first_delta.0, first_delta.1),
+            gesture_direction_mask(second_delta.0, second_delta.1),
+        ))
+    }
+
+    fn bottom_button_area_top(
+        y_range: Option<(i32, i32)>,
+        y_resolution: Option<i32>,
+        height_mm: Option<f64>,
+    ) -> Option<f64> {
+        let (minimum, maximum) = y_range?;
+        let span = f64::from(maximum) - f64::from(minimum);
+        if span <= 0.0 {
+            return None;
+        }
+
+        // The lower softbutton strip is the smaller of 10 mm and 15% of
+        // the touchpad height. Prefer the kernel's unit/mm resolution, then
+        // fall back to the size inferred during device initialization.
+        let button_height = if let Some(resolution) = y_resolution.filter(|value| *value > 0) {
+            (10.0 * f64::from(resolution)).min(span * 0.15)
+        } else if let Some(height_mm) = height_mm.filter(|value| value.is_finite() && *value > 0.0)
+        {
+            span * (10.0 / height_mm).min(0.15)
+        } else {
+            span * 0.15
+        };
+        Some(f64::from(maximum) - button_height)
+    }
+
+    fn classify_gesture_contacts(
+        &mut self,
+        button_areas: bool,
+        button_top: Option<f64>,
+        time_usec: u64,
+    ) {
         for slot in &mut self.mt_slots {
             if slot.active && slot.button_area_classification_pending {
+                slot.button_area_initial_x = slot.x;
+                slot.button_area_initial_y = slot.y;
+                slot.button_area_down_usec = time_usec;
                 slot.button_area_excluded =
                     button_areas && button_top.is_some_and(|top| slot.y >= top);
                 slot.button_area_classification_pending = false;
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_button_area_contacts(
+        &mut self,
+        button_areas: bool,
+        button_top: Option<f64>,
+        x_resolution: Option<i32>,
+        y_resolution: Option<i32>,
+        x_range: Option<(i32, i32)>,
+        y_range: Option<(i32, i32)>,
+        width_mm: Option<f64>,
+        height_mm: Option<f64>,
+    ) -> bool {
+        if !button_areas {
+            return false;
+        }
+        let Some(button_top) = button_top else {
+            return false;
+        };
+
+        let activation_times: Vec<u64> = self
+            .mt_slots
+            .iter()
+            .filter_map(|slot| {
+                if !slot.active || !slot.button_area_excluded {
+                    return None;
+                }
+                let movement_mm = touchpad_delta_mm(
+                    slot.x - slot.button_area_initial_x,
+                    x_resolution,
+                    x_range,
+                    width_mm,
+                )
+                .hypot(touchpad_delta_mm(
+                    slot.y - slot.button_area_initial_y,
+                    y_resolution,
+                    y_range,
+                    height_mm,
+                ));
+                (slot.y < button_top || movement_mm > 5.0).then_some(slot.button_area_down_usec)
+            })
+            .collect();
+        if activation_times.is_empty() {
+            return false;
+        }
+
+        let mut changed = false;
+        for slot in &mut self.mt_slots {
+            if slot.active
+                && slot.button_area_excluded
+                && activation_times
+                    .iter()
+                    .any(|time_usec| slot.button_area_down_usec.abs_diff(*time_usec) <= 80_000)
+            {
+                // A bottom-area contact becomes a gesture contact for the
+                // rest of its lifetime. Simultaneous bottom contacts belong
+                // to that gesture as well.
+                slot.button_area_excluded = false;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn edge_boundary(
+        range: Option<(i32, i32)>,
+        resolution: Option<i32>,
+        size_mm: Option<f64>,
+    ) -> Option<f64> {
+        let (minimum, maximum) = range?;
+        let span = f64::from(maximum) - f64::from(minimum);
+        if span <= 0.0 {
+            return None;
+        }
+        let edge_width = if let Some(resolution) = resolution.filter(|value| *value > 0) {
+            7.0 * f64::from(resolution)
+        } else if let Some(size_mm) = size_mm.filter(|value| value.is_finite() && *value > 0.0) {
+            span * 7.0 / size_mm
+        } else {
+            // The kernel failed to provide physical metadata. Keep the
+            // equivalent conservative 7% fallback rather than silently
+            // disabling edge scrolling for an otherwise usable touchpad.
+            span * 0.07
+        };
+        Some(f64::from(maximum) - edge_width.min(span))
+    }
+
+    fn edge_boundaries(
+        &self,
+        x_resolution: Option<i32>,
+        y_resolution: Option<i32>,
+        x_range: Option<(i32, i32)>,
+        y_range: Option<(i32, i32)>,
+        width_mm: Option<f64>,
+        height_mm: Option<f64>,
+    ) -> (Option<f64>, Option<f64>) {
+        let right = Self::edge_boundary(x_range, x_resolution, width_mm);
+        let horizontal_allowed = self.is_clickpad
+            || height_mm.is_some_and(|height| height.is_finite() && height >= 40.0);
+        let bottom = horizontal_allowed
+            .then(|| Self::edge_boundary(y_range, y_resolution, height_mm))
+            .flatten();
+        (right, bottom)
+    }
+
+    fn edge_mask_at(x: f64, y: f64, right_edge: Option<f64>, bottom_edge: Option<f64>) -> u8 {
+        let mut mask = 0;
+        if right_edge.is_some_and(|edge| x > edge) {
+            mask |= EDGE_RIGHT;
+        }
+        if bottom_edge.is_some_and(|edge| y > edge) {
+            mask |= EDGE_BOTTOM;
+        }
+        mask
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn classify_edge_contacts(
+        &mut self,
+        edge_enabled: bool,
+        button_areas: bool,
+        x_resolution: Option<i32>,
+        y_resolution: Option<i32>,
+        x_range: Option<(i32, i32)>,
+        y_range: Option<(i32, i32)>,
+        width_mm: Option<f64>,
+        height_mm: Option<f64>,
+    ) {
+        let (right_edge, bottom_edge) = self.edge_boundaries(
+            x_resolution,
+            y_resolution,
+            x_range,
+            y_range,
+            width_mm,
+            height_mm,
+        );
+        for slot in &mut self.mt_slots {
+            if !slot.active || !slot.edge_classification_pending {
+                continue;
+            }
+
+            slot.edge_classification_pending = false;
+            slot.edge_initial_x = slot.x;
+            slot.edge_initial_y = slot.y;
+            slot.edge_last_x = slot.x;
+            slot.edge_last_y = slot.y;
+            slot.edge_axis = 0;
+            slot.edge_started_at = None;
+            slot.edge_mask = if edge_enabled {
+                Self::edge_mask_at(slot.x, slot.y, right_edge, bottom_edge)
+            } else {
+                0
+            };
+            slot.edge_state = if slot.edge_mask != 0 {
+                if !button_areas {
+                    slot.edge_started_at = Some(Instant::now());
+                }
+                EdgeScrollState::New
+            } else {
+                EdgeScrollState::Area
+            };
+        }
+    }
+
+    fn expire_edge_scroll_timeouts(&mut self) {
+        for slot in &mut self.mt_slots {
+            if slot.edge_state == EdgeScrollState::New
+                && slot
+                    .edge_started_at
+                    .is_some_and(|started| started.elapsed() >= Duration::from_millis(300))
+            {
+                slot.edge_state = EdgeScrollState::Active;
+                slot.edge_started_at = None;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_edge_scroll_frame(
+        &mut self,
+        edge_enabled: bool,
+        x_resolution: Option<i32>,
+        y_resolution: Option<i32>,
+        x_range: Option<(i32, i32)>,
+        y_range: Option<(i32, i32)>,
+        width_mm: Option<f64>,
+        height_mm: Option<f64>,
+    ) -> EdgeScrollFrame {
+        let (right_edge, bottom_edge) = self.edge_boundaries(
+            x_resolution,
+            y_resolution,
+            x_range,
+            y_range,
+            width_mm,
+            height_mm,
+        );
+        let mut frame = EdgeScrollFrame::default();
+
+        for slot in &mut self.mt_slots {
+            if !slot.active {
+                frame.stop_axes |= slot.edge_axis;
+                slot.edge_axis = 0;
+                slot.edge_state = EdgeScrollState::None;
+                slot.edge_mask = 0;
+                slot.edge_started_at = None;
+                continue;
+            }
+
+            if !edge_enabled {
+                frame.stop_axes |= slot.edge_axis;
+                slot.edge_axis = 0;
+                slot.edge_state = EdgeScrollState::Area;
+                slot.edge_mask = 0;
+                slot.edge_started_at = None;
+                continue;
+            }
+
+            let current_edge = Self::edge_mask_at(slot.x, slot.y, right_edge, bottom_edge);
+            match slot.edge_state {
+                EdgeScrollState::None => {
+                    slot.edge_state = EdgeScrollState::Area;
+                }
+                EdgeScrollState::Area => {}
+                EdgeScrollState::New => {
+                    slot.edge_mask &= current_edge;
+                    if slot.edge_mask == 0 {
+                        slot.edge_state = EdgeScrollState::Area;
+                        slot.edge_started_at = None;
+                    } else {
+                        frame.suppress_normal_motion = true;
+                        let (axis, displacement_mm, raw_delta) = match slot.edge_mask {
+                            EDGE_RIGHT => (
+                                AXIS_VERTICAL,
+                                touchpad_delta_mm(
+                                    slot.y - slot.edge_initial_y,
+                                    y_resolution,
+                                    y_range,
+                                    height_mm,
+                                ),
+                                slot.y - slot.edge_last_y,
+                            ),
+                            EDGE_BOTTOM => (
+                                AXIS_HORIZONTAL,
+                                touchpad_delta_mm(
+                                    slot.x - slot.edge_initial_x,
+                                    x_resolution,
+                                    x_range,
+                                    width_mm,
+                                ),
+                                slot.x - slot.edge_last_x,
+                            ),
+                            _ => (0, 0.0, 0.0),
+                        };
+                        // Upstream keeps EdgeNew until it has emitted the
+                        // current frame after the cumulative 3 mm threshold.
+                        if axis != 0 && displacement_mm.abs() >= 3.0 && raw_delta != 0.0 {
+                            frame.scrolls.push((axis, raw_delta));
+                            slot.edge_axis = axis;
+                            slot.edge_state = EdgeScrollState::Active;
+                            slot.edge_started_at = None;
+                        }
+                    }
+                }
+                EdgeScrollState::Active => {
+                    if slot.edge_mask == (EDGE_RIGHT | EDGE_BOTTOM) {
+                        slot.edge_mask &= current_edge;
+                        if slot.edge_mask == 0 {
+                            slot.edge_state = EdgeScrollState::Area;
+                        }
+                    }
+                    if slot.edge_state == EdgeScrollState::Active {
+                        frame.suppress_normal_motion = true;
+                        let (axis, raw_delta) = match slot.edge_mask {
+                            EDGE_RIGHT if current_edge & EDGE_RIGHT != 0 => {
+                                (AXIS_VERTICAL, slot.y - slot.edge_last_y)
+                            }
+                            EDGE_BOTTOM if current_edge & EDGE_BOTTOM != 0 => {
+                                (AXIS_HORIZONTAL, slot.x - slot.edge_last_x)
+                            }
+                            _ => (0, 0.0),
+                        };
+                        if axis != 0 && raw_delta != 0.0 {
+                            frame.scrolls.push((axis, raw_delta));
+                            slot.edge_axis = axis;
+                        }
+                    }
+                }
+            }
+
+            slot.edge_last_x = slot.x;
+            slot.edge_last_y = slot.y;
+        }
+
+        frame
+    }
+
+    fn stop_edge_scroll(&mut self) -> u8 {
+        let mut axes = 0;
+        for slot in &mut self.mt_slots {
+            axes |= slot.edge_axis;
+            let was_edge_contact = matches!(
+                slot.edge_state,
+                EdgeScrollState::New | EdgeScrollState::Active
+            );
+            slot.edge_axis = 0;
+            slot.edge_mask = 0;
+            slot.edge_started_at = None;
+            slot.edge_classification_pending = false;
+            if slot.active {
+                if was_edge_contact {
+                    // A click releases an edge touch back into pointer
+                    // motion, including when it began in a softbutton area.
+                    slot.button_area_excluded = false;
+                }
+                slot.edge_state = EdgeScrollState::Area;
+            } else {
+                slot.edge_state = EdgeScrollState::None;
+            }
+        }
+        axes
+    }
+
+    fn clickfinger_finger_count(
+        &self,
+        x_resolution: Option<i32>,
+        y_resolution: Option<i32>,
+        x_range: Option<(i32, i32)>,
+        y_range: Option<(i32, i32)>,
+        width_mm: Option<f64>,
+        height_mm: Option<f64>,
+    ) -> u32 {
+        let contacts: Vec<&MtSlot> = self
+            .mt_slots
+            .iter()
+            .filter(|slot| slot.active && !slot.palm_suppressed)
+            .collect();
+        let mut fingers = self.touch_fingers.max(contacts.len() as u32);
+        if fingers == 2
+            && contacts.len() >= 2
+            && !Self::clickfinger_contacts_within_distance(
+                contacts[0],
+                contacts[1],
+                x_resolution,
+                y_resolution,
+                x_range,
+                y_range,
+                width_mm,
+                height_mm,
+            )
+        {
+            fingers = 1;
+        }
+        fingers
+    }
+
+    fn clickfinger_contacts_within_distance(
+        first: &MtSlot,
+        second: &MtSlot,
+        x_resolution: Option<i32>,
+        y_resolution: Option<i32>,
+        x_range: Option<(i32, i32)>,
+        y_range: Option<(i32, i32)>,
+        width_mm: Option<f64>,
+        height_mm: Option<f64>,
+    ) -> bool {
+        let x_distance =
+            touchpad_delta_mm(first.x - second.x, x_resolution, x_range, width_mm).abs();
+        let y_distance =
+            touchpad_delta_mm(first.y - second.y, y_resolution, y_range, height_mm).abs();
+        if x_distance > 40.0 || y_distance > 30.0 {
+            return false;
+        }
+        if y_distance <= 20.0 {
+            return true;
+        }
+
+        let height = height_mm.or_else(|| {
+            y_range
+                .zip(y_resolution)
+                .and_then(|((minimum, maximum), resolution)| {
+                    (resolution > 0)
+                        .then_some((maximum - minimum).unsigned_abs() as f64 / resolution as f64)
+                })
+        });
+        if height.is_some_and(|height| height < 50.0) {
+            return true;
+        }
+
+        let distance_from_bottom = |position: f64| {
+            if let (Some((_, maximum)), Some(resolution)) = (y_range, y_resolution) {
+                if resolution > 0 {
+                    return (maximum as f64 - position) / resolution as f64;
+                }
+            }
+            if let (Some((minimum, maximum)), Some(height)) = (y_range, height) {
+                let range = (maximum - minimum).unsigned_abs() as f64;
+                if range > 0.0 {
+                    return (maximum as f64 - position) * height / range;
+                }
+            }
+            f64::INFINITY
+        };
+        (distance_from_bottom(first.y) < 20.0) == (distance_from_bottom(second.y) < 20.0)
     }
 
     /// Euclidean distance between the two primary active slots.
@@ -1699,6 +2517,13 @@ impl BackendState {
             };
             (d, None)
         };
+        if device.set_nonblocking(true).is_err() {
+            return;
+        }
+        {
+            use std::os::fd::AsRawFd;
+            discard_pending_input_events(device.as_raw_fd());
+        }
         {
             use std::os::fd::AsRawFd;
             let clock_id: libc::c_int = libc::CLOCK_MONOTONIC;
@@ -1972,6 +2797,7 @@ impl BackendState {
                         || (KeyCode::BTN_LEFT.0..=KeyCode::BTN_TASK.0).contains(&code.0)
                 })
             });
+        (*lib_dev).scroll_methods = u32::from((*lib_dev).supports_button_scroll) * 4;
         let mut event_codes: Vec<u16> = keys
             .map(|codes| codes.iter().map(|code| code.0).collect())
             .unwrap_or_default();
@@ -2088,6 +2914,30 @@ impl BackendState {
         let has_right_button = (*lib_dev).event_codes.contains(&KeyCode::BTN_RIGHT.0);
         let has_middle_button = (*lib_dev).event_codes.contains(&KeyCode::BTN_MIDDLE.0);
         let is_clickpad = props.contains(evdev::PropType::BUTTONPAD);
+        let mut click_methods = 0;
+        if is_clickpad {
+            click_methods |= 1;
+            if has_mt_xy {
+                click_methods |= 2;
+            }
+        }
+        if applied_quirks.model_apple_touchpad_onebutton {
+            click_methods |= 2;
+        }
+        let clickfinger_is_default = applied_quirks.model_apple_touchpad
+            || applied_quirks.model_apple_touchpad_onebutton
+            || applied_quirks.model_clickfinger_default
+            || (is_clickpad && input_id.vendor() == 0x05ac);
+        let click_default_method = if clickfinger_is_default && click_methods & 2 != 0 {
+            2
+        } else if click_methods & 1 != 0 {
+            1
+        } else {
+            0
+        };
+        (*lib_dev).click_methods = click_methods;
+        (*lib_dev).click_method = click_default_method;
+        (*lib_dev).click_default_method = click_default_method;
         let (middle_emulation_available, middle_emulation_default) = if is_touchpad {
             if is_clickpad {
                 (true, false)
@@ -2140,6 +2990,10 @@ impl BackendState {
         (*lib_dev).vendor_id = input_id.vendor() as u32;
         (*lib_dev).product_id = input_id.product() as u32;
         (*lib_dev).bus_type = input_id.bus_type().0 as u32;
+        if is_touchpad && input_id.vendor() == 0x05ac {
+            // Apple touchpads opt in to natural scrolling by default.
+            (*lib_dev).natural_scroll = true;
+        }
         (*lib_dev).udev_device = udev_device.into_raw();
         let raw_udev_device = (*lib_dev).udev_device;
         if let Some(value) =
@@ -2270,7 +3124,10 @@ impl BackendState {
                 0
             };
             if is_touchpad {
-                let default_scroll_method = if (*lib_dev).touch_count >= 2 { 1 } else { 2 };
+                let supports_two_finger = (has_mt_slot && mt_slot_count > 1)
+                    || (input_id.vendor() == 0x05ac && input_id.product() == 0x021a);
+                (*lib_dev).scroll_methods = 2 | if supports_two_finger { 1 } else { 0 };
+                let default_scroll_method = if supports_two_finger { 1 } else { 2 };
                 (*lib_dev).scroll_method = default_scroll_method;
                 (*lib_dev).scroll_default_method = default_scroll_method;
             }
@@ -2297,6 +3154,7 @@ impl BackendState {
             is_pointer && has_abs_xy && !is_touchpad,
             is_keyboard,
             is_pointer,
+            is_clickpad,
             is_topbuttonpad,
             tag_pointing_stick,
         );
@@ -2343,6 +3201,51 @@ impl BackendState {
             out.extend(initial_events);
         }
         self.devices.insert(fd, td);
+    }
+
+    pub unsafe fn stop_scroll_for_device(
+        &mut self,
+        ctx: *mut LibinputContext,
+        device: *mut LibinputDevice,
+        out: &mut VecDeque<LibinputEvent>,
+    ) {
+        let Some(tracked) = self
+            .devices
+            .values_mut()
+            .find(|tracked| tracked.lib_device == device)
+        else {
+            return;
+        };
+        let time_usec = systime_to_usec(SystemTime::now());
+        if tracked.scroll_button_axes != 0 {
+            Self::emit_button_scroll_stops(time_usec, device, ctx, tracked, out);
+        }
+        tracked.scroll_button_down = false;
+        tracked.scroll_lock_active = false;
+        tracked.scroll_button_lock_press = false;
+        tracked.scroll_button_press_time = None;
+        tracked.scroll_button_moved = false;
+        tracked.scroll_button_axes = 0;
+        tracked.scroll_button_accum_x = 0;
+        tracked.scroll_button_accum_y = 0;
+        tracked.pending_rel_x = 0;
+        tracked.pending_rel_y = 0;
+        if tracked.finger_scroll_axes != 0 {
+            Self::emit_finger_axis(
+                time_usec,
+                device,
+                ctx,
+                tracked.finger_scroll_axes,
+                [0.0; 2],
+                out,
+            );
+            tracked.finger_scroll_axes = 0;
+        }
+        let edge_axes = tracked.stop_edge_scroll();
+        Self::emit_finger_axis(time_usec, device, ctx, edge_axes, [0.0; 2], out);
+        tracked.finger_scroll_constraint.reset();
+        tracked.remainder_x = 0.0;
+        tracked.remainder_y = 0.0;
     }
 
     pub unsafe fn release_active_inputs(
@@ -2714,6 +3617,10 @@ impl BackendState {
             );
         }
 
+        for tracked in self.devices.values_mut() {
+            tracked.expire_edge_scroll_timeouts();
+        }
+
         // --- read events from every open device ---
         let pointing_stick_device = self
             .devices
@@ -2729,127 +3636,135 @@ impl BackendState {
                 None => continue,
             };
 
-            let batch: Vec<InputEvent> = match td.device.fetch_events() {
-                Ok(b) => b.collect(),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(e)
-                    if e.raw_os_error() == Some(nix::libc::ENODEV)
-                        || e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    dead_fds.push(fd);
+            // fetch_events() may return a partial batch. Drain this device
+            // before returning from dispatch so one libinput_dispatch() call
+            // cannot split a queued gesture across client iterations.
+            loop {
+                let batch: Vec<InputEvent> = match td.device.fetch_events() {
+                    Ok(b) => b.collect(),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e)
+                        if e.raw_os_error() == Some(nix::libc::ENODEV)
+                            || e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                    {
+                        dead_fds.push(fd);
+                        break;
+                    }
+                    Err(_) => break,
+                };
+                if batch.is_empty() {
+                    break;
+                }
+                let lib_dev = td.lib_device;
+                let is_abs = td.is_absolute;
+                let is_kbd = td.is_keyboard;
+                let is_ptr = td.is_pointer;
+                let is_tablet_tool = unsafe { &*lib_dev }.has_tablet
+                    && !unsafe { &*lib_dev }.has_touch
+                    && !unsafe { &*lib_dev }.has_gesture
+                    && !unsafe { &*lib_dev }.has_tablet_pad;
+                let is_tablet_pad = unsafe { &*lib_dev }.has_tablet_pad;
+                let cfg_tap = unsafe { &*lib_dev }.tap_enabled;
+                let cfg_nat = unsafe { &*lib_dev }.natural_scroll;
+                let cfg_dwt = unsafe { &*lib_dev }.dwt_enabled;
+                let cfg_accel = unsafe { &*lib_dev }.accel_speed as f32 + 1.0;
+
+                let send_events_disabled = unsafe { &*lib_dev }.send_events_mode == 1;
+                if send_events_disabled {
+                    if td.is_topbuttonpad {
+                        for ev in &batch {
+                            Self::process_disabled_topbutton_event(
+                                ev,
+                                systime_to_usec(ev.timestamp()),
+                                pointing_stick_device,
+                                ctx,
+                                td,
+                                out,
+                            );
+                        }
+                    }
                     continue;
                 }
-                Err(_) => continue,
-            };
-            let lib_dev = td.lib_device;
-            let is_abs = td.is_absolute;
-            let is_kbd = td.is_keyboard;
-            let is_ptr = td.is_pointer;
-            let is_tablet_tool = unsafe { &*lib_dev }.has_tablet
-                && !unsafe { &*lib_dev }.has_touch
-                && !unsafe { &*lib_dev }.has_gesture
-                && !unsafe { &*lib_dev }.has_tablet_pad;
-            let is_tablet_pad = unsafe { &*lib_dev }.has_tablet_pad;
-            let cfg_tap = unsafe { &*lib_dev }.tap_enabled;
-            let cfg_nat = unsafe { &*lib_dev }.natural_scroll;
-            let cfg_dwt = unsafe { &*lib_dev }.dwt_enabled;
-            let cfg_accel = unsafe { &*lib_dev }.accel_speed as f32 + 1.0;
 
-            let send_events_disabled = unsafe { &*lib_dev }.send_events_mode == 1;
-            if send_events_disabled {
-                if td.is_topbuttonpad {
-                    for ev in &batch {
-                        Self::process_disabled_topbutton_event(
+                let global_typing = self.global_typing_time;
+
+                for ev in &batch {
+                    let ts_usec = systime_to_usec(ev.timestamp());
+
+                    if is_tablet_pad {
+                        Self::process_tablet_pad_event(ev, ts_usec, lib_dev, ctx, td, out);
+                        continue;
+                    }
+
+                    if is_tablet_tool {
+                        Self::process_tablet_tool_event(ev, ts_usec, lib_dev, ctx, td, out);
+                        continue;
+                    }
+
+                    // Composite gaming mice and receiver nodes may expose both
+                    // relative pointer axes and ordinary keyboard keys. Route the
+                    // key range through the keyboard engine without stealing the
+                    // device's BTN_* events from pointer handling.
+                    if is_kbd && is_ptr && ev.event_type() == EventType::KEY && ev.code() < 0x100 {
+                        Self::process_keyboard_event(
                             ev,
-                            systime_to_usec(ev.timestamp()),
+                            ts_usec,
+                            lib_dev,
+                            ctx,
+                            td,
+                            out,
+                            &mut self.global_typing_time,
+                        );
+                        continue;
+                    }
+
+                    if td.is_absolute_pointer {
+                        Self::process_absolute_pointer_event(ev, ts_usec, lib_dev, ctx, td, out);
+                        continue;
+                    }
+
+                    // ---- Keyboard device ----
+                    if is_kbd && !is_abs && !is_ptr {
+                        Self::process_keyboard_event(
+                            ev,
+                            ts_usec,
+                            lib_dev,
+                            ctx,
+                            td,
+                            out,
+                            &mut self.global_typing_time,
+                        );
+                        continue;
+                    }
+
+                    // ---- Relative device (mouse / trackpoint) ----
+                    if !is_abs && is_ptr {
+                        Self::process_relative_event(ev, ts_usec, lib_dev, ctx, td, out);
+                        continue;
+                    }
+
+                    // ---- Absolute device (touchpad) ----
+                    if is_abs {
+                        let dwt_active = cfg_dwt
+                            && global_typing
+                                .map(|t| t.elapsed() < Duration::from_millis(500))
+                                .unwrap_or(false);
+                        let touch_arbitrated = touch_arbitration_active(ctx, lib_dev, None);
+                        Self::process_absolute_event(
+                            ev,
+                            ts_usec,
+                            lib_dev,
                             pointing_stick_device,
                             ctx,
                             td,
                             out,
+                            cfg_tap,
+                            cfg_nat,
+                            cfg_accel,
+                            dwt_active,
+                            touch_arbitrated,
                         );
                     }
-                }
-                continue;
-            }
-
-            let global_typing = self.global_typing_time;
-
-            for ev in &batch {
-                let ts_usec = systime_to_usec(ev.timestamp());
-
-                if is_tablet_pad {
-                    Self::process_tablet_pad_event(ev, ts_usec, lib_dev, ctx, td, out);
-                    continue;
-                }
-
-                if is_tablet_tool {
-                    Self::process_tablet_tool_event(ev, ts_usec, lib_dev, ctx, td, out);
-                    continue;
-                }
-
-                // Composite gaming mice and receiver nodes may expose both
-                // relative pointer axes and ordinary keyboard keys. Route the
-                // key range through the keyboard engine without stealing the
-                // device's BTN_* events from pointer handling.
-                if is_kbd && is_ptr && ev.event_type() == EventType::KEY && ev.code() < 0x100 {
-                    Self::process_keyboard_event(
-                        ev,
-                        ts_usec,
-                        lib_dev,
-                        ctx,
-                        td,
-                        out,
-                        &mut self.global_typing_time,
-                    );
-                    continue;
-                }
-
-                if td.is_absolute_pointer {
-                    Self::process_absolute_pointer_event(ev, ts_usec, lib_dev, ctx, td, out);
-                    continue;
-                }
-
-                // ---- Keyboard device ----
-                if is_kbd && !is_abs && !is_ptr {
-                    Self::process_keyboard_event(
-                        ev,
-                        ts_usec,
-                        lib_dev,
-                        ctx,
-                        td,
-                        out,
-                        &mut self.global_typing_time,
-                    );
-                    continue;
-                }
-
-                // ---- Relative device (mouse / trackpoint) ----
-                if !is_abs && is_ptr {
-                    Self::process_relative_event(ev, ts_usec, lib_dev, ctx, td, out);
-                    continue;
-                }
-
-                // ---- Absolute device (touchpad) ----
-                if is_abs {
-                    let dwt_active = cfg_dwt
-                        && global_typing
-                            .map(|t| t.elapsed() < Duration::from_millis(500))
-                            .unwrap_or(false);
-                    let touch_arbitrated = touch_arbitration_active(ctx, lib_dev, None);
-                    Self::process_absolute_event(
-                        ev,
-                        ts_usec,
-                        lib_dev,
-                        pointing_stick_device,
-                        ctx,
-                        td,
-                        out,
-                        cfg_tap,
-                        cfg_nat,
-                        cfg_accel,
-                        dwt_active,
-                        touch_arbitrated,
-                    );
                 }
             }
         }
@@ -3126,6 +4041,14 @@ impl BackendState {
             .filter_map(|tracked| tracked.drag_3fg_release_since)
             .map(|since| drag_3fg_release_timeout.saturating_sub(since.elapsed()))
             .min();
+        let next_edge_scroll_timeout = self
+            .devices
+            .values()
+            .flat_map(|tracked| tracked.mt_slots.iter())
+            .filter(|slot| slot.edge_state == EdgeScrollState::New)
+            .filter_map(|slot| slot.edge_started_at)
+            .map(|since| Duration::from_millis(300).saturating_sub(since.elapsed()))
+            .min();
         let next_timeout = [
             next_middle_timeout,
             next_debounce_timeout,
@@ -3134,6 +4057,7 @@ impl BackendState {
             next_hold_timeout,
             next_tap_timeout,
             next_drag_3fg_timeout,
+            next_edge_scroll_timeout,
         ]
         .into_iter()
         .flatten()
@@ -4476,14 +5400,16 @@ impl BackendState {
                                 ] {
                                     out.push_back(LibinputEvent {
                                         event_type,
-                                        payload: EventPayload::PointerAxis(PointerAxisEvent {
-                                            time_usec: ts_usec,
-                                            axis,
-                                            value: value as f64,
-                                            value_discrete: 0,
-                                            value_v120: 0.0,
-                                            source: 3,
-                                        }),
+                                        payload: EventPayload::PointerAxis(
+                                            PointerAxisEvent::single(
+                                                ts_usec,
+                                                axis,
+                                                value as f64,
+                                                0,
+                                                0.0,
+                                                3,
+                                            ),
+                                        ),
                                         context: ctx,
                                         device: lib_dev,
                                     });
@@ -4528,14 +5454,9 @@ impl BackendState {
                         ] {
                             out.push_back(LibinputEvent {
                                 event_type,
-                                payload: EventPayload::PointerAxis(PointerAxisEvent {
-                                    time_usec: ts_usec,
-                                    axis,
-                                    value,
-                                    value_discrete: 0,
-                                    value_v120: 0.0,
-                                    source: 3,
-                                }),
+                                payload: EventPayload::PointerAxis(PointerAxisEvent::single(
+                                    ts_usec, axis, value, 0, 0.0, 3,
+                                )),
                                 context: ctx,
                                 device: lib_dev,
                             });
@@ -4597,14 +5518,14 @@ impl BackendState {
                         let value_v120 = raw_v120 * direction;
                         out.push_back(LibinputEvent {
                             event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_SCROLL_WHEEL,
-                            payload: EventPayload::PointerAxis(PointerAxisEvent {
-                                time_usec: ts_usec,
+                            payload: EventPayload::PointerAxis(PointerAxisEvent::single(
+                                ts_usec,
                                 axis,
-                                value: value_v120 / 120.0 * click_angle,
-                                value_discrete: (value_v120 / 120.0) as i32,
+                                value_v120 / 120.0 * click_angle,
+                                (value_v120 / 120.0) as i32,
                                 value_v120,
-                                source: 1,
-                            }),
+                                1,
+                            )),
                             context: ctx,
                             device: lib_dev,
                         });
@@ -4613,14 +5534,14 @@ impl BackendState {
                         let discrete = (low_res as f64 * direction) as i32;
                         out.push_back(LibinputEvent {
                             event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_AXIS,
-                            payload: EventPayload::PointerAxis(PointerAxisEvent {
-                                time_usec: ts_usec,
+                            payload: EventPayload::PointerAxis(PointerAxisEvent::single(
+                                ts_usec,
                                 axis,
-                                value: f64::from(discrete) * click_angle,
-                                value_discrete: discrete,
-                                value_v120: f64::from(discrete) * 120.0,
-                                source: 1,
-                            }),
+                                f64::from(discrete) * click_angle,
+                                discrete,
+                                f64::from(discrete) * 120.0,
+                                1,
+                            )),
                             context: ctx,
                             device: lib_dev,
                         });
@@ -5175,19 +6096,61 @@ impl BackendState {
             ] {
                 out.push_back(LibinputEvent {
                     event_type,
-                    payload: EventPayload::PointerAxis(PointerAxisEvent {
-                        time_usec: ts_usec,
-                        axis,
-                        value: 0.0,
-                        value_discrete: 0,
-                        value_v120: 0.0,
-                        source: 3,
-                    }),
+                    payload: EventPayload::PointerAxis(PointerAxisEvent::single(
+                        ts_usec, axis, 0.0, 0, 0.0, 3,
+                    )),
                     context: ctx,
                     device: lib_dev,
                 });
             }
         }
+    }
+
+    unsafe fn emit_finger_axis(
+        ts_usec: u64,
+        lib_dev: *mut LibinputDevice,
+        ctx: *mut LibinputContext,
+        axes: u8,
+        values: [f64; 2],
+        out: &mut VecDeque<LibinputEvent>,
+    ) {
+        if axes == 0 {
+            return;
+        }
+        for event_type in [
+            LibinputEventType::LIBINPUT_EVENT_POINTER_SCROLL_FINGER,
+            LibinputEventType::LIBINPUT_EVENT_POINTER_AXIS,
+        ] {
+            out.push_back(LibinputEvent {
+                event_type,
+                payload: EventPayload::PointerAxis(PointerAxisEvent::with_axes(
+                    ts_usec, axes, values, [0; 2], [0.0; 2], 2,
+                )),
+                context: ctx,
+                device: lib_dev,
+            });
+        }
+    }
+
+    unsafe fn emit_edge_scroll_frame(
+        ts_usec: u64,
+        lib_dev: *mut LibinputDevice,
+        ctx: *mut LibinputContext,
+        frame: EdgeScrollFrame,
+        natural_scroll: bool,
+        out: &mut VecDeque<LibinputEvent>,
+    ) {
+        for (axis, raw_delta) in frame.scrolls {
+            let mut values = [0.0; 2];
+            let value = raw_delta * 0.02 * 24.0;
+            if axis == AXIS_VERTICAL {
+                values[0] = if natural_scroll { -value } else { value };
+            } else if axis == AXIS_HORIZONTAL {
+                values[1] = if natural_scroll { -value } else { value };
+            }
+            Self::emit_finger_axis(ts_usec, lib_dev, ctx, axis, values, out);
+        }
+        Self::emit_finger_axis(ts_usec, lib_dev, ctx, frame.stop_axes, [0.0; 2], out);
     }
 
     // -----------------------------------------------------------------------
@@ -5294,6 +6257,22 @@ impl BackendState {
                 let code = ev.code();
                 let value = ev.value();
 
+                if value != 0
+                    && [
+                        KeyCode::BTN_LEFT.0,
+                        KeyCode::BTN_RIGHT.0,
+                        KeyCode::BTN_MIDDLE.0,
+                    ]
+                    .contains(&code)
+                {
+                    let edge_axes = td.stop_edge_scroll();
+                    Self::emit_finger_axis(ts_usec, lib_dev, ctx, edge_axes, [0.0; 2], out);
+                    let button_areas = (*lib_dev).click_method == 1;
+                    td.gesture_last_centroid = td.gesture_centroid(button_areas);
+                    td.pinch_base_centroid = td.gesture_last_centroid;
+                    td.finger_scroll_constraint.reset();
+                }
+
                 if (*lib_dev).middle_emulation
                     && (*lib_dev).scroll_method != 4
                     && (code == KeyCode::BTN_LEFT.0
@@ -5306,12 +6285,23 @@ impl BackendState {
 
                 if code == KeyCode::BTN_TOUCH.0 {
                     td.touch_active = value != 0;
-                    if (*lib_dev).has_touch && !td.has_mt {
+                    if td.is_pointer && !td.has_mt {
                         let slot = &mut td.mt_slots[0];
+                        td.mt_contact_count_changed |= slot.active != (value != 0);
                         slot.active = value != 0;
                         slot.dirty = true;
                         if value != 0 {
                             slot.tracking_id = 0;
+                            slot.button_area_classification_pending = true;
+                            slot.button_area_excluded = false;
+                            slot.edge_classification_pending = true;
+                            slot.edge_state = EdgeScrollState::None;
+                            slot.edge_mask = 0;
+                            slot.edge_axis = 0;
+                            slot.edge_started_at = None;
+                        } else {
+                            slot.button_area_classification_pending = false;
+                            slot.edge_classification_pending = false;
                         }
                     }
                     if td.touch_active {
@@ -5491,21 +6481,31 @@ impl BackendState {
                             if td.active_click_button.is_some() {
                                 return;
                             }
+                            let button_areas = (*lib_dev).click_method == 1;
+                            let clickfinger = (*lib_dev).click_method == 2;
+                            let click_position = td.last_x.zip(td.last_y).or_else(|| {
+                                td.mt_slots
+                                    .iter()
+                                    .find(|slot| slot.active && !slot.palm_suppressed)
+                                    .map(|slot| (slot.x.round() as i32, slot.y.round() as i32))
+                            });
                             let (in_right_button_area, in_top_button_area) =
-                                match (td.last_x, td.last_y, td.abs_x_range, td.abs_y_range) {
-                                    (Some(x), Some(y), Some((xmin, xmax)), Some((ymin, ymax))) => {
+                                match (click_position, td.abs_x_range, td.abs_y_range) {
+                                    (Some((x, y)), Some((xmin, xmax)), Some((ymin, ymax))) => {
                                         let right_edge = xmin + (xmax - xmin) * 2 / 3;
                                         let button_top = ymin + (ymax - ymin) * 4 / 5;
                                         let top_button_bottom = ymin + (ymax - ymin) / 5;
                                         (
-                                            x >= right_edge && y >= button_top,
+                                            button_areas && x >= right_edge && y >= button_top,
                                             td.is_topbuttonpad && y <= top_button_bottom,
                                         )
                                     }
                                     _ => (false, false),
                                 };
                             if in_top_button_area {
-                                if let (Some(x), Some((xmin, xmax))) = (td.last_x, td.abs_x_range) {
+                                if let (Some((x, _)), Some((xmin, xmax))) =
+                                    (click_position, td.abs_x_range)
+                                {
                                     let third = (xmax - xmin) / 3;
                                     mapped = if x >= xmin + third * 2 {
                                         KeyCode::BTN_RIGHT.0
@@ -5518,10 +6518,29 @@ impl BackendState {
                                 if let Some(pointing_stick) = pointing_stick_device {
                                     event_device = pointing_stick;
                                 }
-                            } else if in_right_button_area || td.touch_fingers == 2 {
+                            } else if in_right_button_area {
                                 mapped = KeyCode::BTN_RIGHT.0;
-                            } else if td.touch_fingers >= 3 {
-                                mapped = KeyCode::BTN_MIDDLE.0;
+                            }
+                            if clickfinger {
+                                let clickfinger_fingers = td.clickfinger_finger_count(
+                                    (*lib_dev).abs_x_resolution,
+                                    (*lib_dev).abs_y_resolution,
+                                    (*lib_dev).abs_x_range.or(td.abs_x_range),
+                                    (*lib_dev).abs_y_range.or(td.abs_y_range),
+                                    (*lib_dev).width_mm,
+                                    (*lib_dev).height_mm,
+                                );
+                                mapped = match clickfinger_fingers {
+                                    2 if (*lib_dev).clickfinger_button_map == 1 => {
+                                        KeyCode::BTN_MIDDLE.0
+                                    }
+                                    2 => KeyCode::BTN_RIGHT.0,
+                                    n if n >= 3 && (*lib_dev).clickfinger_button_map == 1 => {
+                                        KeyCode::BTN_RIGHT.0
+                                    }
+                                    n if n >= 3 => KeyCode::BTN_MIDDLE.0,
+                                    _ => KeyCode::BTN_LEFT.0,
+                                };
                             }
                             td.active_click_button = Some(mapped);
                             td.active_click_device = Some(event_device);
@@ -5604,18 +6623,50 @@ impl BackendState {
                     let slot = td.current_slot;
                     if slot < td.mt_slots.len() {
                         let mt_slot = &mut td.mt_slots[slot];
-                        td.mt_contact_count_changed |= mt_slot.active != (val >= 0);
+                        let new_contact =
+                            val >= 0 && (!mt_slot.active || mt_slot.tracking_id != val);
+                        // libevdev absorbs SYN_DROPPED while reconstructing
+                        // the current device state. A replacement tracking ID
+                        // can consequently arrive on an already-active slot
+                        // when a release was lost. Its synthetic SYN_REPORT
+                        // can precede the refreshed coordinates, so defer the
+                        // gesture rebase until that contact has a position.
+                        td.mt_contact_count_changed |= mt_slot.active != (val >= 0) || new_contact;
                         mt_slot.active = val >= 0;
                         mt_slot.tracking_id = val;
-                        if val >= 0 {
+                        if new_contact {
                             mt_slot.button_area_classification_pending = true;
                             mt_slot.button_area_excluded = false;
+                            mt_slot.button_area_initial_x = 0.0;
+                            mt_slot.button_area_initial_y = 0.0;
+                            mt_slot.button_area_down_usec = 0;
+                            mt_slot.gesture_initial_x = 0.0;
+                            mt_slot.gesture_initial_y = 0.0;
+                            mt_slot.gesture_rebase_pending = true;
+                            mt_slot.gesture_position_seen = false;
+                            mt_slot.edge_classification_pending = true;
+                            mt_slot.edge_state = EdgeScrollState::None;
+                            mt_slot.edge_mask = 0;
+                            mt_slot.edge_initial_x = 0.0;
+                            mt_slot.edge_initial_y = 0.0;
+                            mt_slot.edge_last_x = 0.0;
+                            mt_slot.edge_last_y = 0.0;
+                            mt_slot.edge_started_at = None;
+                            mt_slot.edge_axis = 0;
                             mt_slot.palm_suppressed =
                                 mt_slot.tool_type == 2 || td.touch_arbitration_suppressed;
                             mt_slot.cancel_pending = false;
                         } else {
                             mt_slot.button_area_classification_pending = false;
                             mt_slot.button_area_excluded = false;
+                            mt_slot.button_area_initial_x = 0.0;
+                            mt_slot.button_area_initial_y = 0.0;
+                            mt_slot.button_area_down_usec = 0;
+                            mt_slot.gesture_initial_x = 0.0;
+                            mt_slot.gesture_initial_y = 0.0;
+                            mt_slot.gesture_rebase_pending = false;
+                            mt_slot.gesture_position_seen = false;
+                            mt_slot.edge_classification_pending = false;
                         }
                         mt_slot.dirty = true;
                     }
@@ -5629,6 +6680,7 @@ impl BackendState {
                             mt_slot.x = val as f64;
                             mt_slot.dirty = true;
                         }
+                        mt_slot.gesture_position_seen |= mt_slot.gesture_rebase_pending;
                     }
                 } else if code == AbsoluteAxisCode::ABS_MT_POSITION_Y.0 {
                     let slot = td.current_slot;
@@ -5640,6 +6692,7 @@ impl BackendState {
                             mt_slot.y = val as f64;
                             mt_slot.dirty = true;
                         }
+                        mt_slot.gesture_position_seen |= mt_slot.gesture_rebase_pending;
                     }
                 } else if code == AbsoluteAxisCode::ABS_MT_DISTANCE.0 {
                     let slot = td.current_slot;
@@ -5660,7 +6713,7 @@ impl BackendState {
                 }
                 // ---- Single-touch ABS_X/Y ----
                 else if code == AbsoluteAxisCode::ABS_X.0 {
-                    if (*lib_dev).has_touch && !td.has_mt {
+                    if td.is_pointer && !td.has_mt {
                         td.mt_slots[0].x = val as f64;
                         td.mt_slots[0].dirty = true;
                     }
@@ -5675,7 +6728,7 @@ impl BackendState {
                     }
                     td.last_x = Some(val);
                 } else if code == AbsoluteAxisCode::ABS_Y.0 {
-                    if (*lib_dev).has_touch && !td.has_mt {
+                    if td.is_pointer && !td.has_mt {
                         td.mt_slots[0].y = val as f64;
                         td.mt_slots[0].dirty = true;
                     }
@@ -5917,21 +6970,68 @@ impl BackendState {
                     td.current_dy = 0;
                     td.remainder_x = 0.0;
                     td.remainder_y = 0.0;
+                    td.finger_scroll_constraint.reset();
                     if !td.touch_active && !touch_arbitrated {
                         td.touch_arbitration_suppressed = false;
                     }
                     return;
                 }
 
+                if td.mt_contact_count_changed && !td.gesture_contact_rebase_ready() {
+                    // A synchronized evdev state may report a new tracking
+                    // ID in a frame before the corresponding position. Do
+                    // not derive motion or gesture direction from that mixed
+                    // old/new contact state.
+                    td.current_dx = 0;
+                    td.current_dy = 0;
+                    td.remainder_x = 0.0;
+                    td.remainder_y = 0.0;
+                    td.finger_scroll_constraint.reset();
+                    return;
+                }
+
+                let pinch_distance = td.primary_slot_distance();
+                let button_areas = (*lib_dev).click_method == 1;
+                let x_range = (*lib_dev).abs_x_range.or(td.abs_x_range);
+                let y_range = (*lib_dev).abs_y_range.or(td.abs_y_range);
+                let edge_enabled = (*lib_dev).scroll_method == 2;
+                td.classify_edge_contacts(
+                    edge_enabled,
+                    button_areas,
+                    (*lib_dev).abs_x_resolution,
+                    (*lib_dev).abs_y_resolution,
+                    x_range,
+                    y_range,
+                    (*lib_dev).width_mm,
+                    (*lib_dev).height_mm,
+                );
+
                 if std::mem::take(&mut td.mt_contact_count_changed) {
-                    let button_areas = (*lib_dev).click_method == 1;
-                    td.classify_gesture_contacts(button_areas);
+                    td.complete_gesture_contact_rebase();
+                    let button_top = TrackedDevice::bottom_button_area_top(
+                        y_range,
+                        (*lib_dev).abs_y_resolution,
+                        (*lib_dev).height_mm,
+                    );
+                    td.classify_gesture_contacts(button_areas, button_top, ts_usec);
+                    td.reset_gesture_contact_initials(button_areas);
+                    let edge_frame = td.process_edge_scroll_frame(
+                        edge_enabled,
+                        (*lib_dev).abs_x_resolution,
+                        (*lib_dev).abs_y_resolution,
+                        x_range,
+                        y_range,
+                        (*lib_dev).width_mm,
+                        (*lib_dev).height_mm,
+                    );
+                    Self::emit_edge_scroll_frame(ts_usec, lib_dev, ctx, edge_frame, cfg_nat, out);
                     let n_fingers = td.gesture_finger_count(button_areas);
                     let eligible_tracked_contacts = td
                         .mt_slots
                         .iter()
                         .filter(|slot| slot.active && (!button_areas || !slot.button_area_excluded))
                         .count();
+                    td.finger_scroll_constraint.reset();
                     if td.touch_active {
                         td.tap_fingers = td.tap_fingers.max(n_fingers as u32);
                     }
@@ -5998,31 +7098,28 @@ impl BackendState {
                             td.hold_fingers = td.hold_fingers.max(n_fingers as i32);
                         }
                     }
-                    if (n_fingers == 0 || n_fingers > 2 || eligible_tracked_contacts == 0)
+                    if ((*lib_dev).scroll_method != 1
+                        || n_fingers != 2
+                        || eligible_tracked_contacts == 0)
                         && td.finger_scroll_axes != 0
                     {
-                        for axis in 0..2 {
-                            if td.finger_scroll_axes & (1 << axis) == 0 {
-                                continue;
-                            }
-                            for event_type in [
-                                LibinputEventType::LIBINPUT_EVENT_POINTER_SCROLL_FINGER,
-                                LibinputEventType::LIBINPUT_EVENT_POINTER_AXIS,
-                            ] {
-                                out.push_back(LibinputEvent {
-                                    event_type,
-                                    payload: EventPayload::PointerAxis(PointerAxisEvent {
-                                        time_usec: ts_usec,
-                                        axis,
-                                        value: 0.0,
-                                        value_discrete: 0,
-                                        value_v120: 0.0,
-                                        source: 2,
-                                    }),
-                                    context: ctx,
-                                    device: lib_dev,
-                                });
-                            }
+                        for event_type in [
+                            LibinputEventType::LIBINPUT_EVENT_POINTER_SCROLL_FINGER,
+                            LibinputEventType::LIBINPUT_EVENT_POINTER_AXIS,
+                        ] {
+                            out.push_back(LibinputEvent {
+                                event_type,
+                                payload: EventPayload::PointerAxis(PointerAxisEvent::with_axes(
+                                    ts_usec,
+                                    td.finger_scroll_axes,
+                                    [0.0; 2],
+                                    [0; 2],
+                                    [0.0; 2],
+                                    2,
+                                )),
+                                context: ctx,
+                                device: lib_dev,
+                            });
                         }
                         td.finger_scroll_axes = 0;
                     }
@@ -6048,6 +7145,7 @@ impl BackendState {
                     td.remainder_x = 0.0;
                     td.remainder_y = 0.0;
                     td.gesture_last_centroid = td.gesture_centroid(button_areas);
+                    td.pinch_base_centroid = td.gesture_last_centroid;
                     if !td.pinch_active && n_fingers >= 2 {
                         if let Some(distance) = td.primary_slot_distance() {
                             td.pinch_base_dist = distance;
@@ -6058,8 +7156,92 @@ impl BackendState {
                     return;
                 }
 
+                let button_top = TrackedDevice::bottom_button_area_top(
+                    y_range,
+                    (*lib_dev).abs_y_resolution,
+                    (*lib_dev).height_mm,
+                );
+                if td.update_button_area_contacts(
+                    button_areas,
+                    button_top,
+                    (*lib_dev).abs_x_resolution,
+                    (*lib_dev).abs_y_resolution,
+                    x_range,
+                    y_range,
+                    (*lib_dev).width_mm,
+                    (*lib_dev).height_mm,
+                ) {
+                    // The set of gesture-eligible contacts changed even
+                    // though the kernel's MT contact count did not. Rebase
+                    // before calculating a centroid delta for this frame.
+                    td.current_dx = 0;
+                    td.current_dy = 0;
+                    td.remainder_x = 0.0;
+                    td.remainder_y = 0.0;
+                    td.finger_scroll_constraint.reset();
+                    td.reset_gesture_contact_initials(button_areas);
+                    td.gesture_last_centroid = td.gesture_centroid(button_areas);
+                    td.pinch_base_centroid = td.gesture_last_centroid;
+                    if !td.pinch_active && td.gesture_finger_count(button_areas) >= 2 {
+                        if let Some(distance) = td.primary_slot_distance() {
+                            td.pinch_base_dist = distance;
+                            td.pinch_base_angle = td.primary_slot_angle();
+                            td.pinch_fingers = td.gesture_finger_count(button_areas) as i32;
+                        }
+                    }
+                }
+
+                if dwt_active {
+                    let edge_axes = td.stop_edge_scroll();
+                    Self::emit_finger_axis(ts_usec, lib_dev, ctx, edge_axes, [0.0; 2], out);
+                    td.current_dx = 0;
+                    td.current_dy = 0;
+                    td.remainder_x = 0.0;
+                    td.remainder_y = 0.0;
+                    td.finger_scroll_constraint.reset();
+                    td.tap_emitted = true;
+                    return;
+                }
+
+                if (*lib_dev).scroll_method != 1 && td.finger_scroll_axes != 0 {
+                    Self::emit_finger_axis(
+                        ts_usec,
+                        lib_dev,
+                        ctx,
+                        td.finger_scroll_axes,
+                        [0.0; 2],
+                        out,
+                    );
+                    td.finger_scroll_axes = 0;
+                    td.finger_scroll_constraint.reset();
+                }
+
+                let edge_frame = td.process_edge_scroll_frame(
+                    edge_enabled,
+                    (*lib_dev).abs_x_resolution,
+                    (*lib_dev).abs_y_resolution,
+                    x_range,
+                    y_range,
+                    (*lib_dev).width_mm,
+                    (*lib_dev).height_mm,
+                );
+                let edge_suppresses_motion = edge_frame.suppress_normal_motion;
+                Self::emit_edge_scroll_frame(ts_usec, lib_dev, ctx, edge_frame, cfg_nat, out);
+                if edge_suppresses_motion {
+                    td.current_dx = 0;
+                    td.current_dy = 0;
+                    td.remainder_x = 0.0;
+                    td.remainder_y = 0.0;
+                    td.finger_scroll_constraint.reset();
+                    td.gesture_last_centroid = td.gesture_centroid(button_areas);
+                    td.pinch_base_centroid = td.gesture_last_centroid;
+                    td.tap_emitted = true;
+                    return;
+                }
+
                 // ---- Pinch UPDATE on SYN_REPORT ----
                 if td.pinch_active && !dwt_active {
+                    td.finger_scroll_constraint.reset();
                     if let Some(dist) = td.primary_slot_distance() {
                         let scale = if td.pinch_base_dist > 0.0 {
                             dist / td.pinch_base_dist
@@ -6088,7 +7270,7 @@ impl BackendState {
                 }
 
                 if td.has_mt {
-                    let centroid = td.gesture_centroid((*lib_dev).click_method == 1);
+                    let centroid = td.gesture_centroid(button_areas);
                     if let (Some((x, y)), Some((last_x, last_y))) =
                         (centroid, td.gesture_last_centroid)
                     {
@@ -6106,10 +7288,11 @@ impl BackendState {
                     td.current_dy = 0;
                     td.remainder_x = 0.0;
                     td.remainder_y = 0.0;
+                    td.finger_scroll_constraint.reset();
                     td.tap_emitted = true;
                     return;
                 }
-                let n_fingers = td.gesture_finger_count((*lib_dev).click_method == 1);
+                let n_fingers = td.gesture_finger_count(button_areas);
                 let drag_fingers = match (*lib_dev).drag_3fg_enabled {
                     1 => 3,
                     2 => 4,
@@ -6201,6 +7384,7 @@ impl BackendState {
                 }
 
                 if td.drag_3fg_active {
+                    td.finger_scroll_constraint.reset();
                     td.tap_emitted = true;
                     if has_movement {
                         let scale = 0.18;
@@ -6222,27 +7406,53 @@ impl BackendState {
                     return;
                 }
 
-                let pinch_distance = td.primary_slot_distance();
                 let button_areas = (*lib_dev).click_method == 1;
                 let eligible_tracked_contacts = td
                     .mt_slots
                     .iter()
                     .filter(|slot| slot.active && (!button_areas || !slot.button_area_excluded))
                     .count();
+                if n_fingers != 2 || eligible_tracked_contacts == 0 {
+                    td.finger_scroll_constraint.reset();
+                }
                 let pinch_is_trackable = eligible_tracked_contacts >= 2
                     && td.touch_fingers as usize <= td.active_slot_count();
-                let centroid_distance = f64::from(td.current_dx).hypot(f64::from(td.current_dy));
+                let contact_direction = (n_fingers == 2)
+                    .then(|| {
+                        td.gesture_contacts_same_direction(
+                            button_areas,
+                            (*lib_dev).abs_x_resolution,
+                            (*lib_dev).abs_y_resolution,
+                            x_range,
+                            y_range,
+                            (*lib_dev).width_mm,
+                            (*lib_dev).height_mm,
+                        )
+                    })
+                    .flatten();
+                let pinch_direction_pending = n_fingers == 2
+                    && pinch_is_trackable
+                    && (*lib_dev).has_gesture
+                    && contact_direction.is_none();
+                let centroid_distance = match (td.gesture_last_centroid, td.pinch_base_centroid) {
+                    (Some((x, y)), Some((base_x, base_y))) => (x - base_x).hypot(y - base_y),
+                    _ => f64::from(td.current_dx).hypot(f64::from(td.current_dy)),
+                };
                 let starts_pinch = !td.pinch_active
                     && !td.swipe_active
                     && td.drag_3fg_candidate_since.is_none()
                     && pinch_is_trackable
                     && n_fingers >= 2
-                    && td.pinch_base_dist > 0.0
-                    && pinch_distance.is_some_and(|distance| {
-                        let distance_delta = (distance - td.pinch_base_dist).abs();
-                        distance_delta > 0.5
-                            && (centroid_distance == 0.0
-                                || distance_delta > centroid_distance * 2.0)
+                    && (if n_fingers == 2 {
+                        contact_direction == Some(false)
+                    } else {
+                        td.pinch_base_dist > 0.0
+                            && pinch_distance.is_some_and(|distance| {
+                                let distance_delta = (distance - td.pinch_base_dist).abs();
+                                distance_delta > 0.5
+                                    && (centroid_distance == 0.0
+                                        || distance_delta > centroid_distance * 2.0)
+                            })
                     });
                 if !has_movement && !starts_pinch {
                     return;
@@ -6273,6 +7483,7 @@ impl BackendState {
                 }
 
                 if starts_pinch {
+                    td.finger_scroll_constraint.reset();
                     td.pinch_active = true;
                     td.pinch_fingers = n_fingers as i32;
                     out.push_back(LibinputEvent {
@@ -6298,79 +7509,130 @@ impl BackendState {
                 let hw_scale: f32 = 0.18;
 
                 if n_fingers <= 1 {
-                    let total_x = (td.current_dx as f32 * hw_scale) * cfg_accel + td.remainder_x;
-                    let total_y = (td.current_dy as f32 * hw_scale) * cfg_accel + td.remainder_y;
-                    let emit_x = total_x.round() as i32;
-                    let emit_y = total_y.round() as i32;
-                    td.remainder_x = total_x - emit_x as f32;
-                    td.remainder_y = total_y - emit_y as f32;
-                    if emit_x != 0 || emit_y != 0 {
-                        out.push_back(LibinputEvent {
-                            event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_MOTION,
-                            payload: EventPayload::PointerMotion(PointerMotionEvent {
-                                time_usec: ts_usec,
-                                dx: emit_x as f64,
-                                dy: emit_y as f64,
-                                dx_unaccel: (td.current_dx as f32 * hw_scale) as f64,
-                                dy_unaccel: (td.current_dy as f32 * hw_scale) as f64,
-                            }),
-                            context: ctx,
-                            device: lib_dev,
-                        });
-                    }
-                } else if n_fingers == 2 {
-                    let scroll_scale: f32 = 0.02;
-                    let total_y = td.current_dy as f32 * scroll_scale + td.remainder_y;
-                    let total_x = td.current_dx as f32 * scroll_scale + td.remainder_x;
-                    let emit_y = total_y.round() as i32;
-                    let emit_x = total_x.round() as i32;
-                    td.remainder_y = total_y - emit_y as f32;
-                    td.remainder_x = total_x - emit_x as f32;
-                    if emit_y != 0 {
-                        let v = if cfg_nat { -emit_y } else { emit_y };
-                        td.finger_scroll_axes |= 1;
-                        for event_type in [
-                            LibinputEventType::LIBINPUT_EVENT_POINTER_SCROLL_FINGER,
-                            LibinputEventType::LIBINPUT_EVENT_POINTER_AXIS,
-                        ] {
+                    let inactive_button_area_contact = button_areas
+                        && td
+                            .mt_slots
+                            .iter()
+                            .any(|slot| slot.active && slot.button_area_excluded);
+                    if !inactive_button_area_contact {
+                        let total_x =
+                            (td.current_dx as f32 * hw_scale) * cfg_accel + td.remainder_x;
+                        let total_y =
+                            (td.current_dy as f32 * hw_scale) * cfg_accel + td.remainder_y;
+                        let emit_x = total_x.round() as i32;
+                        let emit_y = total_y.round() as i32;
+                        td.remainder_x = total_x - emit_x as f32;
+                        td.remainder_y = total_y - emit_y as f32;
+                        if emit_x != 0 || emit_y != 0 {
                             out.push_back(LibinputEvent {
-                                event_type,
-                                payload: EventPayload::PointerAxis(PointerAxisEvent {
+                                event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_MOTION,
+                                payload: EventPayload::PointerMotion(PointerMotionEvent {
                                     time_usec: ts_usec,
-                                    axis: 0,
-                                    value: v as f64 * 15.0,
-                                    value_discrete: v,
-                                    value_v120: v as f64 * 120.0,
-                                    source: 2,
+                                    dx: emit_x as f64,
+                                    dy: emit_y as f64,
+                                    dx_unaccel: (td.current_dx as f32 * hw_scale) as f64,
+                                    dy_unaccel: (td.current_dy as f32 * hw_scale) as f64,
                                 }),
                                 context: ctx,
                                 device: lib_dev,
                             });
                         }
                     }
-                    if emit_x != 0 {
-                        let v = if cfg_nat { -emit_x } else { emit_x };
-                        td.finger_scroll_axes |= 2;
+                } else if n_fingers == 2 && (*lib_dev).scroll_method == 1 {
+                    // While both contacts are still below the pinch
+                    // disambiguation threshold, hold back finger scrolling.
+                    // This avoids leaking a scroll event before a valid
+                    // pinch begins on coarse-resolution touchpads.
+                    if pinch_direction_pending {
+                        td.finger_scroll_constraint.reset();
+                        return;
+                    }
+                    let scroll_scale = 0.02;
+                    let raw_scroll_x = f64::from(td.current_dx) * scroll_scale;
+                    let raw_scroll_y = f64::from(td.current_dy) * scroll_scale;
+                    let delta_x_mm = touchpad_delta_mm(
+                        f64::from(td.current_dx),
+                        (*lib_dev).abs_x_resolution,
+                        (*lib_dev).abs_x_range,
+                        (*lib_dev).width_mm,
+                    );
+                    let delta_y_mm = touchpad_delta_mm(
+                        f64::from(td.current_dy),
+                        (*lib_dev).abs_y_resolution,
+                        (*lib_dev).abs_y_range,
+                        (*lib_dev).height_mm,
+                    );
+                    let gesture_distance_mm =
+                        match (td.gesture_last_centroid, td.pinch_base_centroid) {
+                            (Some((x, y)), Some((base_x, base_y))) => touchpad_delta_mm(
+                                x - base_x,
+                                (*lib_dev).abs_x_resolution,
+                                (*lib_dev).abs_x_range,
+                                (*lib_dev).width_mm,
+                            )
+                            .hypot(touchpad_delta_mm(
+                                y - base_y,
+                                (*lib_dev).abs_y_resolution,
+                                (*lib_dev).abs_y_range,
+                                (*lib_dev).height_mm,
+                            )),
+                            _ => delta_x_mm.hypot(delta_y_mm),
+                        };
+                    let gesture_moved_at_least_one_mm = td
+                        .gesture_contact_moved_at_least(
+                            button_areas,
+                            (*lib_dev).abs_x_resolution,
+                            (*lib_dev).abs_y_resolution,
+                            x_range,
+                            y_range,
+                            (*lib_dev).width_mm,
+                            (*lib_dev).height_mm,
+                            1.0,
+                        )
+                        .unwrap_or(gesture_distance_mm >= 1.0);
+                    if td.finger_scroll_axes == 0 && !gesture_moved_at_least_one_mm {
+                        td.remainder_x = 0.0;
+                        td.remainder_y = 0.0;
+                        return;
+                    }
+                    let (scroll_x, scroll_y) = td.finger_scroll_constraint.constrain(
+                        ts_usec,
+                        raw_scroll_x,
+                        raw_scroll_y,
+                        delta_x_mm,
+                        delta_y_mm,
+                    );
+                    td.remainder_y = 0.0;
+                    td.remainder_x = 0.0;
+                    let mut axes = 0;
+                    let mut values = [0.0; 2];
+                    if scroll_y != 0.0 {
+                        axes |= 1;
+                        values[0] = if cfg_nat { -scroll_y } else { scroll_y };
+                    }
+                    if scroll_x != 0.0 {
+                        axes |= 2;
+                        values[1] = if cfg_nat { -scroll_x } else { scroll_x };
+                    }
+                    if axes != 0 {
+                        values[0] *= 24.0;
+                        values[1] *= 24.0;
+                        td.finger_scroll_axes |= axes;
                         for event_type in [
                             LibinputEventType::LIBINPUT_EVENT_POINTER_SCROLL_FINGER,
                             LibinputEventType::LIBINPUT_EVENT_POINTER_AXIS,
                         ] {
                             out.push_back(LibinputEvent {
                                 event_type,
-                                payload: EventPayload::PointerAxis(PointerAxisEvent {
-                                    time_usec: ts_usec,
-                                    axis: 1,
-                                    value: v as f64 * 15.0,
-                                    value_discrete: v,
-                                    value_v120: v as f64 * 120.0,
-                                    source: 2,
-                                }),
+                                payload: EventPayload::PointerAxis(PointerAxisEvent::with_axes(
+                                    ts_usec, axes, values, [0; 2], [0.0; 2], 2,
+                                )),
                                 context: ctx,
                                 device: lib_dev,
                             });
                         }
                     }
-                } else {
+                } else if n_fingers >= 3 {
                     // 3+ fingers = swipe gesture
                     let gscale: f64 = 0.18;
                     let (event_type, event_payload) = if td.swipe_active {

@@ -111,11 +111,82 @@ pub struct PointerButtonEvent {
 #[derive(Debug, Clone)]
 pub struct PointerAxisEvent {
     pub time_usec: u64,
-    pub axis: u32,
-    pub value: f64,
-    pub value_discrete: i32,
-    pub value_v120: f64,
+    axes: u8,
+    values: [f64; 2],
+    values_discrete: [i32; 2],
+    values_v120: [f64; 2],
     pub source: u32,
+}
+
+impl PointerAxisEvent {
+    pub fn single(
+        time_usec: u64,
+        axis: u32,
+        value: f64,
+        value_discrete: i32,
+        value_v120: f64,
+        source: u32,
+    ) -> Self {
+        let mut event = Self {
+            time_usec,
+            axes: 0,
+            values: [0.0; 2],
+            values_discrete: [0; 2],
+            values_v120: [0.0; 2],
+            source,
+        };
+        if let Some(index) = Self::axis_index(axis) {
+            event.axes = 1 << index;
+            event.values[index] = value;
+            event.values_discrete[index] = value_discrete;
+            event.values_v120[index] = value_v120;
+        }
+        event
+    }
+
+    pub fn with_axes(
+        time_usec: u64,
+        axes: u8,
+        values: [f64; 2],
+        values_discrete: [i32; 2],
+        values_v120: [f64; 2],
+        source: u32,
+    ) -> Self {
+        Self {
+            time_usec,
+            axes: axes & 0b11,
+            values,
+            values_discrete,
+            values_v120,
+            source,
+        }
+    }
+
+    pub fn has_axis(&self, axis: u32) -> bool {
+        Self::axis_index(axis).is_some_and(|index| self.axes & (1 << index) != 0)
+    }
+
+    pub fn value(&self, axis: u32) -> f64 {
+        Self::axis_index(axis)
+            .filter(|_| self.has_axis(axis))
+            .map_or(0.0, |index| self.values[index])
+    }
+
+    pub fn value_discrete(&self, axis: u32) -> i32 {
+        Self::axis_index(axis)
+            .filter(|_| self.has_axis(axis))
+            .map_or(0, |index| self.values_discrete[index])
+    }
+
+    pub fn value_v120(&self, axis: u32) -> f64 {
+        Self::axis_index(axis)
+            .filter(|_| self.has_axis(axis))
+            .map_or(0.0, |index| self.values_v120[index])
+    }
+
+    fn axis_index(axis: u32) -> Option<usize> {
+        (axis < 2).then_some(axis as usize)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -404,12 +475,17 @@ pub struct LibinputDevice {
     pub accel_profile: u32,
     pub left_handed: bool,
     pub left_handed_available: bool,
+    pub scroll_methods: u32,
     pub scroll_method: u32,
     pub scroll_default_method: u32,
     pub scroll_button: u32,
     pub scroll_default_button: u32,
     pub scroll_button_lock: u32,
+    pub click_methods: u32,
     pub click_method: u32,
+    pub click_default_method: u32,
+    pub clickfinger_button_map: u32,
+    pub clickfinger_default_button_map: u32,
     pub middle_emulation_available: bool,
     pub middle_emulation: bool,
     pub middle_emulation_default: bool,
@@ -487,12 +563,17 @@ impl LibinputDevice {
             accel_profile: 2,
             left_handed: false,
             left_handed_available: false,
+            scroll_methods: 0,
             scroll_method: 2,
             scroll_default_method: 2,
             scroll_button: 0,
             scroll_default_button: 0,
             scroll_button_lock: 0,
-            click_method: 1,
+            click_methods: 0,
+            click_method: 0,
+            click_default_method: 0,
+            clickfinger_button_map: 0,
+            clickfinger_default_button_map: 0,
             middle_emulation_available: false,
             middle_emulation: false,
             middle_emulation_default: false,

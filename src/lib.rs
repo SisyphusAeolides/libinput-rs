@@ -562,10 +562,7 @@ pub unsafe extern "C" fn libinput_event_pointer_get_axis_value(
         return 0.0;
     }
     if let EventPayload::PointerAxis(e) = &(*event).payload {
-        if e.axis != axis {
-            return 0.0;
-        }
-        e.value
+        e.value(axis)
     } else {
         0.0
     }
@@ -580,10 +577,7 @@ pub unsafe extern "C" fn libinput_event_pointer_get_axis_value_discrete(
         return 0.0;
     }
     if let EventPayload::PointerAxis(e) = &(*event).payload {
-        if e.axis != axis {
-            return 0.0;
-        }
-        e.value_discrete as f64
+        e.value_discrete(axis) as f64
     } else {
         0.0
     }
@@ -611,7 +605,7 @@ pub unsafe extern "C" fn libinput_event_pointer_has_axis(
     if event.is_null() {
         return 0;
     }
-    matches!(&(*event).payload, EventPayload::PointerAxis(e) if e.axis == axis) as libc::c_int
+    matches!(&(*event).payload, EventPayload::PointerAxis(e) if e.has_axis(axis)) as libc::c_int
 }
 
 // ---------------------------------------------------------------------------
@@ -1594,7 +1588,7 @@ pub unsafe extern "C" fn libinput_device_config_scroll_set_natural_scroll_enable
     dev: *mut LibinputDevice,
     enabled: libc::c_int,
 ) -> u32 {
-    if dev.is_null() {
+    if dev.is_null() || !(*dev).has_pointer {
         return 1;
     }
     (*dev).natural_scroll = enabled != 0;
@@ -1613,9 +1607,12 @@ pub unsafe extern "C" fn libinput_device_config_scroll_get_natural_scroll_enable
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_scroll_get_default_natural_scroll_enabled(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> libc::c_int {
-    0
+    if dev.is_null() {
+        return 0;
+    }
+    ((*dev).scroll_methods & 2 != 0 && (*dev).vendor_id == 0x05ac) as libc::c_int
 }
 
 // ---------------------------------------------------------------------------
@@ -1672,14 +1669,7 @@ pub unsafe extern "C" fn libinput_device_config_scroll_get_methods(
     if dev.is_null() {
         return 0;
     }
-    let mut methods = 0;
-    if (*dev).has_touch || (*dev).has_gesture {
-        methods |= 0b011;
-    }
-    if (*dev).supports_button_scroll {
-        methods |= 0b100;
-    }
-    methods
+    (*dev).scroll_methods
 }
 
 #[no_mangle]
@@ -1690,8 +1680,22 @@ pub unsafe extern "C" fn libinput_device_config_scroll_set_method(
     if dev.is_null() {
         return 1;
     }
-    if method & !libinput_device_config_scroll_get_methods(dev) != 0 {
+    if !matches!(method, 0 | 1 | 2 | 4) {
+        return 2;
+    }
+    if method != 0 && method & (*dev).scroll_methods == 0 {
         return 1;
+    }
+    if (*dev).scroll_method == method {
+        return 0;
+    }
+    let ctx = (*dev).context;
+    if !ctx.is_null() {
+        let mut events = std::collections::VecDeque::new();
+        if let Ok(mut backend) = (*ctx).backend.try_lock() {
+            backend.stop_scroll_for_device(ctx, dev, &mut events);
+        }
+        (*ctx).event_queue.extend(events);
     }
     (*dev).scroll_method = method;
     0
@@ -1724,18 +1728,24 @@ pub unsafe extern "C" fn libinput_device_config_scroll_set_button(
     button: u32,
 ) -> u32 {
     if dev.is_null() || !(*dev).supports_button_scroll {
-        1
-    } else {
-        (*dev).scroll_button = button;
-        0
+        return 1;
     }
+    if button != 0
+        && (u16::try_from(button)
+            .ok()
+            .is_none_or(|button| !(*dev).event_codes.contains(&button)))
+    {
+        return 2;
+    }
+    (*dev).scroll_button = button;
+    0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_scroll_get_button(
     dev: *const LibinputDevice,
 ) -> u32 {
-    if dev.is_null() {
+    if dev.is_null() || !(*dev).supports_button_scroll {
         0
     } else {
         (*dev).scroll_button
@@ -1747,14 +1757,11 @@ pub unsafe extern "C" fn libinput_device_config_scroll_set_button_lock(
     dev: *mut LibinputDevice,
     state: u32,
 ) -> u32 {
-    if dev.is_null() {
+    if dev.is_null() || !(*dev).supports_button_scroll {
         return 1;
     }
     if state > 1 {
         return 2;
-    }
-    if !(*dev).supports_button_scroll {
-        return 1;
     }
     (*dev).scroll_button_lock = state;
     0
@@ -1764,7 +1771,7 @@ pub unsafe extern "C" fn libinput_device_config_scroll_set_button_lock(
 pub unsafe extern "C" fn libinput_device_config_scroll_get_button_lock(
     dev: *const LibinputDevice,
 ) -> u32 {
-    if dev.is_null() {
+    if dev.is_null() || !(*dev).supports_button_scroll {
         0
     } else {
         (*dev).scroll_button_lock
@@ -1789,11 +1796,7 @@ pub unsafe extern "C" fn libinput_device_config_click_get_methods(
     if dev.is_null() {
         return 0;
     }
-    if (*dev).has_pointer {
-        0b11
-    } else {
-        0
-    }
+    (*dev).click_methods
 }
 
 #[no_mangle]
@@ -1802,6 +1805,12 @@ pub unsafe extern "C" fn libinput_device_config_click_set_method(
     method: u32,
 ) -> u32 {
     if dev.is_null() {
+        return 1;
+    }
+    if !matches!(method, 0 | 1 | 2) {
+        return 2;
+    }
+    if method != 0 && method & (*dev).click_methods == 0 {
         return 1;
     }
     (*dev).click_method = method;
@@ -1820,34 +1829,53 @@ pub unsafe extern "C" fn libinput_device_config_click_get_method(
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_click_get_default_method(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    1
+    if dev.is_null() {
+        0
+    } else {
+        (*dev).click_default_method
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_click_set_clickfinger_button_map(
     dev: *mut LibinputDevice,
-    _map: u32,
+    map: u32,
 ) -> u32 {
     if dev.is_null() {
         return 1;
     }
-    1
+    if !matches!(map, 0 | 1) {
+        return 2;
+    }
+    if (*dev).click_methods & 2 == 0 {
+        return 1;
+    }
+    (*dev).clickfinger_button_map = map;
+    0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_click_get_clickfinger_button_map(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    0
+    if dev.is_null() || (*dev).click_methods & 2 == 0 {
+        0
+    } else {
+        (*dev).clickfinger_button_map
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_click_get_default_clickfinger_button_map(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    0
+    if dev.is_null() || (*dev).click_methods & 2 == 0 {
+        0
+    } else {
+        (*dev).clickfinger_default_button_map
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2442,7 +2470,7 @@ pub unsafe extern "C" fn libinput_device_config_rotation_get_default_angle(
 pub unsafe extern "C" fn libinput_device_config_scroll_get_default_button(
     dev: *const LibinputDevice,
 ) -> u32 {
-    if dev.is_null() {
+    if dev.is_null() || !(*dev).supports_button_scroll {
         0
     } else {
         (*dev).scroll_default_button
@@ -2827,9 +2855,7 @@ pub unsafe extern "C" fn libinput_event_pointer_get_scroll_value_v120(
         return 0.0;
     }
     if let EventPayload::PointerAxis(e) = &(*event).payload {
-        if e.axis == axis {
-            return e.value_v120;
-        }
+        return e.value_v120(axis);
     }
     0.0
 }

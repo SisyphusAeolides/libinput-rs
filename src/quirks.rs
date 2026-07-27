@@ -12,6 +12,9 @@ struct Section {
     model_lenovo_scrollpoint: bool,
     model_alps_serial_touchpad: bool,
     model_dell_canvas_totem: bool,
+    model_apple_touchpad: bool,
+    model_apple_touchpad_onebutton: bool,
+    model_clickfinger_default: bool,
 }
 
 struct DeviceIdentity<'a> {
@@ -36,6 +39,9 @@ pub struct AppliedQuirks {
     pub model_lenovo_scrollpoint: bool,
     pub model_alps_serial_touchpad: bool,
     pub model_dell_canvas_totem: bool,
+    pub model_apple_touchpad: bool,
+    pub model_apple_touchpad_onebutton: bool,
+    pub model_clickfinger_default: bool,
 }
 
 pub fn apply_quirks(
@@ -125,6 +131,19 @@ fn apply_file(
             section.model_alps_serial_touchpad = value.trim() == "1";
         } else if key.trim() == "ModelDellCanvasTotem" {
             section.model_dell_canvas_totem = value.trim() == "1";
+        } else if key.trim() == "ModelAppleTouchpad" {
+            section.model_apple_touchpad = value.trim() == "1";
+        } else if key.trim() == "ModelAppleTouchpadOneButton" {
+            section.model_apple_touchpad_onebutton = value.trim() == "1";
+        } else if matches!(
+            key.trim(),
+            "ModelChromebook"
+                | "ModelSystem76Bonobo"
+                | "ModelSystem76Galago"
+                | "ModelSystem76Kudu"
+                | "ModelClevoW740SU"
+        ) {
+            section.model_clickfinger_default = value.trim() == "1";
         }
     }
     if in_section {
@@ -215,6 +234,9 @@ fn apply_section(
     applied.model_lenovo_scrollpoint |= section.model_lenovo_scrollpoint;
     applied.model_alps_serial_touchpad |= section.model_alps_serial_touchpad;
     applied.model_dell_canvas_totem |= section.model_dell_canvas_totem;
+    applied.model_apple_touchpad |= section.model_apple_touchpad;
+    applied.model_apple_touchpad_onebutton |= section.model_apple_touchpad_onebutton;
+    applied.model_clickfinger_default |= section.model_clickfinger_default;
 }
 
 fn match_property(key: &str, value: &str, identity: &DeviceIdentity<'_>) -> bool {
