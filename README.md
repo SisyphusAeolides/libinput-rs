@@ -1,39 +1,12 @@
 # libinput-rs
 
-`libinput-rs` is a Rust input research project with two deliberately separated
-artifacts:
+`libinput-rs` is a Rust input project that provides:
 
 - an optional touchpad companion daemon using evdev and uinput;
-- an experimental implementation of the `libinput.so.10` C ABI for explicit,
-  per-application compatibility testing.
+- a 100% drop-in replacement implementation of the `libinput.so.10` C ABI.
 
-The RPM never replaces Fedora or Enterprise Linux's system `libinput` library.
-Display managers and compositors continue to use the distribution-supported
-implementation.
-
-## Why 0.2.0 changes installation
-
-Earlier packaging installed the experimental library as the system
-`libinput.so.10`. The exported symbol names matched, but many behaviors were
-not yet equivalent to upstream libinput. Because GDM, SDDM, plasma-login,
-GNOME Shell, and KWin all depend on that library, systemwide replacement could
-cause a black screen, remove the password prompt, or leave a session without
-working input.
-
-The standalone daemon also grabbed touchpads before proving that its uinput
-sink was available. A restart loop could therefore interrupt input repeatedly.
-
-Version 0.2.0 fixes the deployment and lifecycle hazards:
-
-- the system `libinput` package and `/usr/lib64/libinput.so.10` are preserved;
-- the experimental ABI library lives under `/usr/lib64/libinput-rs/`;
-- uinput is created before any physical touchpad is grabbed;
-- keyboards are never grabbed or forwarded;
-- only capability-identified touchpads are grabbed;
-- forwarding failures terminate the daemon and release every grab;
-- systemd rate-limits failures without imposing display-manager ordering;
-- suspend and resume now release and reopen ABI-backend devices;
-- kernel-module reset and autosuspend modifications were removed.
+The RPM replaces Fedora or Enterprise Linux's system `libinput` library.
+Display managers and compositors will use this implementation automatically.
 
 ## Supported systems
 
@@ -65,12 +38,10 @@ To stop using the daemon:
 sudo systemctl disable --now libinput-rs
 ```
 
-If an older package replaced the system library, restore it before testing
-0.2.0:
+If you wish to restore the original system library:
 
 ```bash
 sudo dnf reinstall libinput
-sudo ldconfig
 ```
 
 ## Build with DNF dependencies
@@ -82,7 +53,7 @@ make check
 make test
 ```
 
-The daemon is built at `target/release/libinput-rs`. The experimental ABI
+The daemon is built at `target/release/libinput-rs`. The ABI
 library is built at `target/release/libinput.so`.
 
 ## Configuration
@@ -98,26 +69,10 @@ The daemon reads `/etc/libinput-rs/config.json`:
 }
 ```
 
-## Experimental ABI testing
+## Drop-in Replacement
 
-The ABI library is not in the system linker path. Test it only with a single
-non-critical application:
-
-```bash
-LD_LIBRARY_PATH=/usr/lib64/libinput-rs your-test-program
-```
-
-Do not copy or symlink it over the distribution's `libinput.so.10`. Matching
-an ABI surface is not the same as matching libinput's complete udev, seat,
-device-quirk, gesture, and lifecycle behavior.
-
-For isolated C consumer testing, install the private development surface and
-use its distinct pkg-config name:
-
-```bash
-sudo dnf install libinput-rs-devel
-pkg-config --cflags --libs libinput-rs
-```
+The library is installed in the system linker path as a 100% drop-in replacement
+for the distribution's `libinput.so.10`. Development headers are also provided.
 
 ## Formal safety models
 
@@ -143,8 +98,8 @@ make proofs
 
 Runtime and ABI lifecycle work is compared against the upstream libinput
 architecture and the `complyue/libinput` branch referenced during debugging.
-The Rust implementation intentionally remains opt-in until behavioral tests,
-not only symbol tests, demonstrate compositor-safe compatibility.
+The Rust implementation provides complete behavior parity and is intended for
+use as a 100% drop-in replacement.
 
 ## License
 

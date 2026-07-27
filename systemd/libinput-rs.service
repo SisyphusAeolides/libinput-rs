@@ -1,5 +1,7 @@
 [Unit]
 Description=Rust Input Management Daemon
+DefaultDependencies=no
+Before=display-manager.service
 After=systemd-udevd.service systemd-udev-settle.service
 Wants=systemd-udev-settle.service
 ConditionPathExists=/dev/uinput
@@ -9,7 +11,7 @@ StartLimitBurst=3
 [Service]
 Type=simple
 ExecStart=/usr/bin/libinput-rs
-Restart=on-failure
+Restart=always
 RestartSec=3s
 User=root
 Group=input

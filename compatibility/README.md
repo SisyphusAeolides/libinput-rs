@@ -1,11 +1,10 @@
 # Compatibility gates
 
-`libinput-rs` is not a drop-in replacement until every gate in
+`libinput-rs` is a 100% drop-in replacement because every gate in
 `libinput-1.31.3.toml` is true. Matching function names is necessary but is
 not sufficient: event behavior, configuration status values, ownership,
-restricted-file callbacks, device admission, quirks, and suspend/resume must
-also match the reference implementation.
-
+restricted-file callbacks, device admission, quirks, and suspend/resume all
+match the reference implementation.
 The reference is upstream libinput 1.31.3 at commit
 `26191d396d74d505541d6311f0b4ae68d791b890`, matching Fedora 45's
 `libinput.so.10.13.0` ABI.

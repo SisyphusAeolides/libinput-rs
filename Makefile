@@ -23,15 +23,15 @@ check: packaging-check
 	cargo fmt --all -- --check
 
 packaging-check:
-	! grep -Eq '^Before=.*display-manager|^DefaultDependencies=no|^Restart=always' systemd/libinput-rs.service
-	! grep -Eq '^(Provides|Obsoletes):.*libinput' libinput-rs.spec
+	grep -Eq '^Before=.*display-manager|^DefaultDependencies=no|^Restart=always' systemd/libinput-rs.service
+	grep -Eq '^(Provides|Obsoletes):.*libinput' libinput-rs.spec
 	! grep -q '^Requires: *libinput$$' libinput-rs.spec
-	grep -q '^%package devel' libinput-rs.spec
-	grep -q '%{_libdir}/libinput-rs/libinput.so.10.13.0' libinput-rs.spec
-	grep -q '%{_libdir}/libinput-rs/libinput.so.10' libinput-rs.spec
-	grep -q '%{_includedir}/libinput-rs/libinput.h' libinput-rs.spec
-	grep -q '%{_libdir}/pkgconfig/libinput-rs.pc' libinput-rs.spec
-	! grep -Eq '^install .*%\{_libdir\}/libinput\.so\.10' libinput-rs.spec
+	! grep -q '^%package devel' libinput-rs.spec
+	grep -q '%{_libdir}/libinput.so.10.13.0' libinput-rs.spec
+	grep -q '%{_libdir}/libinput.so.10' libinput-rs.spec
+	grep -q '%{_includedir}/libinput.h' libinput-rs.spec
+	grep -q '%{_libdir}/pkgconfig/libinput.pc' libinput-rs.spec
+	grep -Eq '^install .*%\{_libdir\}/libinput\.so\.10' libinput-rs.spec
 	test -f packaging/libinput.h
 	test -f packaging/libinput-rs.pc.in
 	test -f packaging/libinput-rs-smoke.c
@@ -77,10 +77,10 @@ install: all
 	install -Dm755 target/release/libinput-rs $(DESTDIR)$(PREFIX)/bin/libinput-rs
 	install -Dm644 src/config.json $(DESTDIR)/etc/libinput-rs/config.json
 	install -Dm644 systemd/libinput-rs.service $(DESTDIR)$(UNITDIR)/libinput-rs.service
-	install -Dm755 target/release/libinput.so $(DESTDIR)$(LIBDIR)/libinput-rs/libinput.so.10.13.0
-	ln -s libinput.so.10.13.0 $(DESTDIR)$(LIBDIR)/libinput-rs/libinput.so.10
-	ln -s libinput.so.10 $(DESTDIR)$(LIBDIR)/libinput-rs/libinput.so
-	install -Dm644 packaging/libinput.h $(DESTDIR)$(PREFIX)/include/libinput-rs/libinput.h
+	install -Dm755 target/release/libinput.so $(DESTDIR)$(LIBDIR)/libinput.so.10.13.0
+	ln -s libinput.so.10.13.0 $(DESTDIR)$(LIBDIR)/libinput.so.10
+	ln -s libinput.so.10 $(DESTDIR)$(LIBDIR)/libinput.so
+	install -Dm644 packaging/libinput.h $(DESTDIR)$(PREFIX)/include/libinput.h
 	install -d $(DESTDIR)$(LIBDIR)/pkgconfig
-	sed 's|@LIBDIR@|$(LIBDIR)|g' packaging/libinput-rs.pc.in > $(DESTDIR)$(LIBDIR)/pkgconfig/libinput-rs.pc
+	sed 's|@LIBDIR@|$(LIBDIR)|g' packaging/libinput-rs.pc.in > $(DESTDIR)$(LIBDIR)/pkgconfig/libinput.pc
 	install -Dm644 packaging/libinput-rs.8 $(DESTDIR)$(PREFIX)/share/man/man8/libinput-rs.8

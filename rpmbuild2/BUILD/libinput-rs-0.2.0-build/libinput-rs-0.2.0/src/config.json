@@ -1,0 +1,6 @@
+{
+  "tap_to_click": true,
+  "natural_scrolling": true,
+  "pointer_acceleration": 1.0,
+  "disable_while_typing": true
+}

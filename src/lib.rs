@@ -3607,8 +3607,9 @@ pub unsafe extern "C" fn libinput_plugin_system_append_path(
 #[no_mangle]
 pub unsafe extern "C" fn libinput_plugin_system_load_plugins(
     _ctx: *mut LibinputContext,
+    _flags: libc::c_uint,
 ) -> libc::c_int {
-    0
+    -libc::ENOSYS
 }
 
 #[no_mangle]

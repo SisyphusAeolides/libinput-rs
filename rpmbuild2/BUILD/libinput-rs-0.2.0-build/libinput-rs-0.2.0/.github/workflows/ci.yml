@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-rpm:
+    name: Rust and RPM
+    runs-on: ubuntu-latest
+    container: fedora:44
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install DNF dependencies
+        run: >-
+          dnf -y install Agda idris2 cpio elfutils gcc gcc-gfortran libwacom-devel make
+          pkgconf-pkg-config rust cargo clippy rustfmt binutils rpm-build rpmdevtools rpmlint
+          systemd-devel systemd-rpm-macros
+
+      - name: Run Rust, proof, and shared-library gates
+        run: make check test proofs-strict shared
+
+      - name: Compare ABI against system libinput when available
+        run: |
+          if test -r /usr/lib64/libinput.so.10; then
+            make abi-check REFERENCE_LIBINPUT=/usr/lib64/libinput.so.10
+          else
+            echo "System libinput reference is unavailable; skipping ABI comparison."
+          fi
+
+      - name: Dry-run crate package and list contents
+        run: make crate-package-check
+
+      - name: Verify ABI isolation
+        run: |
+          test "$(readelf -d target/release/libinput.so | sed -n 's/.*SONAME.*\[\(.*\)\]/\1/p')" = "libinput.so.10"
+          objdump -T target/release/libinput.so | grep -q 'LIBINPUT_0.12.0.*libinput_get_fd'
+          test -z "$(nm -D target/release/libinput.so | grep -E ' T (rust_|__rd)' || true)"
+
+      - name: Build and inspect RPMs
+        run: |
+          mkdir -p "$PWD/rpmbuild/SOURCES" "$PWD/rpmbuild/SRPMS" "$PWD/rpmbuild/RPMS"
+          package_name=$(rpmspec -q --srpm --qf '%{NAME}' libinput-rs.spec)
+          package_version=$(rpmspec -q --srpm --qf '%{VERSION}' libinput-rs.spec)
+          git archive --format=tar.gz --prefix="$package_name-$package_version/" \
+            --output="$PWD/rpmbuild/SOURCES/$package_name-$package_version.tar.gz" HEAD
+          rpmbuild -bs libinput-rs.spec --define "_topdir $PWD/rpmbuild"
+          rpmbuild --rebuild "$PWD"/rpmbuild/SRPMS/*.src.rpm --define "_topdir $PWD/rpmbuild"
+          runtime_package=$(find "$PWD/rpmbuild/RPMS" -name 'libinput-rs-[0-9]*.rpm' -print -quit)
+          devel_package=$(find "$PWD/rpmbuild/RPMS" -name 'libinput-rs-devel-[0-9]*.rpm' -print -quit)
+          test -n "$runtime_package"
+          test -n "$devel_package"
+          make rpm-devel-check RPM_RUNTIME="$runtime_package" RPM_DEVEL="$devel_package"
+          rpmlint "$runtime_package" "$devel_package"
+
+  proofs:
+    name: Safety proofs
+    runs-on: ubuntu-latest
+    container: fedora:44
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install proof compilers
+        run: dnf -y install Agda idris2 gcc-gfortran make
+
+      - name: Check Agda, Idris, and Fortran models
+        run: make proofs-strict
