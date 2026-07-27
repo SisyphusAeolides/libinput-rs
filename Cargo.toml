@@ -1,3 +1,7 @@
+[workspace]
+members = ["compat/evdev"]
+resolver = "2"
+
 [package]
 name = "libinput-rs"
 version = "0.2.0"
