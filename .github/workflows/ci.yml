@@ -70,7 +70,18 @@ jobs:
             | grep -Eq '/(vendor|\.cargo|rpmbuild)'
 
       - name: Package main crate
-        run: cargo package --locked --no-verify --package libinput-rs
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo package --locked --no-verify --package libinput-rs 2>&1 \
+            | tee main-crate-package.txt
+
+      - name: Upload main crate package log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: main-crate-package-log
+          path: main-crate-package.txt
 
       - name: Inspect main crate contents
         run: |
