@@ -41,14 +41,19 @@ chmod 600 ~/.config/copr
 copr-cli whoami
 ```
 
-Create the project if it does not already exist:
+Create the project if it does not already exist. Fedora 45 is currently the
+rawhide target in COPR, so publish against Fedora 44 and Fedora rawhide:
 
 ```bash
 copr-cli create libinput-rs \
-  --chroot fedora-45-x86_64 \
+  --chroot fedora-44-x86_64 \
+  --chroot fedora-rawhide-x86_64 \
   --description "Rust drop-in replacement for libinput" \
   --instructions "Test from a text console or SSH session and keep the companion daemon disabled until the ABI replacement is confirmed."
 ```
+
+EPEL and RHEL chroots are not enabled because they do not provide the libwacom
+ABI required by this implementation.
 
 Submit the source RPM:
 
