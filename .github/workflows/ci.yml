@@ -92,6 +92,12 @@ jobs:
           rpm -qp --provides "$RPM_PACKAGE"
           rpm -qp --obsoletes "$RPM_PACKAGE"
 
+      - name: Upload binary RPM
+        uses: actions/upload-artifact@v4
+        with:
+          name: libinput-rs-rpm
+          path: ${{ env.RPM_PACKAGE }}
+
       - name: Verify RPM payload
         run: make rpm-check RPM_PACKAGE="$RPM_PACKAGE"
 
