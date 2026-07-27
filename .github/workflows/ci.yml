@@ -17,20 +17,28 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install DNF dependencies
         run: >-
-          dnf -y install rust cargo clippy rustfmt gcc make binutils rpm-build
-          rpmdevtools rpmlint systemd-devel systemd-rpm-macros
+          dnf -y install Agda idris2 cpio elfutils gcc gcc-gfortran libwacom-devel make
+          pkgconf-pkg-config rust cargo clippy rustfmt binutils rpm-build rpmdevtools rpmlint
+          systemd-devel systemd-rpm-macros
 
-      - name: Check Rust
-        run: make check
+      - name: Run Rust, proof, and shared-library gates
+        run: make check test proofs-strict shared
 
-      - name: Test Rust
-        run: make test
+      - name: Compare ABI against system libinput when available
+        run: |
+          if test -r /usr/lib64/libinput.so.10; then
+            make abi-check REFERENCE_LIBINPUT=/usr/lib64/libinput.so.10
+          else
+            echo "System libinput reference is unavailable; skipping ABI comparison."
+          fi
 
-      - name: Build artifacts
-        run: make all
+      - name: Dry-run crate package and list contents
+        run: make crate-package-check
 
       - name: Verify ABI isolation
         run: |
@@ -41,17 +49,18 @@ jobs:
       - name: Build and inspect RPMs
         run: |
           mkdir -p "$PWD/rpmbuild/SOURCES" "$PWD/rpmbuild/SRPMS" "$PWD/rpmbuild/RPMS"
-          git archive --format=tar.gz --prefix=libinput-rs-0.2.0/ --output="$PWD/rpmbuild/SOURCES/libinput-rs-0.2.0.tar.gz" HEAD
+          package_name=$(rpmspec -q --srpm --qf '%{NAME}' libinput-rs.spec)
+          package_version=$(rpmspec -q --srpm --qf '%{VERSION}' libinput-rs.spec)
+          git archive --format=tar.gz --prefix="$package_name-$package_version/" \
+            --output="$PWD/rpmbuild/SOURCES/$package_name-$package_version.tar.gz" HEAD
           rpmbuild -bs libinput-rs.spec --define "_topdir $PWD/rpmbuild"
           rpmbuild --rebuild "$PWD"/rpmbuild/SRPMS/*.src.rpm --define "_topdir $PWD/rpmbuild"
-          package=$(find "$PWD/rpmbuild/RPMS" -name 'libinput-rs-[0-9]*.rpm' -print -quit)
-          test -n "$package"
-          rpm -qp --provides "$package" | grep -q '^libinput-rs = '
-          ! rpm -qp --provides "$package" | grep -q 'libinput\.so\.10'
-          rpm -qpl "$package" | grep -q '/libinput-rs/libinput\.so\.10$'
-          ! rpm -qpl "$package" | grep -q '/libinput\.so\.10$'
-          rpm -qp --requires "$package" | grep -q '/libinput\.so\.10$'
-          rpmlint "$package"
+          runtime_package=$(find "$PWD/rpmbuild/RPMS" -name 'libinput-rs-[0-9]*.rpm' -print -quit)
+          devel_package=$(find "$PWD/rpmbuild/RPMS" -name 'libinput-rs-devel-[0-9]*.rpm' -print -quit)
+          test -n "$runtime_package"
+          test -n "$devel_package"
+          make rpm-devel-check RPM_RUNTIME="$runtime_package" RPM_DEVEL="$devel_package"
+          rpmlint "$runtime_package" "$devel_package"
 
   proofs:
     name: Safety proofs

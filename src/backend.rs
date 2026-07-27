@@ -5,7 +5,7 @@
 //! motion/scroll/DWT/tap/pinch/keyboard logic, and appends finished
 //! LibinputEvents to a caller-supplied queue.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -49,6 +49,7 @@ extern "C" {
         tool_id: libc::c_int,
     ) -> *const libc::c_void;
     fn libwacom_stylus_get_name(stylus: *const libc::c_void) -> *const libc::c_char;
+    #[allow(dead_code)]
     fn libwacom_stylus_is_generic(stylus: *const libc::c_void) -> libc::c_int;
     fn libwacom_stylus_has_eraser(stylus: *const libc::c_void) -> libc::c_int;
     fn libwacom_stylus_get_eraser_type(stylus: *const libc::c_void) -> libc::c_int;
@@ -164,7 +165,12 @@ struct MtSlot {
     active: bool,
     reported: bool,
     dirty: bool,
+    began_this_frame: bool,
+    dwt_released_this_frame: bool,
     palm_suppressed: bool,
+    generic_palm: Option<GenericPalmKind>,
+    dwt_palm: Option<DwtPalmKind>,
+    dwt_palm_started_usec: Option<u64>,
     cancel_pending: bool,
     button_area_classification_pending: bool,
     button_area_excluded: bool,
@@ -189,22 +195,124 @@ struct MtSlot {
     tool_type: i32,
     x: f64,
     y: f64,
+    pressure: f64,
+    touch_major: f64,
+    touch_minor: f64,
     distance: f64, // ABS_MT_DISTANCE (for stylus / palm)
 }
 
-// ---------------------------------------------------------------------------
-// Key-repeat tracking
-// ---------------------------------------------------------------------------
+/// Why a touch contact was ignored by the touchpad's typing/trackpoint palm
+/// detection. Keeping this separate from the generic palm flag is essential:
+/// a contact may be released after the relevant activity timer expires only
+/// when it began after the last keyboard or trackpoint event.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DwtPalmKind {
+    Typing,
+    Trackpoint,
+}
 
-const REPEAT_DELAY_MS: u64 = 200;
-const REPEAT_INTERVAL_MS: u64 = 25;
+/// Palm classifications that remain in effect for the lifetime of a
+/// contact. They are intentionally distinct from the timeout-based DWT/DWTP
+/// state, which may be released by a later contact update.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GenericPalmKind {
+    Pressure,
+    Size,
+}
+
+#[derive(Default)]
+struct DwtRuntime {
+    paired_keyboards: HashSet<RawFd>,
+    pressed_keys: HashSet<u16>,
+    modifier_keys: HashSet<u16>,
+    active: bool,
+    deadline: Option<Instant>,
+    active_started_usec: Option<u64>,
+    deadline_usec: Option<u64>,
+    last_key_press_usec: Option<u64>,
+    event_clock_anchor_at: Option<Instant>,
+    event_clock_anchor_usec: Option<u64>,
+}
+
+#[derive(Default)]
+struct DwtpRuntime {
+    paired_trackpoint: Option<RawFd>,
+    event_count: u32,
+    active: bool,
+    deadline: Option<Instant>,
+    active_started_usec: Option<u64>,
+    deadline_usec: Option<u64>,
+    last_event_usec: Option<u64>,
+}
+
+fn estimate_event_time(
+    anchor_at: Option<Instant>,
+    anchor_usec: Option<u64>,
+    now: Instant,
+) -> Option<u64> {
+    let (Some(anchor_at), Some(anchor_usec)) = (anchor_at, anchor_usec) else {
+        return None;
+    };
+    Some(anchor_usec.saturating_add(now.saturating_duration_since(anchor_at).as_micros() as u64))
+}
+
+#[derive(Clone, Copy)]
+struct DwtPairingInfo {
+    fd: RawFd,
+    is_touchpad: bool,
+    touchpad_is_external: bool,
+    is_dwt_keyboard: bool,
+    keyboard_internal: bool,
+    is_pointing_stick: bool,
+    vendor_id: u16,
+    product_id: u16,
+    bus_type: u16,
+}
+
+enum DwtFollowup {
+    Keyboard {
+        source_fd: RawFd,
+        code: u16,
+        value: i32,
+        at: Instant,
+        time_usec: u64,
+    },
+    TrackpointActivity {
+        source_fd: RawFd,
+        at: Instant,
+        time_usec: u64,
+    },
+}
+
+fn dwt_key_is_shift(code: u16) -> bool {
+    matches!(code, 42 | 54) // KEY_LEFTSHIFT, KEY_RIGHTSHIFT
+}
+
+fn dwt_key_is_modifier(code: u16) -> bool {
+    matches!(
+        code,
+        29 | 97 // Ctrl
+            | 56 | 100 // Alt
+            | 42 | 54 // Shift
+            | 464 // Fn
+            | 58 // Caps Lock
+            | 15 // Tab
+            | 127 // Compose
+            | 125 | 126 // Meta
+    )
+}
+
+fn dwt_key_is_ignored(code: u16) -> bool {
+    if dwt_key_is_modifier(code) {
+        return false;
+    }
+    // KEY_ESC, KEY_KPASTERISK, then the complete F-key/media/numpad range.
+    matches!(code, 1 | 55) || code >= 59
+}
 
 #[derive(Clone)]
 struct HeldKey {
     code: u16,
-    ts_usec: u64,
-    last_fire: Instant,
-    initial_fired: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -222,10 +330,17 @@ struct TrackedDevice {
     mt_x_fuzz: i32,
     mt_y_fuzz: i32,
     is_keyboard: bool,
+    is_dwt_keyboard: bool,
+    keyboard_internal: bool,
     is_pointer: bool,
+    is_touchpad: bool,
+    touchpad_is_external: bool,
     is_clickpad: bool,
     is_topbuttonpad: bool,
     is_pointing_stick: bool,
+    vendor_id: u16,
+    product_id: u16,
+    bus_type: u16,
     supports_hi_res_vertical: bool,
     supports_hi_res_horizontal: bool,
     warned_missing_hi_res_vertical: bool,
@@ -286,6 +401,10 @@ struct TrackedDevice {
     axis_range_warning_at: Option<Instant>,
     touch_arbitration_suppressed: bool,
     touch_arbitration_tablet_was_active: bool,
+    touchpad_left_handed_applied: bool,
+    touchpad_left_handed_sequence_active: bool,
+    palm_pressure_threshold: Option<f64>,
+    palm_size_threshold: Option<f64>,
     tap_emitted: bool,
     tap_button_down: Option<u16>,
     tap_release_since: Option<Instant>,
@@ -396,6 +515,7 @@ struct TrackedDevice {
     swipe_active: bool,
     swipe_fingers: i32,
     mt_contact_count_changed: bool,
+    gesture_fingers_last: usize,
     pinch_base_centroid: Option<(f64, f64)>,
     gesture_last_centroid: Option<(f64, f64)>,
     hold_started_at: Option<Instant>,
@@ -413,8 +533,9 @@ struct TrackedDevice {
     held_keys: Vec<HeldKey>,
     held_buttons: Vec<u16>,
 
-    // --- DWT modifier state ---
-    last_typing_time: Option<Instant>,
+    // --- per-touchpad typing and pointing-stick suppression ---
+    dwt: DwtRuntime,
+    dwtp: DwtpRuntime,
 
     // libinput device pointer (context owns the allocation)
     lib_device: *mut LibinputDevice,
@@ -628,6 +749,179 @@ struct DebounceButton {
 }
 
 impl TrackedDevice {
+    fn dwt_pairing_info(&self, fd: RawFd) -> DwtPairingInfo {
+        DwtPairingInfo {
+            fd,
+            is_touchpad: self.is_touchpad,
+            touchpad_is_external: self.touchpad_is_external,
+            is_dwt_keyboard: self.is_dwt_keyboard,
+            keyboard_internal: self.keyboard_internal,
+            is_pointing_stick: self.is_pointing_stick,
+            vendor_id: self.vendor_id,
+            product_id: self.product_id,
+            bus_type: self.bus_type,
+        }
+    }
+
+    unsafe fn dwt_palm_for_new_touch(&self, time_usec: u64) -> Option<DwtPalmKind> {
+        let typing_active_at_touch = self.dwt.active
+            && (time_usec == 0
+                || (match self.dwt.active_started_usec {
+                    Some(started) => time_usec >= started,
+                    None => true,
+                } && match self.dwt.deadline_usec {
+                    Some(deadline) => time_usec <= deadline,
+                    None => true,
+                }));
+        let trackpoint_active_at_touch = self.dwtp.active
+            && (time_usec == 0
+                || (match self.dwtp.active_started_usec {
+                    Some(started) => time_usec >= started,
+                    None => true,
+                } && match self.dwtp.deadline_usec {
+                    Some(deadline) => time_usec <= deadline,
+                    None => true,
+                }));
+        // Configuration changes are non-retroactive: an already-active DWT
+        // interval continues to classify contacts even if it is disabled.
+        if typing_active_at_touch {
+            Some(DwtPalmKind::Typing)
+        } else if trackpoint_active_at_touch {
+            Some(DwtPalmKind::Trackpoint)
+        } else {
+            None
+        }
+    }
+
+    fn mark_dwt_palm(slot: &mut MtSlot, palm: Option<DwtPalmKind>, time_usec: u64) {
+        let Some(palm) = palm else { return };
+        slot.dwt_palm = Some(palm);
+        slot.dwt_palm_started_usec = (time_usec != 0).then_some(time_usec);
+        slot.palm_suppressed = true;
+    }
+
+    /// Re-enable only contacts that started after the final relevant input
+    /// event. This intentionally preserves upstream's long-standing
+    /// distinction between a resting palm and a fresh touch after typing.
+    fn release_expired_dwt_palms(&mut self) {
+        let keyboard_active = self.dwt.active;
+        let keyboard_last_press = self.dwt.last_key_press_usec;
+        let trackpoint_active = self.dwtp.active;
+        let trackpoint_last_event = self.dwtp.last_event_usec;
+        let mut released = false;
+
+        for slot in &mut self.mt_slots {
+            if !slot.active || !slot.dirty {
+                continue;
+            }
+            let last_activity = match slot.dwt_palm {
+                Some(DwtPalmKind::Typing) if !keyboard_active => keyboard_last_press,
+                Some(DwtPalmKind::Trackpoint) if !trackpoint_active => trackpoint_last_event,
+                _ => continue,
+            };
+            let started_after_activity = match (slot.dwt_palm_started_usec, last_activity) {
+                (Some(started), Some(activity)) if started != 0 && activity != 0 => {
+                    started > activity
+                }
+                // An unknown timestamp is handled like upstream's zero
+                // palm timestamp: release it rather than leave it stuck.
+                _ => true,
+            };
+            if !started_after_activity {
+                continue;
+            }
+            slot.dwt_palm = None;
+            slot.dwt_palm_started_usec = None;
+            slot.dwt_released_this_frame = true;
+            slot.palm_suppressed = slot.generic_palm.is_some()
+                || slot.tool_type == 2
+                || self.touch_arbitration_suppressed;
+            slot.gesture_rebase_pending = false;
+            slot.gesture_position_seen = false;
+            released = true;
+        }
+
+        if released {
+            self.mt_contact_count_changed = true;
+        }
+    }
+
+    /// Apply palm classifications that cannot be released until the contact
+    /// lifts. Upstream checks pressure before (and after) DWT so a contact
+    /// suppressed while typing can transition to a permanent pressure or
+    /// touch-size palm when the typing timeout expires.
+    fn refresh_generic_palms(&mut self) {
+        let pressure_threshold = self.palm_pressure_threshold;
+        let size_threshold = self.palm_size_threshold;
+        let mut palm_detected = false;
+
+        for slot in &mut self.mt_slots {
+            if !slot.active {
+                continue;
+            }
+            // Pressure and size are evaluated before DWT for a fresh touch,
+            // but after DWT for subsequent updates. This preserves the
+            // upstream priority ordering while keeping a typing palm intact
+            // until a later post-timeout update can release it.
+            let began_this_frame = std::mem::take(&mut slot.began_this_frame);
+            let dwt_released_this_frame = std::mem::take(&mut slot.dwt_released_this_frame);
+            if slot.generic_palm.is_some() {
+                slot.palm_suppressed = true;
+                continue;
+            }
+            // A high pressure value is checked before DWT for a new touch.
+            // Touch size, however, is intentionally checked after DWT and
+            // may only take effect once the typing/trackpoint palm releases.
+            if slot.dwt_palm.is_some() {
+                if began_this_frame
+                    && pressure_threshold.is_some_and(|threshold| slot.pressure > threshold)
+                {
+                    // Pressure is evaluated before DWT for a new contact.
+                    // Do not retain a timeout palm that upstream never set.
+                    slot.dwt_palm = None;
+                    slot.dwt_palm_started_usec = None;
+                    slot.generic_palm = Some(GenericPalmKind::Pressure);
+                    slot.palm_suppressed = true;
+                    palm_detected = true;
+                }
+                continue;
+            }
+            if slot.tool_type == 2 || self.touch_arbitration_suppressed {
+                continue;
+            }
+
+            let pressure_palm =
+                pressure_threshold.is_some_and(|threshold| slot.pressure > threshold);
+            let size_palm = size_threshold.is_some_and(|threshold| {
+                slot.touch_major > threshold || slot.touch_minor > threshold
+            });
+            let palm = if dwt_released_this_frame {
+                size_palm
+                    .then_some(GenericPalmKind::Size)
+                    .or_else(|| pressure_palm.then_some(GenericPalmKind::Pressure))
+            } else if pressure_palm {
+                Some(GenericPalmKind::Pressure)
+            } else if size_palm {
+                Some(GenericPalmKind::Size)
+            } else {
+                None
+            };
+            if let Some(palm) = palm {
+                slot.generic_palm = Some(palm);
+                slot.palm_suppressed = true;
+                palm_detected = true;
+            }
+        }
+
+        if palm_detected {
+            // A palm must never produce a deferred tap after it lifts.
+            self.tap_emitted = true;
+            // Rebase gesture/scroll state when an established eligible
+            // contact turns into a palm, just as a contact-count change does.
+            self.mt_contact_count_changed = true;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         device: Device,
@@ -637,10 +931,19 @@ impl TrackedDevice {
         uses_absolute_events: bool,
         is_absolute_pointer: bool,
         is_keyboard: bool,
+        is_dwt_keyboard: bool,
+        keyboard_internal: bool,
         is_pointer: bool,
+        is_touchpad: bool,
+        touchpad_is_external: bool,
+        palm_pressure_threshold: Option<u32>,
+        palm_size_threshold: Option<u32>,
         is_clickpad: bool,
         is_topbuttonpad: bool,
         is_pointing_stick: bool,
+        vendor_id: u16,
+        product_id: u16,
+        bus_type: u16,
     ) -> Self {
         let is_absolute = uses_absolute_events;
         let relative_axes = device.supported_relative_axes();
@@ -848,6 +1151,26 @@ impl TrackedDevice {
                     current_abs_y = Some(mt_slots[0].y as i32);
                 }
             }
+            if let Some(values) = query_slots(AbsoluteAxisCode::ABS_MT_PRESSURE) {
+                for (slot, value) in mt_slots.iter_mut().zip(values) {
+                    slot.pressure = value as f64;
+                }
+            }
+            if let Some(values) = query_slots(AbsoluteAxisCode::ABS_MT_TOUCH_MAJOR) {
+                for (slot, value) in mt_slots.iter_mut().zip(values) {
+                    slot.touch_major = value as f64;
+                }
+            }
+            if let Some(values) = query_slots(AbsoluteAxisCode::ABS_MT_TOUCH_MINOR) {
+                for (slot, value) in mt_slots.iter_mut().zip(values) {
+                    slot.touch_minor = value as f64;
+                }
+            }
+            if let Some(values) = query_slots(AbsoluteAxisCode::ABS_MT_TOOL_TYPE) {
+                for (slot, value) in mt_slots.iter_mut().zip(values) {
+                    slot.tool_type = value;
+                }
+            }
             if let Some(values) = query_slots(AbsoluteAxisCode::ABS_MT_TRACKING_ID) {
                 current_mt_tracking_id = values[0];
             }
@@ -867,10 +1190,17 @@ impl TrackedDevice {
             mt_x_fuzz,
             mt_y_fuzz,
             is_keyboard,
+            is_dwt_keyboard,
+            keyboard_internal,
             is_pointer,
+            is_touchpad,
+            touchpad_is_external,
             is_clickpad,
             is_topbuttonpad,
             is_pointing_stick,
+            vendor_id,
+            product_id,
+            bus_type,
             supports_hi_res_vertical,
             supports_hi_res_horizontal,
             warned_missing_hi_res_vertical: false,
@@ -927,6 +1257,10 @@ impl TrackedDevice {
             axis_range_warning_at: None,
             touch_arbitration_suppressed: false,
             touch_arbitration_tablet_was_active: false,
+            touchpad_left_handed_applied: false,
+            touchpad_left_handed_sequence_active: false,
+            palm_pressure_threshold: palm_pressure_threshold.map(f64::from),
+            palm_size_threshold: palm_size_threshold.map(f64::from),
             tap_emitted: false,
             tap_button_down: None,
             tap_release_since: None,
@@ -1043,6 +1377,7 @@ impl TrackedDevice {
             swipe_active: false,
             swipe_fingers: 0,
             mt_contact_count_changed: false,
+            gesture_fingers_last: 0,
             pinch_base_centroid: None,
             gesture_last_centroid: None,
             hold_started_at: None,
@@ -1057,7 +1392,8 @@ impl TrackedDevice {
             drag_3fg_release_since: None,
             held_keys: Vec::new(),
             held_buttons: Vec::new(),
-            last_typing_time: None,
+            dwt: DwtRuntime::default(),
+            dwtp: DwtpRuntime::default(),
             lib_device,
         }
     }
@@ -1089,16 +1425,28 @@ impl TrackedDevice {
         self.mt_slots.iter().filter(|s| s.active).count()
     }
 
+    /// Whether a contact participates in pointer-motion and gesture state.
+    ///
+    /// Edge-scroll contacts stay outside that state until they are classified
+    /// into the regular touch area. This keeps an edge-scroll timeout from
+    /// arming an unrelated hold gesture.
+    fn gesture_slot_eligible(slot: &MtSlot, button_areas: bool) -> bool {
+        slot.active
+            && !slot.palm_suppressed
+            && slot.edge_state == EdgeScrollState::Area
+            && (!button_areas || !slot.button_area_excluded)
+    }
+
+    fn gesture_tracked_contact_count(&self, button_areas: bool) -> usize {
+        self.mt_slots
+            .iter()
+            .filter(|slot| Self::gesture_slot_eligible(slot, button_areas))
+            .count()
+    }
+
     fn gesture_finger_count(&self, button_areas: bool) -> usize {
         let active = self.active_slot_count();
-        let eligible = if button_areas {
-            self.mt_slots
-                .iter()
-                .filter(|slot| slot.active && !slot.button_area_excluded)
-                .count()
-        } else {
-            active
-        };
+        let eligible = self.gesture_tracked_contact_count(button_areas);
         let untracked = (self.touch_fingers as usize).saturating_sub(active);
         eligible + untracked
     }
@@ -1108,7 +1456,7 @@ impl TrackedDevice {
         let mut y = 0.0;
         let mut count = 0usize;
         for slot in &self.mt_slots {
-            if slot.active && (!button_areas || !slot.button_area_excluded) {
+            if Self::gesture_slot_eligible(slot, button_areas) {
                 x += slot.x;
                 y += slot.y;
                 count += 1;
@@ -1119,7 +1467,7 @@ impl TrackedDevice {
 
     fn reset_gesture_contact_initials(&mut self, button_areas: bool) {
         for slot in &mut self.mt_slots {
-            if slot.active && (!button_areas || !slot.button_area_excluded) {
+            if Self::gesture_slot_eligible(slot, button_areas) {
                 slot.gesture_initial_x = slot.x;
                 slot.gesture_initial_y = slot.y;
             }
@@ -1155,7 +1503,7 @@ impl TrackedDevice {
     ) -> Option<bool> {
         let mut any_eligible = false;
         for slot in &self.mt_slots {
-            if !slot.active || (button_areas && slot.button_area_excluded) {
+            if !Self::gesture_slot_eligible(slot, button_areas) {
                 continue;
             }
             any_eligible = true;
@@ -1194,7 +1542,7 @@ impl TrackedDevice {
         let mut contacts = self
             .mt_slots
             .iter()
-            .filter(|slot| slot.active && (!button_areas || !slot.button_area_excluded));
+            .filter(|slot| Self::gesture_slot_eligible(slot, button_areas));
         let (Some(first), Some(second)) = (contacts.next(), contacts.next()) else {
             return None;
         };
@@ -1275,7 +1623,7 @@ impl TrackedDevice {
         time_usec: u64,
     ) {
         for slot in &mut self.mt_slots {
-            if slot.active && slot.button_area_classification_pending {
+            if slot.active && !slot.palm_suppressed && slot.button_area_classification_pending {
                 slot.button_area_initial_x = slot.x;
                 slot.button_area_initial_y = slot.y;
                 slot.button_area_down_usec = time_usec;
@@ -1309,7 +1657,7 @@ impl TrackedDevice {
             .mt_slots
             .iter()
             .filter_map(|slot| {
-                if !slot.active || !slot.button_area_excluded {
+                if !slot.active || slot.palm_suppressed || !slot.button_area_excluded {
                     return None;
                 }
                 let movement_mm = touchpad_delta_mm(
@@ -1334,6 +1682,7 @@ impl TrackedDevice {
         let mut changed = false;
         for slot in &mut self.mt_slots {
             if slot.active
+                && !slot.palm_suppressed
                 && slot.button_area_excluded
                 && activation_times
                     .iter()
@@ -1422,7 +1771,7 @@ impl TrackedDevice {
             height_mm,
         );
         for slot in &mut self.mt_slots {
-            if !slot.active || !slot.edge_classification_pending {
+            if !slot.active || slot.palm_suppressed || !slot.edge_classification_pending {
                 continue;
             }
 
@@ -1484,7 +1833,7 @@ impl TrackedDevice {
         let mut frame = EdgeScrollFrame::default();
 
         for slot in &mut self.mt_slots {
-            if !slot.active {
+            if !slot.active || slot.palm_suppressed {
                 frame.stop_axes |= slot.edge_axis;
                 slot.edge_axis = 0;
                 slot.edge_state = EdgeScrollState::None;
@@ -1640,6 +1989,9 @@ impl TrackedDevice {
         fingers
     }
 
+    // The separate axes and dimensions mirror libinput's physical-distance
+    // calculation; grouping them would obscure which axis each value serves.
+    #[allow(clippy::too_many_arguments)]
     fn clickfinger_contacts_within_distance(
         first: &MtSlot,
         second: &MtSlot,
@@ -1690,9 +2042,13 @@ impl TrackedDevice {
         (distance_from_bottom(first.y) < 20.0) == (distance_from_bottom(second.y) < 20.0)
     }
 
-    /// Euclidean distance between the two primary active slots.
-    fn primary_slot_distance(&self) -> Option<f64> {
-        let active: Vec<&MtSlot> = self.mt_slots.iter().filter(|s| s.active).collect();
+    /// Euclidean distance between the two primary gesture contacts.
+    fn gesture_primary_slot_distance(&self, button_areas: bool) -> Option<f64> {
+        let active: Vec<&MtSlot> = self
+            .mt_slots
+            .iter()
+            .filter(|slot| Self::gesture_slot_eligible(slot, button_areas))
+            .collect();
         if active.len() < 2 {
             return None;
         }
@@ -1701,15 +2057,60 @@ impl TrackedDevice {
         Some((dx * dx + dy * dy).sqrt())
     }
 
-    /// Angle (degrees) of the vector between the two primary active slots.
-    fn primary_slot_angle(&self) -> f64 {
-        let active: Vec<&MtSlot> = self.mt_slots.iter().filter(|s| s.active).collect();
+    /// Angle (degrees) of the vector between the two primary gesture contacts.
+    fn gesture_primary_slot_angle(&self, button_areas: bool) -> f64 {
+        let active: Vec<&MtSlot> = self
+            .mt_slots
+            .iter()
+            .filter(|slot| Self::gesture_slot_eligible(slot, button_areas))
+            .collect();
         if active.len() < 2 {
             return 0.0;
         }
         let dx = active[1].x - active[0].x;
         let dy = active[1].y - active[0].y;
         dy.atan2(dx).to_degrees()
+    }
+
+    fn rebase_gesture_contacts_after_eligibility_change(&mut self, button_areas: bool) {
+        self.current_dx = 0;
+        self.current_dy = 0;
+        self.remainder_x = 0.0;
+        self.remainder_y = 0.0;
+        self.finger_scroll_constraint.reset();
+        self.reset_gesture_contact_initials(button_areas);
+        self.gesture_last_centroid = self.gesture_centroid(button_areas);
+        self.pinch_base_centroid = self.gesture_last_centroid;
+
+        let n_fingers = self.gesture_finger_count(button_areas);
+        if !self.pinch_active && n_fingers >= 2 {
+            if let Some(distance) = self.gesture_primary_slot_distance(button_areas) {
+                self.pinch_base_dist = distance;
+                self.pinch_base_angle = self.gesture_primary_slot_angle(button_areas);
+                self.pinch_fingers = n_fingers as i32;
+            }
+        }
+    }
+
+    fn sync_gesture_finger_count(&mut self, n_fingers: usize) {
+        if self.gesture_fingers_last == n_fingers {
+            return;
+        }
+
+        self.gesture_fingers_last = n_fingers;
+        self.hold_contact_changed = true;
+        if self.hold_active {
+            return;
+        }
+
+        if n_fingers == 0 {
+            self.hold_started_at = None;
+            self.hold_blocked = false;
+            self.hold_fingers = 0;
+        } else if !self.hold_blocked {
+            self.hold_started_at = Some(Instant::now());
+            self.hold_fingers = n_fingers as i32;
+        }
     }
 
     fn filter_hi_res_wheel(&mut self, axis: u32, value: i64) -> Option<i64> {
@@ -1857,26 +2258,12 @@ unsafe fn tablet_tool_for(
         return tool;
     }
     let mut eraser_button_modes = u32::from(tool_type == 1);
-    let name = i32::try_from(tool_id).ok().and_then(|tool_id| {
-        let database = libwacom_database_new();
-        if database.is_null() {
-            return None;
+    let name = tablet_tool_name_for_id(tool_id);
+    if let Some(stylus) = libwacom_stylus_for_id(tool_id) {
+        if libwacom_stylus_has_eraser(stylus) != 0 && libwacom_stylus_get_eraser_type(stylus) == 2 {
+            eraser_button_modes = 0;
         }
-        let stylus = libwacom_stylus_get_for_id(database, tool_id);
-        let name = if stylus.is_null() || libwacom_stylus_is_generic(stylus) != 0 {
-            None
-        } else {
-            if libwacom_stylus_has_eraser(stylus) != 0
-                && libwacom_stylus_get_eraser_type(stylus) == 2
-            {
-                eraser_button_modes = 0;
-            }
-            let value = libwacom_stylus_get_name(stylus);
-            (!value.is_null()).then(|| std::ffi::CStr::from_ptr(value).to_owned())
-        };
-        libwacom_database_destroy(database);
-        name
-    });
+    }
     let tool_buttons: Vec<u32> = buttons
         .iter()
         .copied()
@@ -1923,6 +2310,34 @@ unsafe fn tablet_tool_for(
     }));
     (*ctx).tablet_tools.push(tool);
     tool
+}
+
+pub(crate) fn tablet_tool_name_for_id(tool_id: u64) -> Option<std::ffi::CString> {
+    let tool_id = i32::try_from(tool_id).ok()?;
+    unsafe {
+        let database = libwacom_database_new();
+        if database.is_null() {
+            return None;
+        }
+        let stylus = libwacom_stylus_get_for_id(database, tool_id);
+        let name = stylus.as_ref().and_then(|stylus| {
+            let value = libwacom_stylus_get_name(stylus);
+            (!value.is_null()).then(|| std::ffi::CStr::from_ptr(value).to_owned())
+        });
+        libwacom_database_destroy(database);
+        name
+    }
+}
+
+pub(crate) fn libwacom_stylus_for_id(tool_id: u64) -> Option<*const libc::c_void> {
+    let tool_id = i32::try_from(tool_id).ok()?;
+    let database = unsafe { libwacom_database_new() };
+    if database.is_null() {
+        return None;
+    }
+    let stylus = unsafe { libwacom_stylus_get_for_id(database, tool_id) };
+    unsafe { libwacom_database_destroy(database) };
+    Some(stylus).filter(|s| !s.is_null())
 }
 
 unsafe fn tablet_tool_payload(
@@ -2199,6 +2614,47 @@ unsafe fn active_tablet_for_touch(
     fallback_tablet.filter(|_| (*touch_device).has_touch)
 }
 
+unsafe fn paired_left_handed_rotation_enabled(
+    ctx: *mut LibinputContext,
+    device: *mut LibinputDevice,
+) -> bool {
+    let device_is_tablet_tool = (*device).has_tablet
+        && !(*device).has_touch
+        && !(*device).has_gesture
+        && !(*device).has_tablet_pad;
+    let device_is_gesture_touchpad = (*device).has_gesture && !(*device).has_tablet_pad;
+    if !device_is_tablet_tool && !device_is_gesture_touchpad {
+        return (*device).left_handed;
+    }
+
+    let Some(device_group) =
+        crate::udev::property_value((*device).udev_device, "LIBINPUT_DEVICE_GROUP")
+    else {
+        return (*device).left_handed;
+    };
+
+    for &candidate in &(*ctx).devices {
+        if candidate.is_null() || candidate == device || (*candidate).has_tablet_pad {
+            continue;
+        }
+        let candidate_is_tablet_tool =
+            (*candidate).has_tablet && !(*candidate).has_touch && !(*candidate).has_gesture;
+        let candidate_is_gesture_touchpad = (*candidate).has_gesture;
+        let is_paired_counterpart = (device_is_tablet_tool && candidate_is_gesture_touchpad)
+            || (device_is_gesture_touchpad && candidate_is_tablet_tool);
+        if !is_paired_counterpart {
+            continue;
+        }
+        let candidate_group =
+            crate::udev::property_value((*candidate).udev_device, "LIBINPUT_DEVICE_GROUP");
+        if candidate_group.as_deref() == Some(device_group.as_str()) {
+            return (*device).left_handed || (*candidate).left_handed;
+        }
+    }
+
+    (*device).left_handed
+}
+
 unsafe fn touch_arbitration_active(
     ctx: *mut LibinputContext,
     touch_device: *mut LibinputDevice,
@@ -2412,7 +2868,6 @@ pub struct BackendState {
     devices: HashMap<RawFd, TrackedDevice>,
     requested_paths: Vec<PathBuf>,
     inotify: Option<Inotify>,
-    pub global_typing_time: Option<Instant>,
     suspended: bool,
 }
 
@@ -2447,8 +2902,110 @@ impl BackendState {
             devices: HashMap::new(),
             requested_paths: Vec::new(),
             inotify,
-            global_typing_time: None,
             suspended: false,
+        }
+    }
+
+    fn dwt_wants_keyboard(touchpad: DwtPairingInfo, keyboard: DwtPairingInfo) -> bool {
+        if touchpad.fd == keyboard.fd || !touchpad.is_touchpad || !keyboard.is_dwt_keyboard {
+            return false;
+        }
+        if touchpad.touchpad_is_external {
+            touchpad.vendor_id == keyboard.vendor_id && touchpad.product_id == keyboard.product_id
+        } else {
+            keyboard.keyboard_internal
+        }
+    }
+
+    fn dwtp_wants_trackpoint(touchpad: DwtPairingInfo, trackpoint: DwtPairingInfo) -> bool {
+        touchpad.fd != trackpoint.fd
+            && touchpad.is_touchpad
+            && !touchpad.touchpad_is_external
+            && trackpoint.is_pointing_stick
+            && !matches!(trackpoint.bus_type, 0x03 | 0x05)
+    }
+
+    /// Build DWT/DWTP relationships on every device addition. This handles
+    /// either arrival order without treating an arbitrary global pointer
+    /// device as a trackpoint partner.
+    fn pair_new_dwt_device(&mut self, new_fd: RawFd) {
+        let Some(new_device) = self.devices.get(&new_fd) else {
+            return;
+        };
+        let new_info = new_device.dwt_pairing_info(new_fd);
+        let infos: Vec<DwtPairingInfo> = self
+            .devices
+            .iter()
+            .map(|(fd, device)| device.dwt_pairing_info(*fd))
+            .collect();
+
+        if new_info.is_touchpad {
+            let paired_keyboards: Vec<RawFd> = infos
+                .iter()
+                .copied()
+                .filter(|candidate| Self::dwt_wants_keyboard(new_info, *candidate))
+                .map(|candidate| candidate.fd)
+                .collect();
+            let paired_trackpoint = infos
+                .iter()
+                .copied()
+                .find(|candidate| Self::dwtp_wants_trackpoint(new_info, *candidate))
+                .map(|candidate| candidate.fd);
+            if let Some(touchpad) = self.devices.get_mut(&new_fd) {
+                touchpad.dwt.paired_keyboards.extend(paired_keyboards);
+                touchpad.dwtp.paired_trackpoint = paired_trackpoint;
+            }
+        }
+
+        if new_info.is_dwt_keyboard {
+            let targets: Vec<RawFd> = infos
+                .iter()
+                .copied()
+                .filter(|candidate| Self::dwt_wants_keyboard(*candidate, new_info))
+                .map(|candidate| candidate.fd)
+                .collect();
+            for target_fd in targets {
+                if let Some(touchpad) = self.devices.get_mut(&target_fd) {
+                    touchpad.dwt.paired_keyboards.insert(new_fd);
+                }
+            }
+        }
+
+        if new_info.is_pointing_stick && !matches!(new_info.bus_type, 0x03 | 0x05) {
+            let targets: Vec<RawFd> = infos
+                .iter()
+                .copied()
+                .filter(|candidate| Self::dwtp_wants_trackpoint(*candidate, new_info))
+                .map(|candidate| candidate.fd)
+                .collect();
+            for target_fd in targets {
+                if let Some(touchpad) = self.devices.get_mut(&target_fd) {
+                    // Upstream keeps the first paired trackpoint and does not
+                    // silently substitute a different existing device.
+                    if touchpad.dwtp.paired_trackpoint.is_none() {
+                        touchpad.dwtp.paired_trackpoint = Some(new_fd);
+                    }
+                }
+            }
+        }
+    }
+
+    fn unpair_removed_dwt_device(&mut self, removed_fd: RawFd) {
+        for touchpad in self.devices.values_mut() {
+            if touchpad.dwt.paired_keyboards.remove(&removed_fd) {
+                // Match the upstream removal listener: stop active typing
+                // suppression immediately, while keeping any already-marked
+                // typing palm suppressed until it lifts.
+                touchpad.dwt.active = false;
+                touchpad.dwt.deadline = None;
+                touchpad.dwt.active_started_usec = None;
+                touchpad.dwt.deadline_usec = None;
+                touchpad.dwt.pressed_keys.clear();
+                touchpad.dwt.modifier_keys.clear();
+            }
+            if touchpad.dwtp.paired_trackpoint == Some(removed_fd) {
+                touchpad.dwtp.paired_trackpoint = None;
+            }
         }
     }
 
@@ -2670,13 +3227,15 @@ impl BackendState {
         }
         let has_tag = |tag| crate::udev::property_equals(udev_pointer, tag, "1");
         let tag_keyboard = has_tag("ID_INPUT_KEYBOARD");
+        let tag_key = has_tag("ID_INPUT_KEY");
         let tag_touchpad = has_tag("ID_INPUT_TOUCHPAD");
         let tag_touchscreen = has_tag("ID_INPUT_TOUCHSCREEN");
         let tag_tablet = has_tag("ID_INPUT_TABLET");
         let tag_tablet_pad = has_tag("ID_INPUT_TABLET_PAD");
         let tag_switch = has_tag("ID_INPUT_SWITCH");
         let tag_mouse = has_tag("ID_INPUT_MOUSE");
-        let tag_pointing_stick = has_tag("ID_INPUT_POINTINGSTICK");
+        let tag_pointing_stick =
+            has_tag("ID_INPUT_POINTINGSTICK") || props.contains(evdev::PropType::POINTING_STICK);
         let has_class_tag = tag_keyboard
             || tag_touchpad
             || tag_touchscreen
@@ -2688,6 +3247,10 @@ impl BackendState {
         let use_evdev_fallback = !has_class_tag;
         let is_keyboard = tag_keyboard
             || (use_evdev_fallback && keys.is_some_and(|k| k.iter().any(|key| key.0 < 0x100)));
+        // DWT only pairs ordinary typewriter keyboards. A node exposing a
+        // handful of media or receiver keys must not suppress its touchpad.
+        let is_typewriter_keyboard = is_keyboard
+            && keys.is_some_and(|codes| (16_u16..=25).all(|code| codes.contains(KeyCode(code))));
         let has_pen = keys.is_some_and(|k| {
             k.contains(KeyCode::BTN_TOOL_PEN)
                 || k.contains(KeyCode::BTN_TOOL_RUBBER)
@@ -2711,7 +3274,11 @@ impl BackendState {
                     || props.contains(evdev::PropType::BUTTONPAD)
                     || has_finger)
                 && (has_abs_xy || has_mt_xy));
-        let mut has_tablet = tag_tablet || (use_evdev_fallback && has_pen);
+        // libwacom may assign the tablet tag to companion touch and pad
+        // nodes.  Upstream dispatches those nodes as touchpads, touchscreens,
+        // or tablet pads before considering the tablet-tool interface.
+        let mut has_tablet = (tag_tablet && !tag_touchpad && !tag_touchscreen && !tag_tablet_pad)
+            || (use_evdev_fallback && has_pen);
         let mut has_touch = tag_touchscreen
             || (use_evdev_fallback
                 && !has_pen
@@ -2772,6 +3339,8 @@ impl BackendState {
         (*lib_dev).has_keyboard = is_keyboard;
         (*lib_dev).has_touch = has_touch;
         (*lib_dev).has_gesture = is_touchpad && !props.contains(evdev::PropType::SEMI_MT);
+        (*lib_dev).hold_enabled = (*lib_dev).has_gesture;
+        (*lib_dev).hold_default_enabled = (*lib_dev).has_gesture;
         (*lib_dev).mt_slot_count = if has_mt_slot { mt_slot_count } else { 0 };
         (*lib_dev).has_switch = has_switch;
         (*lib_dev).has_tablet = has_tablet;
@@ -2782,11 +3351,13 @@ impl BackendState {
         (*lib_dev).abs_y_resolution = abs_y_resolution.filter(|resolution| *resolution > 0);
         (*lib_dev).calibration_available = has_abs_xy
             && !is_touchpad
+            && !has_tablet_pad
             && (!has_tablet
                 || props.contains(evdev::PropType::DIRECT)
                 || tablet_is_display_device(path));
         (*lib_dev).area_available = has_tablet && !props.contains(evdev::PropType::DIRECT);
-        (*lib_dev).accel_available = is_touchpad || has_relative_motion || has_tablet;
+        (*lib_dev).accel_available =
+            (is_touchpad || has_relative_motion || has_tablet) && !has_tablet_pad;
         (*lib_dev).supports_button_scroll = is_pointer
             && !has_tablet
             && !has_tablet_pad
@@ -2801,32 +3372,45 @@ impl BackendState {
         let mut event_codes: Vec<u16> = keys
             .map(|codes| codes.iter().map(|code| code.0).collect())
             .unwrap_or_default();
-        let udev_type = if tag_touchpad {
-            "touchpad"
-        } else if tag_touchscreen {
-            "touchscreen"
-        } else if tag_tablet {
-            "tablet"
-        } else if tag_tablet_pad {
-            "tablet-pad"
-        } else if tag_pointing_stick {
-            "pointingstick"
-        } else if tag_mouse || has_relative_pointer {
-            "mouse"
-        } else if tag_keyboard {
-            "keyboard"
-        } else if tag_switch {
-            "switch"
-        } else {
-            "unknown"
-        };
+        // Devices may legitimately carry more than one udev role (for
+        // example a keyboard receiver that also exposes pointer axes).
+        // Preserve every applicable role for quirk matching instead of
+        // letting an arbitrary single role hide keyboard integration quirks.
+        let mut udev_types = Vec::new();
+        if is_keyboard || tag_key {
+            udev_types.push("keyboard");
+        }
+        if is_touchpad {
+            udev_types.push("touchpad");
+        }
+        if has_touch {
+            udev_types.push("touchscreen");
+        }
+        if has_tablet {
+            udev_types.push("tablet");
+        }
+        if has_tablet_pad {
+            udev_types.push("tablet-pad");
+        }
+        if tag_pointing_stick {
+            udev_types.push("pointingstick");
+        }
+        if tag_mouse || has_relative_pointer {
+            udev_types.push("mouse");
+        }
+        if has_switch {
+            udev_types.push("switch");
+        }
+        if udev_types.is_empty() {
+            udev_types.push("unknown");
+        }
         let applied_quirks = crate::quirks::apply_quirks(
             &name,
             input_id.bus_type().0,
             input_id.vendor(),
             input_id.product(),
             input_id.version(),
-            udev_type,
+            &udev_types,
             &mut event_codes,
         );
         for message in &applied_quirks.messages {
@@ -2838,9 +3422,16 @@ impl BackendState {
             (*lib_dev).has_touch = false;
             (*lib_dev).has_tablet = true;
         }
-        (*lib_dev).accel_available |= has_tablet;
+        // A tablet pad can share a physical device with a tablet tool, but
+        // its dial/ring/strip node is never an accelerated pointer.
+        (*lib_dev).accel_available =
+            (is_touchpad || has_relative_motion || has_tablet) && !has_tablet_pad;
         (*lib_dev).event_codes = event_codes;
-        (*lib_dev).left_handed_available = is_pointer;
+        let mut left_handed_available = is_pointer;
+        if is_touchpad && applied_quirks.model_apple_touchpad_onebutton {
+            left_handed_available = false;
+        }
+        (*lib_dev).left_handed_available = left_handed_available;
         if has_tablet_pad {
             let mut pad_button_codes = Vec::new();
             let mut pad_left_handed_available = true;
@@ -3033,18 +3624,25 @@ impl BackendState {
         (*lib_dev).sysname =
             std::ffi::CString::new(path.file_name().and_then(|s| s.to_str()).unwrap_or(""))
                 .unwrap_or_else(|_| std::ffi::CString::new("").unwrap());
-        let external_touchpad = crate::udev::property_equals(
-            (*lib_dev).udev_device,
-            "ID_INPUT_TOUCHPAD_INTEGRATION",
-            "external",
-        );
+        let touchpad_integration =
+            crate::udev::property_value((*lib_dev).udev_device, "ID_INPUT_TOUCHPAD_INTEGRATION");
+        // Match upstream's touchpad integration classification. Bluetooth
+        // touchpads without an explicit udev classification are external;
+        // otherwise the absence of the property defaults to internal. The
+        // Logitech and Wacom-touchpad exceptions are quirk/device-model
+        // based, rather than a blanket vendor exclusion.
+        let mut external_touchpad = match touchpad_integration.as_deref() {
+            Some("internal") => false,
+            Some("external") => true,
+            _ => input_id.bus_type().0 == 0x05,
+        };
+        external_touchpad |= input_id.vendor() == 0x046d || applied_quirks.model_wacom_touchpad;
         // DWT is available on internal touchpads and on external keyboard /
         // touchpad combinations explicitly identified by the quirks database.
         // DWTP is only meaningful for an internal touchpad paired with a
-        // trackpoint. Wacom tablet touch surfaces are external devices for
-        // these purposes even when their synthetic test metadata lacks the
-        // integration property.
-        let dwt_device = is_touchpad && input_id.vendor() != 0x056a;
+        // trackpoint. Device-model quirks above classify tablet touch
+        // surfaces as external where appropriate.
+        let dwt_device = is_touchpad;
         (*lib_dev).dwt_available =
             dwt_device && (!external_touchpad || applied_quirks.tpkb_combo_layout_below);
         (*lib_dev).dwt_enabled = (*lib_dev).dwt_available;
@@ -3052,12 +3650,34 @@ impl BackendState {
         (*lib_dev).dwtp_available = dwt_device && !external_touchpad;
         (*lib_dev).dwtp_enabled = (*lib_dev).dwtp_available;
         (*lib_dev).dwtp_timeout = 300;
-        (*lib_dev).send_events_modes =
-            if is_touchpad && !external_touchpad && input_id.vendor() != 0x056a {
-                0b11
-            } else {
-                0b01
-            };
+        (*lib_dev).send_events_modes = if is_touchpad && !external_touchpad {
+            0b11
+        } else {
+            0b01
+        };
+
+        // The upstream palm detector enables pressure detection whenever a
+        // touchpad exposes ABS_MT_PRESSURE, using 130 as its default
+        // threshold. Size detection is deliberately opt-in through quirks.
+        // External touchpads use neither detector unless they are an
+        // explicitly identified keyboard/touchpad combination.
+        let palm_detection_enabled =
+            is_touchpad && (!external_touchpad || applied_quirks.tpkb_combo_layout_below);
+        // INPUT_PROP_PRESSUREPAD (0x07) and a non-zero ABS_MT_PRESSURE
+        // resolution mean the axis is contact/touch detection data rather
+        // than the raw palm-pressure signal used by libinput's palm logic.
+        let has_raw_mt_pressure = device.get_absinfo().ok().is_some_and(|axes| {
+            axes.into_iter().any(|(axis, info)| {
+                axis == AbsoluteAxisCode::ABS_MT_PRESSURE && info.resolution() == 0
+            })
+        }) && !props.contains(evdev::PropType(0x07));
+        let palm_pressure_threshold = (palm_detection_enabled && has_raw_mt_pressure)
+            .then_some(applied_quirks.palm_pressure_threshold.unwrap_or(130))
+            .filter(|threshold| *threshold != 0);
+        let palm_size_threshold = palm_detection_enabled
+            .then_some(applied_quirks.palm_size_threshold)
+            .flatten()
+            .filter(|threshold| *threshold != 0);
 
         if let Ok(absinfo) = device.get_absinfo() {
             let mut x = None;
@@ -3167,10 +3787,22 @@ impl BackendState {
             is_touchpad || has_touch || has_tablet || (is_pointer && has_abs_xy),
             is_pointer && has_abs_xy && !is_touchpad,
             is_keyboard,
+            is_typewriter_keyboard,
+            matches!(
+                applied_quirks.keyboard_integration,
+                Some(crate::quirks::KeyboardIntegration::Internal)
+            ),
             is_pointer,
+            is_touchpad,
+            external_touchpad,
+            palm_pressure_threshold,
+            palm_size_threshold,
             is_clickpad,
             is_topbuttonpad,
             tag_pointing_stick,
+            input_id.vendor(),
+            input_id.product(),
+            input_id.bus_type().0,
         );
         let udev_fuzz = |primary: &str, fallback: &str| {
             crate::udev::property_value(raw_udev_device, primary)
@@ -3215,6 +3847,7 @@ impl BackendState {
             out.extend(initial_events);
         }
         self.devices.insert(fd, td);
+        self.pair_new_dwt_device(fd);
     }
 
     pub unsafe fn stop_scroll_for_device(
@@ -3255,8 +3888,15 @@ impl BackendState {
             );
             tracked.finger_scroll_axes = 0;
         }
+        let button_areas = (*tracked.lib_device).click_method == 1;
+        let edge_gesture_contacts_before = tracked.gesture_tracked_contact_count(button_areas);
         let edge_axes = tracked.stop_edge_scroll();
         Self::emit_finger_axis(time_usec, device, ctx, edge_axes, [0.0; 2], out);
+        let n_fingers = tracked.gesture_finger_count(button_areas);
+        if edge_gesture_contacts_before != tracked.gesture_tracked_contact_count(button_areas) {
+            tracked.rebase_gesture_contacts_after_eligibility_change(button_areas);
+            tracked.sync_gesture_finger_count(n_fingers);
+        }
         tracked.finger_scroll_constraint.reset();
         tracked.remainder_x = 0.0;
         tracked.remainder_y = 0.0;
@@ -3554,8 +4194,11 @@ impl BackendState {
         // --- hotplug ---
         self.handle_hotplug(ctx, out);
 
-        // --- synthetic key-repeat before reading new events ---
-        self.emit_key_repeats(ctx, out);
+        // Expire per-touchpad DWT/DWTP timers before consuming a new touch
+        // frame. This preserves the upstream distinction between a contact
+        // that began while activity was active and one that begins afterward.
+        self.expire_dwt_timeouts();
+
         let quick_hold_timeout = Duration::from_millis(40);
         let hold_timeout = Duration::from_millis(180);
         let tap_release_timeout = Duration::from_millis(180);
@@ -3641,143 +4284,83 @@ impl BackendState {
             .values()
             .find(|tracked| tracked.is_pointing_stick)
             .map(|tracked| tracked.lib_device);
-        let fds: Vec<RawFd> = self.devices.keys().copied().collect();
+        // Process paired sources before touchpads so a keyboard or
+        // trackpoint event and a following touch frame in the same dispatch
+        // observe the new suppression state deterministically.
+        let mut fds: Vec<RawFd> = self.devices.keys().copied().collect();
+        fds.sort_by_key(|fd| {
+            self.devices
+                .get(fd)
+                .map(|tracked| {
+                    if tracked.is_keyboard {
+                        0_u8
+                    } else if tracked.is_pointing_stick {
+                        1
+                    } else {
+                        2
+                    }
+                })
+                .unwrap_or(3)
+        });
         let mut dead_fds: Vec<RawFd> = Vec::new();
 
         for fd in fds {
-            let td = match self.devices.get_mut(&fd) {
-                Some(d) => d,
-                None => continue,
-            };
-
             // fetch_events() may return a partial batch. Drain this device
             // before returning from dispatch so one libinput_dispatch() call
             // cannot split a queued gesture across client iterations.
             loop {
-                let batch: Vec<InputEvent> = match td.device.fetch_events() {
-                    Ok(b) => b.collect(),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e)
-                        if e.raw_os_error() == Some(nix::libc::ENODEV)
-                            || e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                    {
-                        dead_fds.push(fd);
+                let batch: Vec<InputEvent> = {
+                    let Some(td) = self.devices.get_mut(&fd) else {
                         break;
+                    };
+                    match td.device.fetch_events() {
+                        Ok(batch) => batch.collect(),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error)
+                            if error.raw_os_error() == Some(nix::libc::ENODEV)
+                                || error.kind() == std::io::ErrorKind::UnexpectedEof =>
+                        {
+                            dead_fds.push(fd);
+                            break;
+                        }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
                 };
                 if batch.is_empty() {
                     break;
                 }
-                let lib_dev = td.lib_device;
-                let is_abs = td.is_absolute;
-                let is_kbd = td.is_keyboard;
-                let is_ptr = td.is_pointer;
-                let is_tablet_tool = unsafe { &*lib_dev }.has_tablet
-                    && !unsafe { &*lib_dev }.has_touch
-                    && !unsafe { &*lib_dev }.has_gesture
-                    && !unsafe { &*lib_dev }.has_tablet_pad;
-                let is_tablet_pad = unsafe { &*lib_dev }.has_tablet_pad;
-                let cfg_tap = unsafe { &*lib_dev }.tap_enabled;
-                let cfg_nat = unsafe { &*lib_dev }.natural_scroll;
-                let cfg_dwt = unsafe { &*lib_dev }.dwt_enabled;
-                let cfg_accel = unsafe { &*lib_dev }.accel_speed as f32 + 1.0;
 
-                let send_events_disabled = unsafe { &*lib_dev }.send_events_mode == 1;
-                if send_events_disabled {
-                    if td.is_topbuttonpad {
-                        for ev in &batch {
-                            Self::process_disabled_topbutton_event(
-                                ev,
-                                systime_to_usec(ev.timestamp()),
-                                pointing_stick_device,
-                                ctx,
-                                td,
-                                out,
-                            );
-                        }
-                    }
-                    continue;
+                let mut followups = Vec::new();
+                if let Some(td) = self.devices.get_mut(&fd) {
+                    Self::process_device_batch(
+                        fd,
+                        &batch,
+                        pointing_stick_device,
+                        ctx,
+                        td,
+                        out,
+                        &mut followups,
+                    );
                 }
-
-                let global_typing = self.global_typing_time;
-
-                for ev in &batch {
-                    let ts_usec = systime_to_usec(ev.timestamp());
-
-                    if is_tablet_pad {
-                        Self::process_tablet_pad_event(ev, ts_usec, lib_dev, ctx, td, out);
-                        continue;
-                    }
-
-                    if is_tablet_tool {
-                        Self::process_tablet_tool_event(ev, ts_usec, lib_dev, ctx, td, out);
-                        continue;
-                    }
-
-                    // Composite gaming mice and receiver nodes may expose both
-                    // relative pointer axes and ordinary keyboard keys. Route the
-                    // key range through the keyboard engine without stealing the
-                    // device's BTN_* events from pointer handling.
-                    if is_kbd && is_ptr && ev.event_type() == EventType::KEY && ev.code() < 0x100 {
-                        Self::process_keyboard_event(
-                            ev,
-                            ts_usec,
-                            lib_dev,
-                            ctx,
-                            td,
-                            out,
-                            &mut self.global_typing_time,
-                        );
-                        continue;
-                    }
-
-                    if td.is_absolute_pointer {
-                        Self::process_absolute_pointer_event(ev, ts_usec, lib_dev, ctx, td, out);
-                        continue;
-                    }
-
-                    // ---- Keyboard device ----
-                    if is_kbd && !is_abs && !is_ptr {
-                        Self::process_keyboard_event(
-                            ev,
-                            ts_usec,
-                            lib_dev,
-                            ctx,
-                            td,
-                            out,
-                            &mut self.global_typing_time,
-                        );
-                        continue;
-                    }
-
-                    // ---- Relative device (mouse / trackpoint) ----
-                    if !is_abs && is_ptr {
-                        Self::process_relative_event(ev, ts_usec, lib_dev, ctx, td, out);
-                        continue;
-                    }
-
-                    // ---- Absolute device (touchpad) ----
-                    if is_abs {
-                        let dwt_active = cfg_dwt
-                            && global_typing
-                                .map(|t| t.elapsed() < Duration::from_millis(500))
-                                .unwrap_or(false);
-                        let touch_arbitrated = touch_arbitration_active(ctx, lib_dev, None);
-                        Self::process_absolute_event(
-                            ev,
-                            ts_usec,
-                            lib_dev,
-                            pointing_stick_device,
-                            ctx,
-                            td,
-                            out,
-                            cfg_tap,
-                            cfg_nat,
-                            cfg_accel,
-                            dwt_active,
-                            touch_arbitrated,
-                        );
+                // The source borrow has ended. Applying follow-ups here lets
+                // a source event mutate its paired touchpad without aliasing
+                // the HashMap entry currently being read.
+                for followup in followups {
+                    match followup {
+                        DwtFollowup::Keyboard {
+                            source_fd,
+                            code,
+                            value,
+                            at,
+                            time_usec,
+                        } => self.apply_dwt_keyboard_event(
+                            source_fd, code, value, at, time_usec, ctx, out,
+                        ),
+                        DwtFollowup::TrackpointActivity {
+                            source_fd,
+                            at,
+                            time_usec,
+                        } => self.apply_dwtp_activity(source_fd, at, time_usec, ctx, out),
                     }
                 }
             }
@@ -3823,6 +4406,31 @@ impl BackendState {
         // contact already queued by the kernel join the hold before its begin
         // event is emitted.
         for tracked in self.devices.values_mut() {
+            // A one-finger contact that has already travelled past the
+            // hold-and-motion threshold remains pointer motion. Upstream
+            // only promotes an in-motion single finger to a hold when it is
+            // still within 0.5 mm of its gesture origin at timer expiry.
+            // Without this check, a normal slow pointer move can leak a
+            // hold-begin event after the quick-hold timeout.
+            let button_areas = (*tracked.lib_device).click_method == 1;
+            let single_finger_moved_past_hold_threshold = tracked.hold_fingers == 1
+                && tracked
+                    .gesture_contact_moved_at_least(
+                        button_areas,
+                        (*tracked.lib_device).abs_x_resolution,
+                        (*tracked.lib_device).abs_y_resolution,
+                        (*tracked.lib_device).abs_x_range,
+                        (*tracked.lib_device).abs_y_range,
+                        (*tracked.lib_device).width_mm,
+                        (*tracked.lib_device).height_mm,
+                        0.5,
+                    )
+                    .unwrap_or(false);
+            if single_finger_moved_past_hold_threshold {
+                tracked.hold_started_at = None;
+                tracked.hold_blocked = true;
+                continue;
+            }
             let timeout = if tracked.hold_fingers <= 2 {
                 quick_hold_timeout
             } else {
@@ -3918,25 +4526,38 @@ impl BackendState {
             });
         }
 
-        // A tablet may become active without the paired touchscreen
-        // producing another frame. Cancel an already-reported contact in
-        // this dispatch cycle so clients cannot keep using a stale touch
-        // underneath a pen or totem.
+        // A tablet may become active after a paired touchscreen or touchpad
+        // frame was already read in this dispatch cycle. Preserve the
+        // arbitration decision on the existing contact, otherwise a touch
+        // that began underneath a pen can resume once the pen leaves
+        // proximity.
         for td in self.devices.values_mut() {
             let lib_dev = td.lib_device;
-            let tablet_is_active =
-                (*lib_dev).has_touch && active_tablet_for_touch(ctx, lib_dev).is_some();
+            let is_gesture_touchpad = (*lib_dev).has_gesture;
+            let tablet_is_active = ((*lib_dev).has_touch || is_gesture_touchpad)
+                && active_tablet_for_touch(ctx, lib_dev).is_some();
             let tablet_just_activated = tablet_is_active && !td.touch_arbitration_tablet_was_active;
             td.touch_arbitration_tablet_was_active = tablet_is_active;
             if !tablet_just_activated
                 || !td.mt_slots.iter().any(|slot| {
-                    slot.reported && touch_arbitration_active(ctx, lib_dev, Some((slot.x, slot.y)))
+                    slot.active && touch_arbitration_active(ctx, lib_dev, Some((slot.x, slot.y)))
                 })
             {
                 continue;
             }
             td.touch_arbitration_suppressed = true;
             let time_usec = systime_to_usec(SystemTime::now());
+            if is_gesture_touchpad {
+                Self::stop_touchpad_actions(td, time_usec, ctx, out);
+                for slot in &mut td.mt_slots {
+                    slot.palm_suppressed = slot.active;
+                    slot.reported = false;
+                    slot.seat_slot = None;
+                    slot.dirty = false;
+                }
+                td.touch_active = td.mt_slots.iter().any(|slot| slot.active);
+                continue;
+            }
             let mut cancelled = false;
             for (slot_index, slot) in td.mt_slots.iter_mut().enumerate() {
                 if !slot.reported {
@@ -3978,6 +4599,7 @@ impl BackendState {
 
         // Remove dead devices
         for fd in dead_fds {
+            self.unpair_removed_dwt_device(fd);
             if let Some(device) = self.devices.get(&fd).map(|tracked| tracked.lib_device) {
                 self.release_active_inputs(ctx, device, out);
             }
@@ -4063,6 +4685,14 @@ impl BackendState {
             .filter_map(|slot| slot.edge_started_at)
             .map(|since| Duration::from_millis(300).saturating_sub(since.elapsed()))
             .min();
+        let timer_now = Instant::now();
+        let next_dwt_timeout = self
+            .devices
+            .values()
+            .flat_map(|tracked| [tracked.dwt.deadline, tracked.dwtp.deadline])
+            .flatten()
+            .map(|deadline| deadline.saturating_duration_since(timer_now))
+            .min();
         let next_timeout = [
             next_middle_timeout,
             next_debounce_timeout,
@@ -4072,6 +4702,7 @@ impl BackendState {
             next_tap_timeout,
             next_drag_3fg_timeout,
             next_edge_scroll_timeout,
+            next_dwt_timeout,
         ]
         .into_iter()
         .flatten()
@@ -4115,6 +4746,7 @@ impl BackendState {
                 .iter()
                 .find_map(|(fd, tracked)| (tracked.lib_device == device).then_some(*fd));
             let Some(fd) = fd else { continue };
+            self.unpair_removed_dwt_device(fd);
             let Some(tracked) = self.devices.remove(&fd) else {
                 continue;
             };
@@ -4184,6 +4816,7 @@ impl BackendState {
         let Some(fd) = fd else {
             return false;
         };
+        self.unpair_removed_dwt_device(fd);
         self.release_active_inputs(ctx, device, out);
         let tracked = self
             .devices
@@ -4270,41 +4903,486 @@ impl BackendState {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Synthetic key repeat
-    // -----------------------------------------------------------------------
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn process_device_batch(
+        fd: RawFd,
+        batch: &[InputEvent],
+        pointing_stick_device: Option<*mut LibinputDevice>,
+        ctx: *mut LibinputContext,
+        td: &mut TrackedDevice,
+        out: &mut VecDeque<LibinputEvent>,
+        followups: &mut Vec<DwtFollowup>,
+    ) {
+        let lib_dev = td.lib_device;
+        let is_abs = td.is_absolute;
+        let is_kbd = td.is_keyboard;
+        let is_ptr = td.is_pointer;
+        let is_tablet_tool = (*lib_dev).has_tablet
+            && !(*lib_dev).has_touch
+            && !(*lib_dev).has_gesture
+            && !(*lib_dev).has_tablet_pad;
+        let is_tablet_pad = (*lib_dev).has_tablet_pad;
+        let cfg_tap = (*lib_dev).tap_enabled;
+        let cfg_nat = (*lib_dev).natural_scroll;
+        let cfg_accel = (*lib_dev).accel_speed as f32 + 1.0;
 
-    unsafe fn emit_key_repeats(
-        &mut self,
+        if (*lib_dev).send_events_mode == 1 {
+            if td.is_topbuttonpad {
+                for event in batch {
+                    Self::process_disabled_topbutton_event(
+                        event,
+                        systime_to_usec(event.timestamp()),
+                        pointing_stick_device,
+                        ctx,
+                        td,
+                        out,
+                    );
+                }
+            }
+            return;
+        }
+
+        for event in batch {
+            let ts_usec = systime_to_usec(event.timestamp());
+
+            if is_tablet_pad {
+                Self::process_tablet_pad_event(event, ts_usec, lib_dev, ctx, td, out);
+                continue;
+            }
+
+            if is_tablet_tool {
+                Self::process_tablet_tool_event(event, ts_usec, lib_dev, ctx, td, out);
+                continue;
+            }
+
+            // Composite gaming mice and receiver nodes may expose both
+            // relative pointer axes and ordinary keyboard keys. Route the
+            // key range through the keyboard engine without stealing the
+            // device's BTN_* events from pointer handling.
+            if is_kbd && is_ptr && event.event_type() == EventType::KEY && event.code() < 0x100 {
+                Self::process_keyboard_event(event, ts_usec, lib_dev, ctx, td, out);
+                if matches!(event.value(), 0 | 1) {
+                    followups.push(DwtFollowup::Keyboard {
+                        source_fd: fd,
+                        code: event.code(),
+                        value: event.value(),
+                        at: Instant::now(),
+                        time_usec: ts_usec,
+                    });
+                }
+                continue;
+            }
+
+            if td.is_absolute_pointer {
+                Self::process_absolute_pointer_event(event, ts_usec, lib_dev, ctx, td, out);
+                continue;
+            }
+
+            if is_kbd && !is_abs && !is_ptr {
+                Self::process_keyboard_event(event, ts_usec, lib_dev, ctx, td, out);
+                if matches!(event.value(), 0 | 1) {
+                    followups.push(DwtFollowup::Keyboard {
+                        source_fd: fd,
+                        code: event.code(),
+                        value: event.value(),
+                        at: Instant::now(),
+                        time_usec: ts_usec,
+                    });
+                }
+                continue;
+            }
+
+            if !is_abs && is_ptr {
+                // The upstream listener receives one logical pointer event
+                // per SYN frame. Count a trackpoint frame once, never each
+                // raw REL_X/REL_Y record.
+                let trackpoint_motion_frame = td.is_pointing_stick
+                    && event.event_type() == EventType::SYNCHRONIZATION
+                    && event.code() == 0
+                    && (td.pending_rel_x != 0 || td.pending_rel_y != 0);
+                Self::process_relative_event(event, ts_usec, lib_dev, ctx, td, out);
+                if trackpoint_motion_frame {
+                    followups.push(DwtFollowup::TrackpointActivity {
+                        source_fd: fd,
+                        at: Instant::now(),
+                        time_usec: ts_usec,
+                    });
+                }
+                continue;
+            }
+
+            if is_abs {
+                let touch_arbitrated = touch_arbitration_active(ctx, lib_dev, None);
+                Self::process_absolute_event(
+                    event,
+                    ts_usec,
+                    lib_dev,
+                    pointing_stick_device,
+                    ctx,
+                    td,
+                    out,
+                    cfg_tap,
+                    cfg_nat,
+                    cfg_accel,
+                    touch_arbitrated,
+                );
+            }
+        }
+    }
+
+    unsafe fn stop_touchpad_actions(
+        td: &mut TrackedDevice,
+        time_usec: u64,
         ctx: *mut LibinputContext,
         out: &mut VecDeque<LibinputEvent>,
     ) {
-        let now = Instant::now();
-        for td in self.devices.values_mut() {
-            if !td.is_keyboard {
+        let lib_dev = td.lib_device;
+        if td.finger_scroll_axes != 0 {
+            Self::emit_finger_axis(
+                time_usec,
+                lib_dev,
+                ctx,
+                td.finger_scroll_axes,
+                [0.0; 2],
+                out,
+            );
+            td.finger_scroll_axes = 0;
+        }
+        let edge_axes = td.stop_edge_scroll();
+        Self::emit_finger_axis(time_usec, lib_dev, ctx, edge_axes, [0.0; 2], out);
+
+        if td.pinch_active {
+            td.pinch_active = false;
+            out.push_back(LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_GESTURE_PINCH_END,
+                payload: EventPayload::GesturePinchEnd(GestureEvent {
+                    time_usec,
+                    finger_count: td.pinch_fingers,
+                    dx: 0.0,
+                    dy: 0.0,
+                    scale: 1.0,
+                    angle: 0.0,
+                    cancelled: true,
+                }),
+                context: ctx,
+                device: lib_dev,
+            });
+        }
+        if td.swipe_active {
+            td.swipe_active = false;
+            out.push_back(LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_GESTURE_SWIPE_END,
+                payload: EventPayload::GestureSwipeEnd(GestureEvent {
+                    time_usec,
+                    finger_count: td.swipe_fingers,
+                    dx: 0.0,
+                    dy: 0.0,
+                    scale: 1.0,
+                    angle: 0.0,
+                    cancelled: true,
+                }),
+                context: ctx,
+                device: lib_dev,
+            });
+        }
+        if td.hold_active {
+            td.hold_active = false;
+            out.push_back(LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_GESTURE_HOLD_END,
+                payload: EventPayload::GestureHoldEnd(GestureEvent {
+                    time_usec,
+                    finger_count: td.hold_fingers,
+                    dx: 0.0,
+                    dy: 0.0,
+                    scale: 1.0,
+                    angle: 0.0,
+                    cancelled: true,
+                }),
+                context: ctx,
+                device: lib_dev,
+            });
+        }
+        if let Some(button) = td.tap_button_down.take() {
+            td.tap_release_since = None;
+            td.tap_drag_active = false;
+            let seat_button_count = release_seat_button(lib_dev);
+            out.push_back(LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
+                payload: EventPayload::PointerButton(PointerButtonEvent {
+                    time_usec,
+                    button: button as u32,
+                    state: 0,
+                    seat_button_count,
+                }),
+                context: ctx,
+                device: lib_dev,
+            });
+        }
+        if std::mem::take(&mut td.drag_3fg_button_down) {
+            td.drag_3fg_active = false;
+            td.drag_3fg_release_since = None;
+            let seat_button_count = release_seat_button(lib_dev);
+            out.push_back(LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
+                payload: EventPayload::PointerButton(PointerButtonEvent {
+                    time_usec,
+                    button: KeyCode::BTN_LEFT.0 as u32,
+                    state: 0,
+                    seat_button_count,
+                }),
+                context: ctx,
+                device: lib_dev,
+            });
+        }
+        td.hold_started_at = None;
+        td.hold_blocked = true;
+        td.hold_contact_changed = false;
+        td.gesture_fingers_last = 0;
+        td.drag_3fg_candidate_since = None;
+        td.drag_3fg_candidate_time_usec = 0;
+        td.current_dx = 0;
+        td.current_dy = 0;
+        td.remainder_x = 0.0;
+        td.remainder_y = 0.0;
+        td.finger_scroll_constraint.reset();
+        // tp_tap_suspend() prevents a touch that was active at the start of
+        // DWT/DWTP from turning into a delayed tap. Physical button events
+        // deliberately take a separate path and remain usable.
+        td.tap_emitted = true;
+    }
+
+    fn reset_touchpad_sequence_after_arbitration(td: &mut TrackedDevice) {
+        // Arbitration ends the current physical contact sequence. Keep none
+        // of its cancellation latches for the next contact.
+        td.touch_fingers = 0;
+        td.last_x = None;
+        td.last_y = None;
+        td.current_dx = 0;
+        td.current_dy = 0;
+        td.remainder_x = 0.0;
+        td.remainder_y = 0.0;
+        td.finger_scroll_axes = 0;
+        td.finger_scroll_constraint.reset();
+        td.tap_emitted = false;
+        td.tap_fingers = 0;
+        td.touch_start_time = None;
+        td.last_movement_time = None;
+        td.pinch_base_centroid = None;
+        td.gesture_last_centroid = None;
+        td.pinch_base_dist = 0.0;
+        td.pinch_base_angle = 0.0;
+        td.pinch_fingers = 0;
+        td.swipe_fingers = 0;
+        td.hold_started_at = None;
+        td.hold_active = false;
+        td.hold_fingers = 0;
+        td.hold_blocked = false;
+        td.hold_contact_changed = false;
+        td.gesture_fingers_last = 0;
+        td.mt_contact_count_changed = false;
+        td.drag_3fg_candidate_since = None;
+        td.drag_3fg_candidate_time_usec = 0;
+    }
+
+    // This dispatch boundary carries the event fields and output queue needed
+    // to update every paired touchpad atomically.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn apply_dwt_keyboard_event(
+        &mut self,
+        source_fd: RawFd,
+        code: u16,
+        value: i32,
+        at: Instant,
+        time_usec: u64,
+        ctx: *mut LibinputContext,
+        out: &mut VecDeque<LibinputEvent>,
+    ) {
+        let targets: Vec<RawFd> = self
+            .devices
+            .iter()
+            .filter_map(|(fd, touchpad)| {
+                touchpad
+                    .dwt
+                    .paired_keyboards
+                    .contains(&source_fd)
+                    .then_some(*fd)
+            })
+            .collect();
+
+        for target_fd in targets {
+            let Some(touchpad) = self.devices.get_mut(&target_fd) else {
+                continue;
+            };
+            if time_usec != 0 {
+                touchpad.dwt.event_clock_anchor_at = Some(at);
+                touchpad.dwt.event_clock_anchor_usec = Some(time_usec);
+            }
+            if value == 0 {
+                // Releases clear both masks even while DWT is disabled.
+                touchpad.dwt.pressed_keys.remove(&code);
+                touchpad.dwt.modifier_keys.remove(&code);
                 continue;
             }
-            let lib_dev = td.lib_device;
-            for hk in &mut td.held_keys {
-                let delay = if hk.initial_fired {
-                    Duration::from_millis(REPEAT_INTERVAL_MS)
-                } else {
-                    Duration::from_millis(REPEAT_DELAY_MS)
-                };
-                if now.duration_since(hk.last_fire) >= delay {
-                    out.push_back(LibinputEvent {
-                        event_type: LibinputEventType::LIBINPUT_EVENT_KEYBOARD_KEY,
-                        payload: EventPayload::KeyboardKey(KeyboardKeyEvent {
-                            time_usec: hk.ts_usec,
-                            key: hk.code as u32,
-                            state: 2, // LIBINPUT_KEY_STATE_REPEAT
-                        }),
-                        context: ctx,
-                        device: lib_dev,
-                    });
-                    hk.last_fire = now;
-                    hk.initial_fired = true;
+            if value != 1 || !(*touchpad.lib_device).dwt_enabled || dwt_key_is_ignored(code) {
+                continue;
+            }
+            if dwt_key_is_modifier(code) {
+                if !dwt_key_is_shift(code) {
+                    touchpad.dwt.modifier_keys.insert(code);
                 }
+                continue;
+            }
+            // Modifier chords such as Ctrl+click must remain responsive when
+            // DWT is not already active. Shift intentionally does not enter
+            // this mask, so Shift+letter is treated as typing.
+            if !touchpad.dwt.active && !touchpad.dwt.modifier_keys.is_empty() {
+                continue;
+            }
+
+            let first_key = !touchpad.dwt.active;
+            touchpad.dwt.active = true;
+            if first_key {
+                touchpad.dwt.active_started_usec = (time_usec != 0).then_some(time_usec);
+            }
+            touchpad.dwt.pressed_keys.insert(code);
+            touchpad.dwt.last_key_press_usec = (time_usec != 0).then_some(time_usec);
+            let timeout_ms = if first_key {
+                200
+            } else {
+                (*touchpad.lib_device).dwt_timeout as u64
+            };
+            touchpad.dwt.deadline = Some(at + Duration::from_millis(timeout_ms));
+            touchpad.dwt.deadline_usec = (time_usec != 0)
+                .then_some(time_usec.saturating_add(timeout_ms.saturating_mul(1_000)));
+            if first_key {
+                let mut suspension_events = VecDeque::new();
+                Self::stop_touchpad_actions(touchpad, time_usec, ctx, &mut suspension_events);
+                // A paired keyboard listener interrupts touchpad actions
+                // before the key event reaches clients. The source keyboard
+                // batch was already decoded, so prepend the cancellation
+                // sequence to preserve that observable ordering.
+                while let Some(event) = suspension_events.pop_back() {
+                    out.push_front(event);
+                }
+            }
+        }
+    }
+
+    unsafe fn apply_dwtp_activity(
+        &mut self,
+        source_fd: RawFd,
+        at: Instant,
+        time_usec: u64,
+        ctx: *mut LibinputContext,
+        out: &mut VecDeque<LibinputEvent>,
+    ) {
+        let targets: Vec<RawFd> = self
+            .devices
+            .iter()
+            .filter_map(|(fd, touchpad)| {
+                (touchpad.dwtp.paired_trackpoint == Some(source_fd)).then_some(*fd)
+            })
+            .collect();
+
+        for target_fd in targets {
+            let Some(touchpad) = self.devices.get_mut(&target_fd) else {
+                continue;
+            };
+            if !(*touchpad.lib_device).dwtp_enabled {
+                continue;
+            }
+            let activity_window_expired = (!touchpad.dwtp.active
+                && touchpad
+                    .dwtp
+                    .deadline
+                    .is_some_and(|deadline| at >= deadline))
+                || (!touchpad.dwtp.active
+                    && time_usec != 0
+                    && touchpad
+                        .dwtp
+                        .deadline_usec
+                        .is_some_and(|deadline| time_usec > deadline));
+            if activity_window_expired {
+                touchpad.dwtp.event_count = 0;
+                touchpad.dwtp.deadline = None;
+                touchpad.dwtp.deadline_usec = None;
+            }
+            touchpad.dwtp.last_event_usec = (time_usec != 0).then_some(time_usec);
+            touchpad.dwtp.event_count = touchpad.dwtp.event_count.saturating_add(1);
+            if touchpad.dwtp.event_count < 3 {
+                touchpad.dwtp.deadline = Some(at + Duration::from_millis(40));
+                touchpad.dwtp.deadline_usec =
+                    (time_usec != 0).then_some(time_usec.saturating_add(40_000));
+                continue;
+            }
+
+            let first_activity = !touchpad.dwtp.active;
+            touchpad.dwtp.active = true;
+            if first_activity {
+                touchpad.dwtp.active_started_usec = (time_usec != 0).then_some(time_usec);
+            }
+            touchpad.dwtp.deadline =
+                Some(at + Duration::from_millis((*touchpad.lib_device).dwtp_timeout as u64));
+            touchpad.dwtp.deadline_usec = (time_usec != 0).then_some(
+                time_usec.saturating_add((*touchpad.lib_device).dwtp_timeout as u64 * 1_000),
+            );
+            if first_activity {
+                let mut suspension_events = VecDeque::new();
+                Self::stop_touchpad_actions(touchpad, time_usec, ctx, &mut suspension_events);
+                while let Some(event) = suspension_events.pop_back() {
+                    out.push_front(event);
+                }
+            }
+        }
+    }
+
+    unsafe fn expire_dwt_timeouts(&mut self) {
+        let now = Instant::now();
+        for touchpad in self.devices.values_mut() {
+            if touchpad
+                .dwt
+                .deadline
+                .is_some_and(|deadline| now >= deadline)
+            {
+                if touchpad.dwt.active
+                    && (*touchpad.lib_device).dwt_enabled
+                    && !touchpad.dwt.pressed_keys.is_empty()
+                {
+                    let now_usec = estimate_event_time(
+                        touchpad.dwt.event_clock_anchor_at,
+                        touchpad.dwt.event_clock_anchor_usec,
+                        now,
+                    );
+                    touchpad.dwt.deadline = Some(
+                        now + Duration::from_millis((*touchpad.lib_device).dwt_timeout as u64),
+                    );
+                    if let Some(now_usec) = now_usec {
+                        touchpad.dwt.deadline_usec = Some(
+                            now_usec
+                                .saturating_add((*touchpad.lib_device).dwt_timeout as u64 * 1_000),
+                        );
+                        touchpad.dwt.last_key_press_usec = Some(now_usec);
+                    }
+                } else {
+                    touchpad.dwt.active = false;
+                    touchpad.dwt.deadline = None;
+                    touchpad.dwt.active_started_usec = None;
+                    touchpad.dwt.deadline_usec = None;
+                    // Mirrors tp_tap_resume(). The candidate's tap engine is
+                    // contact-scoped, so clearing the timer is sufficient;
+                    // pre-existing palms stay marked until a later update.
+                }
+            }
+            if touchpad
+                .dwtp
+                .deadline
+                .is_some_and(|deadline| now >= deadline)
+            {
+                touchpad.dwtp.active = false;
+                touchpad.dwtp.event_count = 0;
+                touchpad.dwtp.deadline = None;
+                touchpad.dwtp.active_started_usec = None;
+                touchpad.dwtp.deadline_usec = None;
             }
         }
     }
@@ -4865,7 +5943,7 @@ impl BackendState {
         let was_in_proximity = (*lib_dev).tablet_in_proximity;
         if in_proximity && td.tablet_tool.is_null() && !was_in_proximity {
             (*ctx).touch_arbitration_until = None;
-            td.tablet_left_handed_applied = (*lib_dev).left_handed;
+            td.tablet_left_handed_applied = paired_left_handed_rotation_enabled(ctx, lib_dev);
             (*lib_dev).area = (*lib_dev).wanted_area;
             (*lib_dev).tablet_in_proximity = true;
             if (*lib_dev).area_available {
@@ -4991,7 +6069,7 @@ impl BackendState {
         }
         if in_proximity {
             if td.tablet_tool.is_null() {
-                td.tablet_left_handed_applied = (*lib_dev).left_handed;
+                td.tablet_left_handed_applied = paired_left_handed_rotation_enabled(ctx, lib_dev);
             }
             // Proximity-in establishes a complete coordinate state even
             // when evdev suppresses an unchanged axis from the frame.
@@ -5241,7 +6319,6 @@ impl BackendState {
         ctx: *mut LibinputContext,
         td: &mut TrackedDevice,
         out: &mut VecDeque<LibinputEvent>,
-        global_typing_time: &mut Option<Instant>,
     ) {
         if ev.event_type() != EventType::KEY {
             return;
@@ -5257,15 +6334,10 @@ impl BackendState {
         }
 
         if value == 1 {
-            // Key down: update DWT, start repeat tracking
-            *global_typing_time = Some(Instant::now());
-            td.last_typing_time = Some(Instant::now());
-            td.held_keys.push(HeldKey {
-                code,
-                ts_usec,
-                last_fire: Instant::now(),
-                initial_fired: false,
-            });
+            // Key down: repeat tracking. DWT is applied after the source
+            // batch releases its mutable device borrow, so it can update the
+            // correctly paired touchpad rather than a global timestamp.
+            td.held_keys.push(HeldKey { code });
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_KEYBOARD_KEY,
                 payload: EventPayload::KeyboardKey(KeyboardKeyEvent {
@@ -6255,15 +7327,18 @@ impl BackendState {
         cfg_tap: bool,
         cfg_nat: bool,
         cfg_accel: f32,
-        dwt_active: bool,
         touch_arbitrated: bool,
     ) {
-        if dwt_active {
-            td.tap_emitted = true;
-        }
         if touch_arbitrated {
             td.touch_arbitration_suppressed = true;
             td.tap_emitted = true;
+        } else if td.touch_arbitration_suppressed && td.active_slot_count() == 0 {
+            // The delayed post-proximity arbitration window expired between
+            // touch sequences. Clear the completed suppressed sequence
+            // before the first raw event of a new contact, otherwise that
+            // contact would inherit its predecessor's palm suppression.
+            td.touch_arbitration_suppressed = false;
+            Self::reset_touchpad_sequence_after_arbitration(td);
         }
 
         match ev.event_type() {
@@ -6279,9 +7354,18 @@ impl BackendState {
                     ]
                     .contains(&code)
                 {
+                    let button_areas = (*lib_dev).click_method == 1;
+                    let edge_gesture_contacts_before =
+                        td.gesture_tracked_contact_count(button_areas);
                     let edge_axes = td.stop_edge_scroll();
                     Self::emit_finger_axis(ts_usec, lib_dev, ctx, edge_axes, [0.0; 2], out);
-                    let button_areas = (*lib_dev).click_method == 1;
+                    let n_fingers = td.gesture_finger_count(button_areas);
+                    if edge_gesture_contacts_before
+                        != td.gesture_tracked_contact_count(button_areas)
+                    {
+                        td.rebase_gesture_contacts_after_eligibility_change(button_areas);
+                        td.sync_gesture_finger_count(n_fingers);
+                    }
                     td.gesture_last_centroid = td.gesture_centroid(button_areas);
                     td.pinch_base_centroid = td.gesture_last_centroid;
                     td.finger_scroll_constraint.reset();
@@ -6298,11 +7382,21 @@ impl BackendState {
                 }
 
                 if code == KeyCode::BTN_TOUCH.0 {
+                    let new_touch_palm = (value != 0)
+                        .then(|| td.dwt_palm_for_new_touch(ts_usec))
+                        .flatten();
                     td.touch_active = value != 0;
-                    if td.is_pointer && !td.has_mt {
+                    // A single-touch direct touchscreen reports its contact
+                    // through BTN_TOUCH plus ABS_X/ABS_Y, just like a
+                    // single-touch touchpad. Keep a slot for both device
+                    // classes so the direct-touch SYN_REPORT path can emit
+                    // its touch lifecycle.
+                    if !td.has_mt && (td.is_pointer || (*lib_dev).has_touch) {
+                        let touch_arbitration_suppressed = td.touch_arbitration_suppressed;
                         let slot = &mut td.mt_slots[0];
                         td.mt_contact_count_changed |= slot.active != (value != 0);
                         slot.active = value != 0;
+                        slot.began_this_frame = value != 0;
                         slot.dirty = true;
                         if value != 0 {
                             slot.tracking_id = 0;
@@ -6313,9 +7407,22 @@ impl BackendState {
                             slot.edge_mask = 0;
                             slot.edge_axis = 0;
                             slot.edge_started_at = None;
+                            // A single-touch slot is reused across contacts.
+                            // Clear a prior DWT palm before applying the
+                            // classification for this fresh contact.
+                            slot.generic_palm = None;
+                            slot.dwt_released_this_frame = false;
+                            slot.dwt_palm = None;
+                            slot.dwt_palm_started_usec = None;
+                            slot.palm_suppressed = touch_arbitration_suppressed;
+                            TrackedDevice::mark_dwt_palm(slot, new_touch_palm, ts_usec);
                         } else {
                             slot.button_area_classification_pending = false;
                             slot.edge_classification_pending = false;
+                            slot.generic_palm = None;
+                            slot.dwt_released_this_frame = false;
+                            slot.dwt_palm = None;
+                            slot.dwt_palm_started_usec = None;
                         }
                     }
                     if td.touch_active {
@@ -6324,6 +7431,9 @@ impl BackendState {
                         td.tap_drag_active = continues_tap_drag;
                         td.touch_start_time = Some(Instant::now());
                         td.tap_emitted = td.touch_arbitration_suppressed || continues_tap_drag;
+                        if new_touch_palm.is_some() {
+                            td.tap_emitted = true;
+                        }
                         if continues_tap_drag {
                             td.hold_started_at = None;
                             td.hold_blocked = true;
@@ -6368,7 +7478,7 @@ impl BackendState {
                                     dx: 0.0,
                                     dy: 0.0,
                                     scale: td
-                                        .primary_slot_distance()
+                                        .gesture_primary_slot_distance((*lib_dev).click_method == 1)
                                         .map(|d| {
                                             if td.pinch_base_dist > 0.0 {
                                                 d / td.pinch_base_dist
@@ -6377,7 +7487,9 @@ impl BackendState {
                                             }
                                         })
                                         .unwrap_or(1.0),
-                                    angle: td.primary_slot_angle() - td.pinch_base_angle,
+                                    angle: td
+                                        .gesture_primary_slot_angle((*lib_dev).click_method == 1)
+                                        - td.pinch_base_angle,
                                     cancelled: false,
                                 }),
                                 context: ctx,
@@ -6434,7 +7546,6 @@ impl BackendState {
                             td.tap_drag_active = false;
                         } else if cfg_tap
                             && !td.tap_emitted
-                            && !dwt_active
                             && !td.touch_arbitration_suppressed
                             && td
                                 .touch_start_time
@@ -6636,9 +7747,11 @@ impl BackendState {
                 } else if code == AbsoluteAxisCode::ABS_MT_TRACKING_ID.0 {
                     let slot = td.current_slot;
                     if slot < td.mt_slots.len() {
+                        let new_touch_palm = td.dwt_palm_for_new_touch(ts_usec);
                         let mt_slot = &mut td.mt_slots[slot];
                         let new_contact =
                             val >= 0 && (!mt_slot.active || mt_slot.tracking_id != val);
+                        let typing_palm = new_contact && new_touch_palm.is_some();
                         // libevdev absorbs SYN_DROPPED while reconstructing
                         // the current device state. A replacement tracking ID
                         // can consequently arrive on an already-active slot
@@ -6647,6 +7760,7 @@ impl BackendState {
                         // gesture rebase until that contact has a position.
                         td.mt_contact_count_changed |= mt_slot.active != (val >= 0) || new_contact;
                         mt_slot.active = val >= 0;
+                        mt_slot.began_this_frame = new_contact;
                         mt_slot.tracking_id = val;
                         if new_contact {
                             mt_slot.button_area_classification_pending = true;
@@ -6667,8 +7781,14 @@ impl BackendState {
                             mt_slot.edge_last_y = 0.0;
                             mt_slot.edge_started_at = None;
                             mt_slot.edge_axis = 0;
+                            mt_slot.generic_palm = None;
+                            mt_slot.dwt_released_this_frame = false;
+                            mt_slot.pressure = 0.0;
+                            mt_slot.touch_major = 0.0;
+                            mt_slot.touch_minor = 0.0;
                             mt_slot.palm_suppressed =
                                 mt_slot.tool_type == 2 || td.touch_arbitration_suppressed;
+                            TrackedDevice::mark_dwt_palm(mt_slot, new_touch_palm, ts_usec);
                             mt_slot.cancel_pending = false;
                         } else {
                             mt_slot.button_area_classification_pending = false;
@@ -6681,8 +7801,18 @@ impl BackendState {
                             mt_slot.gesture_rebase_pending = false;
                             mt_slot.gesture_position_seen = false;
                             mt_slot.edge_classification_pending = false;
+                            if val < 0 {
+                                mt_slot.began_this_frame = false;
+                                mt_slot.generic_palm = None;
+                                mt_slot.dwt_released_this_frame = false;
+                                mt_slot.dwt_palm = None;
+                                mt_slot.dwt_palm_started_usec = None;
+                            }
                         }
                         mt_slot.dirty = true;
+                        if typing_palm {
+                            td.tap_emitted = true;
+                        }
                     }
                 } else if code == AbsoluteAxisCode::ABS_MT_POSITION_X.0 {
                     let slot = td.current_slot;
@@ -6713,6 +7843,27 @@ impl BackendState {
                     if slot < td.mt_slots.len() {
                         td.mt_slots[slot].distance = val as f64;
                     }
+                } else if code == AbsoluteAxisCode::ABS_MT_PRESSURE.0 {
+                    let slot = td.current_slot;
+                    if slot < td.mt_slots.len() {
+                        let mt_slot = &mut td.mt_slots[slot];
+                        mt_slot.pressure = val as f64;
+                        mt_slot.dirty = true;
+                    }
+                } else if code == AbsoluteAxisCode::ABS_MT_TOUCH_MAJOR.0 {
+                    let slot = td.current_slot;
+                    if slot < td.mt_slots.len() {
+                        let mt_slot = &mut td.mt_slots[slot];
+                        mt_slot.touch_major = val as f64;
+                        mt_slot.dirty = true;
+                    }
+                } else if code == AbsoluteAxisCode::ABS_MT_TOUCH_MINOR.0 {
+                    let slot = td.current_slot;
+                    if slot < td.mt_slots.len() {
+                        let mt_slot = &mut td.mt_slots[slot];
+                        mt_slot.touch_minor = val as f64;
+                        mt_slot.dirty = true;
+                    }
                 } else if code == AbsoluteAxisCode::ABS_MT_TOOL_TYPE.0 {
                     let slot = td.current_slot;
                     if slot < td.mt_slots.len() {
@@ -6724,10 +7875,16 @@ impl BackendState {
                             mt_slot.dirty = true;
                         }
                     }
+                } else if code == AbsoluteAxisCode::ABS_PRESSURE.0 {
+                    if !td.has_mt {
+                        let mt_slot = &mut td.mt_slots[0];
+                        mt_slot.pressure = val as f64;
+                        mt_slot.dirty = true;
+                    }
                 }
                 // ---- Single-touch ABS_X/Y ----
                 else if code == AbsoluteAxisCode::ABS_X.0 {
-                    if td.is_pointer && !td.has_mt {
+                    if !td.has_mt && (td.is_pointer || (*lib_dev).has_touch) {
                         td.mt_slots[0].x = val as f64;
                         td.mt_slots[0].dirty = true;
                     }
@@ -6742,7 +7899,7 @@ impl BackendState {
                     }
                     td.last_x = Some(val);
                 } else if code == AbsoluteAxisCode::ABS_Y.0 {
-                    if td.is_pointer && !td.has_mt {
+                    if !td.has_mt && (td.is_pointer || (*lib_dev).has_touch) {
                         td.mt_slots[0].y = val as f64;
                         td.mt_slots[0].dirty = true;
                     }
@@ -6773,6 +7930,13 @@ impl BackendState {
                 if ev.code() != 0 {
                     return;
                 }
+
+                // A typing/trackpoint palm is released only on a subsequent
+                // contact update after its timer has expired. This keeps a
+                // resting palm ignored but lets a freshly-started contact
+                // resume pointer motion, matching upstream's nuanced rule.
+                td.release_expired_dwt_palms();
+                td.refresh_generic_palms();
 
                 if (*lib_dev).has_touch {
                     if td.protocol_a {
@@ -6869,6 +8033,7 @@ impl BackendState {
                         td.touch_active = td.mt_slots.iter().any(|slot| slot.active);
                         if !td.touch_active && !touch_arbitrated {
                             td.touch_arbitration_suppressed = false;
+                            Self::reset_touchpad_sequence_after_arbitration(td);
                         }
                         return;
                     }
@@ -6972,6 +8137,15 @@ impl BackendState {
                     return;
                 }
 
+                if (*lib_dev).has_gesture {
+                    let sequence_active = td.active_slot_count() != 0;
+                    if sequence_active && !td.touchpad_left_handed_sequence_active {
+                        td.touchpad_left_handed_applied =
+                            paired_left_handed_rotation_enabled(ctx, lib_dev);
+                    }
+                    td.touchpad_left_handed_sequence_active = sequence_active;
+                }
+
                 if td.touch_arbitration_suppressed {
                     for slot in &mut td.mt_slots {
                         slot.palm_suppressed = slot.active;
@@ -6987,6 +8161,7 @@ impl BackendState {
                     td.finger_scroll_constraint.reset();
                     if !td.touch_active && !touch_arbitrated {
                         td.touch_arbitration_suppressed = false;
+                        Self::reset_touchpad_sequence_after_arbitration(td);
                     }
                     return;
                 }
@@ -7004,7 +8179,20 @@ impl BackendState {
                     return;
                 }
 
-                let pinch_distance = td.primary_slot_distance();
+                // While an active DWT/DWTP interval is in effect, libinput
+                // still processes physical buttons but stops touchpad
+                // scrolling and gesture/pointer motion for every contact.
+                // Individual contacts retain their palm classification so
+                // their post-timeout lifecycle can be resolved separately.
+                if td.dwt.active || td.dwtp.active {
+                    td.current_dx = 0;
+                    td.current_dy = 0;
+                    td.remainder_x = 0.0;
+                    td.remainder_y = 0.0;
+                    td.finger_scroll_constraint.reset();
+                    return;
+                }
+
                 let button_areas = (*lib_dev).click_method == 1;
                 let x_range = (*lib_dev).abs_x_range.or(td.abs_x_range);
                 let y_range = (*lib_dev).abs_y_range.or(td.abs_y_range);
@@ -7029,6 +8217,8 @@ impl BackendState {
                     );
                     td.classify_gesture_contacts(button_areas, button_top, ts_usec);
                     td.reset_gesture_contact_initials(button_areas);
+                    let edge_gesture_contacts_before =
+                        td.gesture_tracked_contact_count(button_areas);
                     let edge_frame = td.process_edge_scroll_frame(
                         edge_enabled,
                         (*lib_dev).abs_x_resolution,
@@ -7038,13 +8228,14 @@ impl BackendState {
                         (*lib_dev).width_mm,
                         (*lib_dev).height_mm,
                     );
+                    if edge_gesture_contacts_before
+                        != td.gesture_tracked_contact_count(button_areas)
+                    {
+                        td.rebase_gesture_contacts_after_eligibility_change(button_areas);
+                    }
                     Self::emit_edge_scroll_frame(ts_usec, lib_dev, ctx, edge_frame, cfg_nat, out);
                     let n_fingers = td.gesture_finger_count(button_areas);
-                    let eligible_tracked_contacts = td
-                        .mt_slots
-                        .iter()
-                        .filter(|slot| slot.active && (!button_areas || !slot.button_area_excluded))
-                        .count();
+                    let eligible_tracked_contacts = td.gesture_tracked_contact_count(button_areas);
                     td.finger_scroll_constraint.reset();
                     if td.touch_active {
                         td.tap_fingers = td.tap_fingers.max(n_fingers as u32);
@@ -7101,17 +8292,7 @@ impl BackendState {
                         td.hold_started_at = None;
                         td.hold_blocked = true;
                     }
-                    td.hold_contact_changed = true;
-                    if !td.hold_active {
-                        if n_fingers == 0 {
-                            td.hold_started_at = None;
-                            td.hold_blocked = false;
-                            td.hold_fingers = 0;
-                        } else if !td.hold_blocked {
-                            td.hold_started_at.get_or_insert_with(Instant::now);
-                            td.hold_fingers = td.hold_fingers.max(n_fingers as i32);
-                        }
-                    }
+                    td.sync_gesture_finger_count(n_fingers);
                     if ((*lib_dev).scroll_method != 1
                         || n_fingers != 2
                         || eligible_tracked_contacts == 0)
@@ -7161,9 +8342,9 @@ impl BackendState {
                     td.gesture_last_centroid = td.gesture_centroid(button_areas);
                     td.pinch_base_centroid = td.gesture_last_centroid;
                     if !td.pinch_active && n_fingers >= 2 {
-                        if let Some(distance) = td.primary_slot_distance() {
+                        if let Some(distance) = td.gesture_primary_slot_distance(button_areas) {
                             td.pinch_base_dist = distance;
-                            td.pinch_base_angle = td.primary_slot_angle();
+                            td.pinch_base_angle = td.gesture_primary_slot_angle(button_areas);
                             td.pinch_fingers = n_fingers as i32;
                         }
                     }
@@ -7188,33 +8369,9 @@ impl BackendState {
                     // The set of gesture-eligible contacts changed even
                     // though the kernel's MT contact count did not. Rebase
                     // before calculating a centroid delta for this frame.
-                    td.current_dx = 0;
-                    td.current_dy = 0;
-                    td.remainder_x = 0.0;
-                    td.remainder_y = 0.0;
-                    td.finger_scroll_constraint.reset();
-                    td.reset_gesture_contact_initials(button_areas);
-                    td.gesture_last_centroid = td.gesture_centroid(button_areas);
-                    td.pinch_base_centroid = td.gesture_last_centroid;
-                    if !td.pinch_active && td.gesture_finger_count(button_areas) >= 2 {
-                        if let Some(distance) = td.primary_slot_distance() {
-                            td.pinch_base_dist = distance;
-                            td.pinch_base_angle = td.primary_slot_angle();
-                            td.pinch_fingers = td.gesture_finger_count(button_areas) as i32;
-                        }
-                    }
-                }
-
-                if dwt_active {
-                    let edge_axes = td.stop_edge_scroll();
-                    Self::emit_finger_axis(ts_usec, lib_dev, ctx, edge_axes, [0.0; 2], out);
-                    td.current_dx = 0;
-                    td.current_dy = 0;
-                    td.remainder_x = 0.0;
-                    td.remainder_y = 0.0;
-                    td.finger_scroll_constraint.reset();
-                    td.tap_emitted = true;
-                    return;
+                    let n_fingers = td.gesture_finger_count(button_areas);
+                    td.rebase_gesture_contacts_after_eligibility_change(button_areas);
+                    td.sync_gesture_finger_count(n_fingers);
                 }
 
                 if (*lib_dev).scroll_method != 1 && td.finger_scroll_axes != 0 {
@@ -7230,6 +8387,7 @@ impl BackendState {
                     td.finger_scroll_constraint.reset();
                 }
 
+                let edge_gesture_contacts_before = td.gesture_tracked_contact_count(button_areas);
                 let edge_frame = td.process_edge_scroll_frame(
                     edge_enabled,
                     (*lib_dev).abs_x_resolution,
@@ -7239,6 +8397,13 @@ impl BackendState {
                     (*lib_dev).width_mm,
                     (*lib_dev).height_mm,
                 );
+                let edge_gesture_contacts_changed =
+                    edge_gesture_contacts_before != td.gesture_tracked_contact_count(button_areas);
+                if edge_gesture_contacts_changed {
+                    let n_fingers = td.gesture_finger_count(button_areas);
+                    td.rebase_gesture_contacts_after_eligibility_change(button_areas);
+                    td.sync_gesture_finger_count(n_fingers);
+                }
                 let edge_suppresses_motion = edge_frame.suppress_normal_motion;
                 Self::emit_edge_scroll_frame(ts_usec, lib_dev, ctx, edge_frame, cfg_nat, out);
                 if edge_suppresses_motion {
@@ -7254,15 +8419,16 @@ impl BackendState {
                 }
 
                 // ---- Pinch UPDATE on SYN_REPORT ----
-                if td.pinch_active && !dwt_active {
+                if td.pinch_active {
                     td.finger_scroll_constraint.reset();
-                    if let Some(dist) = td.primary_slot_distance() {
+                    if let Some(dist) = td.gesture_primary_slot_distance(button_areas) {
                         let scale = if td.pinch_base_dist > 0.0 {
                             dist / td.pinch_base_dist
                         } else {
                             1.0
                         };
-                        let angle = td.primary_slot_angle() - td.pinch_base_angle;
+                        let angle =
+                            td.gesture_primary_slot_angle(button_areas) - td.pinch_base_angle;
                         out.push_back(LibinputEvent {
                             event_type: LibinputEventType::LIBINPUT_EVENT_GESTURE_PINCH_UPDATE,
                             payload: EventPayload::GesturePinchUpdate(GestureEvent {
@@ -7296,17 +8462,25 @@ impl BackendState {
                     }
                     td.gesture_last_centroid = centroid;
                 }
+                if td.touchpad_left_handed_applied {
+                    td.current_dx = td.current_dx.saturating_neg();
+                    td.current_dy = td.current_dy.saturating_neg();
+                }
                 let has_movement = td.current_dx != 0 || td.current_dy != 0;
-                if dwt_active {
+                let n_fingers = td.gesture_finger_count(button_areas);
+
+                // A single-touch device has no MT slot path to exclude a
+                // typing/trackpoint palm from its accumulated absolute
+                // motion.  If every active contact is suppressed, discard
+                // that motion before the generic one-finger pointer path.
+                if td.active_slot_count() > 0 && n_fingers == 0 {
                     td.current_dx = 0;
                     td.current_dy = 0;
                     td.remainder_x = 0.0;
                     td.remainder_y = 0.0;
                     td.finger_scroll_constraint.reset();
-                    td.tap_emitted = true;
                     return;
                 }
-                let n_fingers = td.gesture_finger_count(button_areas);
                 let drag_fingers = match (*lib_dev).drag_3fg_enabled {
                     1 => 3,
                     2 => 4,
@@ -7421,11 +8595,7 @@ impl BackendState {
                 }
 
                 let button_areas = (*lib_dev).click_method == 1;
-                let eligible_tracked_contacts = td
-                    .mt_slots
-                    .iter()
-                    .filter(|slot| slot.active && (!button_areas || !slot.button_area_excluded))
-                    .count();
+                let eligible_tracked_contacts = td.gesture_tracked_contact_count(button_areas);
                 if n_fingers != 2 || eligible_tracked_contacts == 0 {
                     td.finger_scroll_constraint.reset();
                 }
@@ -7452,6 +8622,7 @@ impl BackendState {
                     (Some((x, y)), Some((base_x, base_y))) => (x - base_x).hypot(y - base_y),
                     _ => f64::from(td.current_dx).hypot(f64::from(td.current_dy)),
                 };
+                let pinch_distance = td.gesture_primary_slot_distance(button_areas);
                 let starts_pinch = !td.pinch_active
                     && !td.swipe_active
                     && td.drag_3fg_candidate_since.is_none()
@@ -7690,5 +8861,38 @@ impl BackendState {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn active_slot(edge_state: EdgeScrollState) -> MtSlot {
+        MtSlot {
+            active: true,
+            edge_state,
+            ..MtSlot::default()
+        }
+    }
+
+    #[test]
+    fn edge_scroll_contacts_do_not_join_gestures() {
+        assert!(TrackedDevice::gesture_slot_eligible(
+            &active_slot(EdgeScrollState::Area),
+            false
+        ));
+        assert!(!TrackedDevice::gesture_slot_eligible(
+            &active_slot(EdgeScrollState::None),
+            false
+        ));
+        assert!(!TrackedDevice::gesture_slot_eligible(
+            &active_slot(EdgeScrollState::New),
+            false
+        ));
+        assert!(!TrackedDevice::gesture_slot_eligible(
+            &active_slot(EdgeScrollState::Active),
+            false
+        ));
     }
 }

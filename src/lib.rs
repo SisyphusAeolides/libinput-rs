@@ -1106,9 +1106,10 @@ pub unsafe extern "C" fn libinput_device_ref(dev: *mut LibinputDevice) -> *mut L
     if dev.is_null() {
         return std::ptr::null_mut();
     }
-    (*dev)
+    let current = (*dev)
         .refcount
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    (*dev).abi.refcount = current + 1;
     dev
 }
 
@@ -1121,6 +1122,7 @@ pub unsafe extern "C" fn libinput_device_unref(dev: *mut LibinputDevice) -> *mut
         .refcount
         .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
         - 1;
+    (*dev).abi.refcount = remaining;
     if remaining <= 0 {
         drop(Box::from_raw(dev));
         std::ptr::null_mut()
@@ -1731,9 +1733,10 @@ pub unsafe extern "C" fn libinput_device_config_scroll_set_button(
         return 1;
     }
     if button != 0
-        && (u16::try_from(button)
-            .ok()
-            .is_none_or(|button| !(*dev).event_codes.contains(&button)))
+        && match u16::try_from(button) {
+            Ok(button) => !(*dev).event_codes.contains(&button),
+            Err(_) => true,
+        }
     {
         return 2;
     }
@@ -1807,7 +1810,7 @@ pub unsafe extern "C" fn libinput_device_config_click_set_method(
     if dev.is_null() {
         return 1;
     }
-    if !matches!(method, 0 | 1 | 2) {
+    if !matches!(method, 0..=2) {
         return 2;
     }
     if method != 0 && method & (*dev).click_methods == 0 {
@@ -2008,9 +2011,11 @@ pub unsafe extern "C" fn libinput_device_config_dwt_get_timeout(dev: *const Libi
 pub unsafe extern "C" fn libinput_device_config_dwt_get_default_timeout(
     dev: *const LibinputDevice,
 ) -> u32 {
-    (!dev.is_null() && (*dev).dwt_available)
-        .then_some(500)
-        .unwrap_or(0)
+    if !dev.is_null() && (*dev).dwt_available {
+        500
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
@@ -2092,9 +2097,11 @@ pub unsafe extern "C" fn libinput_device_config_dwtp_get_timeout(
 pub unsafe extern "C" fn libinput_device_config_dwtp_get_default_timeout(
     dev: *const LibinputDevice,
 ) -> u32 {
-    (!dev.is_null() && (*dev).dwtp_available)
-        .then_some(300)
-        .unwrap_or(0)
+    if !dev.is_null() && (*dev).dwtp_available {
+        300
+    } else {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2230,6 +2237,7 @@ pub unsafe extern "C" fn libinput_device_set_seat_logical_name(
     (*replacement).seat = new_seat;
     (*ctx).event_queue.extend(removed);
     (*ctx).event_queue.extend(added);
+    (*replacement).abi.seat = new_seat;
     (*ctx).signal_fd();
     0
 }
@@ -2392,6 +2400,7 @@ pub unsafe extern "C" fn libinput_device_set_user_data(
         return;
     }
     (*dev).user_data = data;
+    (*dev).abi.user_data = data;
 }
 
 #[no_mangle]
@@ -3901,10 +3910,20 @@ pub unsafe extern "C" fn libinput_tablet_tool_get_name(
     if tool.is_null() {
         return std::ptr::null();
     }
-    (*tool)
-        .name
-        .as_ref()
-        .map_or(std::ptr::null(), |name| name.as_ptr())
+    let tool = tool.cast::<LibinputTabletTool>();
+    let tool = tool as *mut LibinputTabletTool;
+    if let Some(name) = (*tool).name.as_ref() {
+        return name.as_ptr();
+    }
+    if let Some(name) = crate::backend::tablet_tool_name_for_id((*tool).tool_id) {
+        (*tool).name = Some(name);
+        (*tool)
+            .name
+            .as_ref()
+            .map_or(std::ptr::null(), |name| name.as_ptr())
+    } else {
+        std::ptr::null()
+    }
 }
 
 #[no_mangle]

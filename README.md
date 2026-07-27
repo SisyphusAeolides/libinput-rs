@@ -31,19 +31,16 @@ Version 0.2.0 fixes the deployment and lifecycle hazards:
 - keyboards are never grabbed or forwarded;
 - only capability-identified touchpads are grabbed;
 - forwarding failures terminate the daemon and release every grab;
-- systemd rate-limits failures and does not start the daemon before a display
-  manager;
+- systemd rate-limits failures without imposing display-manager ordering;
 - suspend and resume now release and reopen ABI-backend devices;
-- kernel-module reset and autosuspend modification hooks were removed.
+- kernel-module reset and autosuspend modifications were removed.
 
 ## Supported systems
 
-The supported packaging path is DNF/RPM on:
-
-- Fedora 44
-- Fedora Rawhide
-- EPEL 9 and 10
-- RHEL-compatible 9 and 10 chroots
+The supported packaging path is DNF/RPM on Fedora releases whose repositories
+provide `libwacom-devel` 2.18 or newer. The initial COPR builds target Fedora;
+Enterprise Linux 9 and 10 do not currently provide the libwacom ABI required
+by this implementation.
 
 ## Install from COPR
 
@@ -79,7 +76,7 @@ sudo ldconfig
 ## Build with DNF dependencies
 
 ```bash
-sudo dnf install rust cargo gcc make binutils systemd-rpm-macros
+sudo dnf install rust cargo gcc make systemd-devel libwacom-devel pkgconf-pkg-config
 make all
 make check
 make test
@@ -114,6 +111,14 @@ Do not copy or symlink it over the distribution's `libinput.so.10`. Matching
 an ABI surface is not the same as matching libinput's complete udev, seat,
 device-quirk, gesture, and lifecycle behavior.
 
+For isolated C consumer testing, install the private development surface and
+use its distinct pkg-config name:
+
+```bash
+sudo dnf install libinput-rs-devel
+pkg-config --cflags --libs libinput-rs
+```
+
 ## Formal safety models
 
 The fail-open state machine is modeled three ways under `proofs/`:
@@ -125,7 +130,7 @@ The fail-open state machine is modeled three ways under `proofs/`:
   fail-open grabbing, exactly-once descriptor closure, and udev-only hotplug.
 
 Agda, Idris 2, and GNU Fortran are available through DNF on the supported
-Fedora and EPEL targets:
+Fedora targets:
 
 ```bash
 sudo dnf install Agda idris2 gcc-gfortran

@@ -11,10 +11,11 @@ The reference is upstream libinput 1.31.3 at commit
 `libinput.so.10.13.0` ABI.
 
 Use `scripts/check-abi.sh` for symbol, symbol-version, version-node, and SONAME
-parity. Use `scripts/run-upstream-suite.sh` with an upstream build directory
-to run its test binary against the Rust library without changing the
+parity. Use `scripts/run-upstream-public-abi-suite.sh` with a clean checkout
+of the pinned upstream commit and its configured build directory to build a
+disposable, public-ABI test runner. It runs the suite serially against the
+Rust library through an isolated loader path and does not change the
 installed system library.
 
 The gate file records only complete test groups. Individual passing tests are
 useful progress, but do not turn a group green.
-

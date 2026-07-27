@@ -15,7 +15,11 @@ struct Section {
     model_apple_touchpad: bool,
     model_apple_touchpad_onebutton: bool,
     model_clickfinger_default: bool,
+    model_wacom_touchpad: bool,
     tpkb_combo_layout_below: bool,
+    keyboard_integration: Option<KeyboardIntegration>,
+    palm_pressure_threshold: Option<u32>,
+    palm_size_threshold: Option<u32>,
 }
 
 struct DeviceIdentity<'a> {
@@ -24,7 +28,16 @@ struct DeviceIdentity<'a> {
     vendor: u16,
     product: u16,
     version: u16,
-    udev_type: &'a str,
+    udev_types: &'a [&'a str],
+}
+
+/// How a keyboard is physically integrated with the system.  This is a
+/// quirk-derived property: bus type alone is not enough to decide whether a
+/// keyboard should participate in a touchpad's disable-while-typing state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyboardIntegration {
+    Internal,
+    External,
 }
 
 #[derive(Default)]
@@ -43,7 +56,11 @@ pub struct AppliedQuirks {
     pub model_apple_touchpad: bool,
     pub model_apple_touchpad_onebutton: bool,
     pub model_clickfinger_default: bool,
+    pub model_wacom_touchpad: bool,
     pub tpkb_combo_layout_below: bool,
+    pub keyboard_integration: Option<KeyboardIntegration>,
+    pub palm_pressure_threshold: Option<u32>,
+    pub palm_size_threshold: Option<u32>,
 }
 
 pub fn apply_quirks(
@@ -52,7 +69,7 @@ pub fn apply_quirks(
     vendor: u16,
     product: u16,
     version: u16,
-    udev_type: &str,
+    udev_types: &[&str],
     event_codes: &mut Vec<u16>,
 ) -> AppliedQuirks {
     let mut applied = AppliedQuirks::default();
@@ -78,7 +95,7 @@ pub fn apply_quirks(
         vendor,
         product,
         version,
-        udev_type,
+        udev_types,
     };
     for path in files {
         apply_file(&path, &identity, event_codes, &mut applied);
@@ -127,6 +144,16 @@ fn apply_file(
             section.resolution_hint = parse_dimensions(value);
         } else if key.trim() == "AttrTPKComboLayout" {
             section.tpkb_combo_layout_below = value.trim().eq_ignore_ascii_case("below");
+        } else if key.trim() == "AttrKeyboardIntegration" {
+            section.keyboard_integration = match value.trim().to_ascii_lowercase().as_str() {
+                "internal" => Some(KeyboardIntegration::Internal),
+                "external" => Some(KeyboardIntegration::External),
+                _ => None,
+            };
+        } else if key.trim() == "AttrPalmPressureThreshold" {
+            section.palm_pressure_threshold = value.trim().parse().ok();
+        } else if key.trim() == "AttrPalmSizeThreshold" {
+            section.palm_size_threshold = value.trim().parse().ok();
         } else if key.trim() == "AttrIsVirtual" {
             section.is_virtual = value.trim() == "1";
         } else if key.trim() == "ModelLenovoScrollPoint" {
@@ -139,6 +166,8 @@ fn apply_file(
             section.model_apple_touchpad = value.trim() == "1";
         } else if key.trim() == "ModelAppleTouchpadOneButton" {
             section.model_apple_touchpad_onebutton = value.trim() == "1";
+        } else if key.trim() == "ModelWacomTouchpad" {
+            section.model_wacom_touchpad = value.trim() == "1";
         } else if matches!(
             key.trim(),
             "ModelChromebook"
@@ -241,7 +270,20 @@ fn apply_section(
     applied.model_apple_touchpad |= section.model_apple_touchpad;
     applied.model_apple_touchpad_onebutton |= section.model_apple_touchpad_onebutton;
     applied.model_clickfinger_default |= section.model_clickfinger_default;
+    applied.model_wacom_touchpad |= section.model_wacom_touchpad;
     applied.tpkb_combo_layout_below |= section.tpkb_combo_layout_below;
+    if let Some(integration) = section.keyboard_integration {
+        // Quirk files are applied in lexical order, matching the precedence
+        // model of the upstream quirk database. A later matching rule is
+        // therefore allowed to replace an earlier integration classification.
+        applied.keyboard_integration = Some(integration);
+    }
+    if let Some(threshold) = section.palm_pressure_threshold {
+        applied.palm_pressure_threshold = Some(threshold);
+    }
+    if let Some(threshold) = section.palm_size_threshold {
+        applied.palm_size_threshold = Some(threshold);
+    }
 }
 
 fn match_property(key: &str, value: &str, identity: &DeviceIdentity<'_>) -> bool {
@@ -259,7 +301,10 @@ fn match_property(key: &str, value: &str, identity: &DeviceIdentity<'_>) -> bool
         "MatchVendor" => parse_number(value).is_some_and(|number| number == identity.vendor),
         "MatchProduct" => parse_number(value).is_some_and(|number| number == identity.product),
         "MatchVersion" => parse_number(value).is_some_and(|number| number == identity.version),
-        "MatchUdevType" => value.eq_ignore_ascii_case(identity.udev_type),
+        "MatchUdevType" => identity
+            .udev_types
+            .iter()
+            .any(|udev_type| value.eq_ignore_ascii_case(udev_type)),
         // A match constraint we cannot establish must not broaden a quirk.
         _ => false,
     }
@@ -376,5 +421,21 @@ mod tests {
         assert_eq!(parse_dimensions("100x55"), Some((100.0, 55.0)));
         assert_eq!(parse_dimensions("0x55"), None);
         assert_eq!(parse_dimensions("invalid"), None);
+    }
+
+    #[test]
+    fn applies_apple_touchpad_onebutton_quirk_by_identity() {
+        std::env::set_var("LIBINPUT_QUIRKS_DIR", "/tmp/libinput-rs-quirks-debug/");
+        let mut event_codes = Vec::new();
+        let applied = apply_quirks(
+            "litest appletouch",
+            0x03,
+            0x05ac,
+            0x021a,
+            0x00,
+            &["touchpad"],
+            &mut event_codes,
+        );
+        assert!(applied.model_apple_touchpad_onebutton);
     }
 }

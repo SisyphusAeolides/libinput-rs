@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::ffi::CString;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::backend::BackendState;
@@ -360,6 +360,211 @@ pub enum EventPayload {
 }
 
 // ---------------------------------------------------------------------------
+// Private ABI-compatible compatibility layer
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+pub struct LibinputList {
+    pub next: *mut LibinputList,
+    pub prev: *mut LibinputList,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LibinputBitmask {
+    pub mask: u32,
+}
+
+#[repr(C)]
+pub struct LibinputDeviceConfigTap {}
+
+#[repr(C)]
+pub struct LibinputDeviceConfigCalibration {}
+
+#[repr(C)]
+pub struct LibinputDeviceConfigArea {}
+
+#[repr(C)]
+pub struct LibinputDeviceConfigSendEvents {}
+
+#[repr(C)]
+pub struct LibinputDeviceConfigAccel {}
+
+#[repr(C)]
+pub struct LibinputDeviceConfigNaturalScroll {}
+
+#[repr(C)]
+pub struct LibinputDeviceConfigLeftHanded {}
+
+#[repr(C)]
+pub struct LibinputDeviceConfigScrollMethod {}
+
+#[repr(C)]
+pub struct LibinputDeviceConfigClickMethod {}
+
+#[repr(C)]
+pub struct LibinputDeviceConfigMiddleEmulation {}
+
+#[repr(C)]
+pub struct LibinputDeviceConfigDwt {}
+
+#[repr(C)]
+pub struct LibinputDeviceConfigDwtp {}
+
+#[repr(C)]
+pub struct LibinputDeviceConfigRotation {}
+
+#[repr(C)]
+pub struct LibinputDeviceConfig3FgDrag {}
+
+#[repr(C)]
+pub struct LibinputDeviceConfigGesture {
+    pub set_hold_enabled:
+        Option<unsafe extern "C" fn(*mut LibinputDevice, libc::c_uint) -> libc::c_uint>,
+    pub get_hold_enabled: Option<unsafe extern "C" fn(*mut LibinputDevice) -> libc::c_uint>,
+    pub get_hold_default: Option<unsafe extern "C" fn(*const LibinputDevice) -> libc::c_uint>,
+}
+
+#[repr(C)]
+pub struct LibinputDeviceConfig {
+    pub tap: *mut LibinputDeviceConfigTap,
+    pub calibration: *mut LibinputDeviceConfigCalibration,
+    pub area: *mut LibinputDeviceConfigArea,
+    pub sendevents: *mut LibinputDeviceConfigSendEvents,
+    pub accel: *mut LibinputDeviceConfigAccel,
+    pub natural_scroll: *mut LibinputDeviceConfigNaturalScroll,
+    pub left_handed: *mut LibinputDeviceConfigLeftHanded,
+    pub scroll_method: *mut LibinputDeviceConfigScrollMethod,
+    pub click_method: *mut LibinputDeviceConfigClickMethod,
+    pub middle_emulation: *mut LibinputDeviceConfigMiddleEmulation,
+    pub dwt: *mut LibinputDeviceConfigDwt,
+    pub dwtp: *mut LibinputDeviceConfigDwtp,
+    pub rotation: *mut LibinputDeviceConfigRotation,
+    pub gesture: *mut LibinputDeviceConfigGesture,
+    pub drag_3fg: *mut LibinputDeviceConfig3FgDrag,
+}
+
+const LIBINPUT_CONFIG_STATUS_SUCCESS: libc::c_uint = 0;
+const LIBINPUT_CONFIG_STATUS_UNSUPPORTED: libc::c_uint = 1;
+const LIBINPUT_CONFIG_STATUS_INVALID: libc::c_uint = 2;
+const LIBINPUT_CONFIG_HOLD_DISABLED: libc::c_uint = 0;
+const LIBINPUT_CONFIG_HOLD_ENABLED: libc::c_uint = 1;
+
+static GESTURE_CONFIG: OnceLock<LibinputDeviceConfigGesture> = OnceLock::new();
+
+fn compat_gesture_config() -> *mut LibinputDeviceConfigGesture {
+    GESTURE_CONFIG.get_or_init(|| LibinputDeviceConfigGesture {
+        set_hold_enabled: Some(libinput_device_config_gesture_set_hold_enabled),
+        get_hold_enabled: Some(libinput_device_config_gesture_get_hold_enabled),
+        get_hold_default: Some(libinput_device_config_gesture_get_hold_default_enabled),
+    }) as *const _ as *mut _
+}
+
+#[no_mangle]
+unsafe extern "C" fn libinput_device_config_gesture_set_hold_enabled(
+    device: *mut LibinputDevice,
+    enable: libc::c_uint,
+) -> libc::c_uint {
+    if enable != LIBINPUT_CONFIG_HOLD_ENABLED && enable != LIBINPUT_CONFIG_HOLD_DISABLED {
+        return LIBINPUT_CONFIG_STATUS_INVALID;
+    }
+    if device.is_null() {
+        return LIBINPUT_CONFIG_STATUS_INVALID;
+    }
+    if !(*device).has_gesture {
+        return LIBINPUT_CONFIG_STATUS_UNSUPPORTED;
+    }
+    (*device).hold_enabled = enable == LIBINPUT_CONFIG_HOLD_ENABLED;
+    LIBINPUT_CONFIG_STATUS_SUCCESS
+}
+
+#[no_mangle]
+unsafe extern "C" fn libinput_device_config_gesture_get_hold_enabled(
+    device: *mut LibinputDevice,
+) -> libc::c_uint {
+    if device.is_null() || !(*device).has_gesture {
+        return LIBINPUT_CONFIG_HOLD_DISABLED;
+    }
+    if (*device).hold_enabled {
+        LIBINPUT_CONFIG_HOLD_ENABLED
+    } else {
+        LIBINPUT_CONFIG_HOLD_DISABLED
+    }
+}
+
+#[no_mangle]
+unsafe extern "C" fn libinput_device_config_gesture_get_hold_default_enabled(
+    device: *const LibinputDevice,
+) -> libc::c_uint {
+    if device.is_null() || !(*device).has_gesture {
+        return LIBINPUT_CONFIG_HOLD_DISABLED;
+    }
+    if (*device).hold_default_enabled {
+        LIBINPUT_CONFIG_HOLD_ENABLED
+    } else {
+        LIBINPUT_CONFIG_HOLD_DISABLED
+    }
+}
+
+#[repr(C)]
+pub struct LibinputDeviceAbi {
+    pub seat: *mut LibinputSeat,
+    pub group: *mut LibinputDeviceGroup,
+    pub link: LibinputList,
+    pub event_listeners: LibinputList,
+    pub user_data: *mut libc::c_void,
+    pub refcount: i32,
+    pub config: LibinputDeviceConfig,
+    pub plugin_frame_callbacks: LibinputBitmask,
+    pub disabled_features: LibinputBitmask,
+    pub inject_evdev_frame: Option<unsafe extern "C" fn(*mut LibinputDevice, *mut libc::c_void)>,
+}
+
+impl LibinputDeviceAbi {
+    fn new(
+        seat: *mut LibinputSeat,
+        group: *mut LibinputDeviceGroup,
+        user_data: *mut libc::c_void,
+        refcount: i32,
+    ) -> Self {
+        Self {
+            seat,
+            group,
+            link: LibinputList {
+                next: std::ptr::null_mut(),
+                prev: std::ptr::null_mut(),
+            },
+            event_listeners: LibinputList {
+                next: std::ptr::null_mut(),
+                prev: std::ptr::null_mut(),
+            },
+            user_data,
+            refcount,
+            config: LibinputDeviceConfig {
+                tap: std::ptr::null_mut(),
+                calibration: std::ptr::null_mut(),
+                area: std::ptr::null_mut(),
+                sendevents: std::ptr::null_mut(),
+                accel: std::ptr::null_mut(),
+                natural_scroll: std::ptr::null_mut(),
+                left_handed: std::ptr::null_mut(),
+                scroll_method: std::ptr::null_mut(),
+                click_method: std::ptr::null_mut(),
+                middle_emulation: std::ptr::null_mut(),
+                dwt: std::ptr::null_mut(),
+                dwtp: std::ptr::null_mut(),
+                rotation: std::ptr::null_mut(),
+                gesture: compat_gesture_config(),
+                drag_3fg: std::ptr::null_mut(),
+            },
+            plugin_frame_callbacks: LibinputBitmask { mask: 0 },
+            disabled_features: LibinputBitmask { mask: 0 },
+            inject_evdev_frame: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // LibinputEvent
 // ---------------------------------------------------------------------------
 
@@ -434,7 +639,9 @@ impl LibinputDeviceGroup {
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
+#[repr(C)]
 pub struct LibinputDevice {
+    pub abi: LibinputDeviceAbi,
     pub name: CString,
     pub sysname: CString,
     pub devnode: CString,
@@ -516,6 +723,8 @@ pub struct LibinputDevice {
     pub context: *mut LibinputContext,
     pub udev_device: *mut libc::c_void,
     pub group: *mut LibinputDeviceGroup,
+    pub hold_enabled: bool,
+    pub hold_default_enabled: bool,
 }
 
 unsafe impl Send for LibinputDevice {}
@@ -527,7 +736,9 @@ impl LibinputDevice {
         seat: *mut LibinputSeat,
         context: *mut LibinputContext,
     ) -> Self {
+        let group = Box::into_raw(Box::new(LibinputDeviceGroup::new()));
         Self {
+            abi: LibinputDeviceAbi::new(seat, group, std::ptr::null_mut(), 1),
             name: CString::new(name).unwrap_or_else(|_| CString::new("Unknown").unwrap()),
             sysname: CString::new("").unwrap(),
             devnode: CString::new(devnode).unwrap_or_else(|_| CString::new("").unwrap()),
@@ -608,7 +819,9 @@ impl LibinputDevice {
             seat,
             context,
             udev_device: std::ptr::null_mut(),
-            group: Box::into_raw(Box::new(LibinputDeviceGroup::new())),
+            group,
+            hold_enabled: false,
+            hold_default_enabled: false,
         }
     }
 }

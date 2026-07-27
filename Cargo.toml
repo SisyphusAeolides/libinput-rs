@@ -8,6 +8,7 @@ description = "Fail-open Rust touchpad companion and experimental libinput ABI i
 license = "MIT"
 repository = "https://github.com/SisyphusAeolides/libinput-rs"
 readme = "README.md"
+exclude = [".cargo", "vendor"]
 
 [[bin]]
 name = "libinput-rs"

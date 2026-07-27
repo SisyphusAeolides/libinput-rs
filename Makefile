@@ -4,8 +4,10 @@ UNITDIR ?= $(PREFIX)/lib/systemd/system
 DESTDIR ?=
 FC = gfortran
 REFERENCE_LIBINPUT ?= /usr/lib64/libinput.so.10
+RPM_RUNTIME ?=
+RPM_DEVEL ?=
 
-.PHONY: all build shared check packaging-check test abi-check proofs proofs-strict install
+.PHONY: all build shared check packaging-check crate-package-check rpm-devel-check test abi-check proofs proofs-strict install
 
 all: build shared
 
@@ -13,7 +15,7 @@ build:
 	CARGO_NET_OFFLINE=true CARGO_PROFILE_RELEASE_DEBUG=2 cargo build --frozen --release --bin libinput-rs
 
 shared:
-	CARGO_PROFILE_RELEASE_DEBUG=2 ./build-shared.sh
+	CARGO_NET_OFFLINE=true CARGO_PROFILE_RELEASE_DEBUG=2 ./build-shared.sh
 
 check: packaging-check
 	cargo check --locked
@@ -23,9 +25,26 @@ check: packaging-check
 packaging-check:
 	! grep -Eq '^Before=.*display-manager|^DefaultDependencies=no|^Restart=always' systemd/libinput-rs.service
 	! grep -Eq '^(Provides|Obsoletes):.*libinput' libinput-rs.spec
-	grep -q '^Requires: *%{_libdir}/libinput.so.10' libinput-rs.spec
+	! grep -q '^Requires: *libinput$$' libinput-rs.spec
+	grep -q '^%package devel' libinput-rs.spec
+	grep -q '%{_libdir}/libinput-rs/libinput.so.10.13.0' libinput-rs.spec
 	grep -q '%{_libdir}/libinput-rs/libinput.so.10' libinput-rs.spec
+	grep -q '%{_includedir}/libinput-rs/libinput.h' libinput-rs.spec
+	grep -q '%{_libdir}/pkgconfig/libinput-rs.pc' libinput-rs.spec
 	! grep -Eq '^install .*%\{_libdir\}/libinput\.so\.10' libinput-rs.spec
+	test -f packaging/libinput.h
+	test -f packaging/libinput-rs.pc.in
+	test -f packaging/libinput-rs-smoke.c
+	test -x scripts/verify-rpm-devel.sh
+
+crate-package-check:
+	cargo package --locked
+	! cargo package --locked --list | grep -Eq '/(vendor|\.cargo)/'
+
+rpm-devel-check:
+	test -n "$(RPM_RUNTIME)"
+	test -n "$(RPM_DEVEL)"
+	scripts/verify-rpm-devel.sh "$(RPM_RUNTIME)" "$(RPM_DEVEL)"
 
 test:
 	cargo test --locked
@@ -58,5 +77,10 @@ install: all
 	install -Dm755 target/release/libinput-rs $(DESTDIR)$(PREFIX)/bin/libinput-rs
 	install -Dm644 src/config.json $(DESTDIR)/etc/libinput-rs/config.json
 	install -Dm644 systemd/libinput-rs.service $(DESTDIR)$(UNITDIR)/libinput-rs.service
-	install -Dm755 target/release/libinput.so $(DESTDIR)$(LIBDIR)/libinput-rs/libinput.so.10
+	install -Dm755 target/release/libinput.so $(DESTDIR)$(LIBDIR)/libinput-rs/libinput.so.10.13.0
+	ln -s libinput.so.10.13.0 $(DESTDIR)$(LIBDIR)/libinput-rs/libinput.so.10
+	ln -s libinput.so.10 $(DESTDIR)$(LIBDIR)/libinput-rs/libinput.so
+	install -Dm644 packaging/libinput.h $(DESTDIR)$(PREFIX)/include/libinput-rs/libinput.h
+	install -d $(DESTDIR)$(LIBDIR)/pkgconfig
+	sed 's|@LIBDIR@|$(LIBDIR)|g' packaging/libinput-rs.pc.in > $(DESTDIR)$(LIBDIR)/pkgconfig/libinput-rs.pc
 	install -Dm644 packaging/libinput-rs.8 $(DESTDIR)$(PREFIX)/share/man/man8/libinput-rs.8
