@@ -18,8 +18,8 @@ shared:
 	CARGO_NET_OFFLINE=true CARGO_PROFILE_RELEASE_DEBUG=2 ./build-shared.sh
 
 check: packaging-check
-	cargo check --locked
-	cargo clippy --locked --all-targets -- -D warnings
+	cargo check --locked --workspace
+	cargo clippy --locked --workspace --all-targets -- -D warnings
 	cargo fmt --all -- --check
 
 packaging-check:
@@ -38,8 +38,8 @@ packaging-check:
 	test -x scripts/verify-rpm-devel.sh
 
 crate-package-check:
-	cargo package --locked --no-verify
-	! cargo package --locked --list | grep -Eq '/(vendor|\.cargo)/'
+	cargo package --locked --no-verify --package libinput-rs
+	! cargo package --locked --list --package libinput-rs | grep -Eq '/(vendor|\.cargo)/'
 
 rpm-devel-check:
 	test -n "$(RPM_RUNTIME)"
@@ -47,7 +47,7 @@ rpm-devel-check:
 	scripts/verify-rpm-devel.sh "$(RPM_RUNTIME)" "$(RPM_DEVEL)"
 
 test:
-	cargo test --locked
+	cargo test --locked --workspace
 
 abi-check: shared
 	scripts/check-abi.sh "$(REFERENCE_LIBINPUT)" target/release/libinput.so
