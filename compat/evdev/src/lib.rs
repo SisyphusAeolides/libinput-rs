@@ -100,10 +100,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(
-            names,
-            vec!["event0".to_string(), "event12".to_string()]
-        );
+        assert_eq!(names, vec!["event0".to_string(), "event12".to_string()]);
     }
 
     #[test]
