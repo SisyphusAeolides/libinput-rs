@@ -74,15 +74,23 @@ The daemon reads `/etc/libinput-rs/config.json`:
 The library is installed in the system linker path as a 100% drop-in replacement
 for the distribution's `libinput.so.10`. Development headers are also provided.
 
+The udev backend enumerates `/dev/input/event*` by directory entry and delegates
+the first device open to the compositor's `open_restricted` callback. This keeps
+startup discovery compatible with logind-managed permissions where the
+compositor can list device nodes but cannot open them directly.
+
 ## Formal safety models
 
-The fail-open state machine is modeled three ways under `proofs/`:
+The fail-open and restricted-discovery state machines are modeled three ways
+under `proofs/`:
 
-- Agda proves that a grab cannot be authorized while the output sink is absent;
-- Idris 2 uses indexed states and total transitions so invalid runtime states
-  are unconstructable;
-- Fortran provides an independently compiled executable reference model for
-  fail-open grabbing, exactly-once descriptor closure, and udev-only hotplug.
+- Agda proves that a grab cannot be authorized while the output sink is absent
+  and that listed event nodes remain discoverable without direct-open access;
+- Idris 2 uses indexed states and total transitions so invalid runtime and
+  restricted-open states are unconstructable;
+- Fortran provides independently compiled executable reference models for
+  fail-open grabbing, permission-independent discovery, exactly-once descriptor
+  closure, and udev-only hotplug.
 
 Agda, Idris 2, and GNU Fortran are available through DNF on the supported
 Fedora targets:
