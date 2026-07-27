@@ -81,29 +81,36 @@ jobs:
             -czf "$rpm_topdir/SOURCES/$package_name-$package_version.tar.gz" .
           rpmbuild -bs libinput-rs.spec --define "_topdir $rpm_topdir"
 
-      - name: Rebuild binary RPM
+      - name: Rebuild binary RPMs
         run: rpmbuild --rebuild "$RPM_TOPDIR"/SRPMS/*.src.rpm --define "_topdir $RPM_TOPDIR"
 
-      - name: Locate binary RPM
+      - name: Locate binary RPMs
         run: |
-          package=$(find "$RPM_TOPDIR/RPMS" -name 'libinput-rs-[0-9]*.rpm' -print -quit)
-          test -n "$package"
-          echo "RPM_PACKAGE=$package" >> "$GITHUB_ENV"
+          runtime=$(find "$RPM_TOPDIR/RPMS" -name 'libinput-rs-[0-9]*.rpm' -print -quit)
+          devel=$(find "$RPM_TOPDIR/RPMS" -name 'libinput-rs-devel-[0-9]*.rpm' -print -quit)
+          test -n "$runtime"
+          test -n "$devel"
+          echo "RPM_RUNTIME=$runtime" >> "$GITHUB_ENV"
+          echo "RPM_DEVEL=$devel" >> "$GITHUB_ENV"
 
       - name: Inspect RPM metadata
         run: |
-          rpm -qpl "$RPM_PACKAGE"
-          rpm -qp --provides "$RPM_PACKAGE"
-          rpm -qp --obsoletes "$RPM_PACKAGE"
+          for package in "$RPM_RUNTIME" "$RPM_DEVEL"; do
+            rpm -qpl "$package"
+            rpm -qp --provides "$package"
+            rpm -qp --obsoletes "$package"
+          done
 
-      - name: Upload binary RPM
+      - name: Upload binary RPMs
         uses: actions/upload-artifact@v4
         with:
-          name: libinput-rs-rpm
-          path: ${{ env.RPM_PACKAGE }}
+          name: libinput-rs-rpms
+          path: |
+            ${{ env.RPM_RUNTIME }}
+            ${{ env.RPM_DEVEL }}
 
-      - name: Verify RPM payload
-        run: make rpm-check RPM_PACKAGE="$RPM_PACKAGE"
+      - name: Verify RPM payloads
+        run: make rpm-devel-check RPM_RUNTIME="$RPM_RUNTIME" RPM_DEVEL="$RPM_DEVEL"
 
   rpm-lint:
     name: RPM lint
@@ -115,13 +122,13 @@ jobs:
       - name: Install rpmlint
         run: dnf -y -q install rpmlint >/dev/null 2>&1
 
-      - name: Download binary RPM
+      - name: Download binary RPMs
         uses: actions/download-artifact@v4
         with:
-          name: libinput-rs-rpm
+          name: libinput-rs-rpms
           path: rpm
 
-      - name: Lint RPM
+      - name: Lint RPMs
         shell: bash
         run: |
           set -o pipefail
