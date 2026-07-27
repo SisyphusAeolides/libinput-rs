@@ -58,8 +58,16 @@ jobs:
             echo "System libinput reference is unavailable; skipping ABI comparison."
           fi
 
-      - name: Dry-run crate package and list contents
-        run: make crate-package-check
+      - name: Package discovery crate
+        run: cargo package --locked --no-verify --package libinput-rs-evdev
+
+      - name: Package libinput crate
+        run: cargo package --locked --no-verify --package libinput-rs
+
+      - name: Verify crate contents
+        run: |
+          ! cargo package --locked --list --package libinput-rs-evdev | grep -Eq '/(vendor|\.cargo)/'
+          ! cargo package --locked --list --package libinput-rs | grep -Eq '/(vendor|\.cargo)/'
 
       - name: Verify ABI isolation
         run: |
