@@ -1,6 +1,7 @@
 PREFIX ?= /usr
 LIBDIR ?= $(PREFIX)/lib64
 UNITDIR ?= $(PREFIX)/lib/systemd/system
+PRESETDIR ?= $(PREFIX)/lib/systemd/system-preset
 DESTDIR ?=
 FC = gfortran
 REFERENCE_LIBINPUT ?= /usr/lib64/libinput.so.10
@@ -28,18 +29,20 @@ check: packaging-check
 
 packaging-check:
 	grep -Eq '^Before=.*display-manager|^DefaultDependencies=no|^Restart=always' systemd/libinput-rs.service
+	grep -qx 'enable libinput-rs.service' systemd/90-libinput-rs.preset
 	grep -Eq '^Provides: *libinput( |%)' libinput-rs.spec
 	grep -Eq '^Obsoletes: *libinput ' libinput-rs.spec
 	grep -q '^%package devel' libinput-rs.spec
 	grep -Eq '^Provides: *libinput-devel( |%)' libinput-rs.spec
 	grep -Eq '^Obsoletes: *libinput-devel ' libinput-rs.spec
 	grep -q '^%files devel' libinput-rs.spec
+	grep -q '%{_presetdir}/90-libinput-rs.preset' libinput-rs.spec
 	grep -q '%{_libdir}/libinput.so.10.13.0' libinput-rs.spec
 	grep -q '%{_libdir}/libinput.so.10' libinput-rs.spec
 	grep -q '%{_includedir}/libinput.h' libinput-rs.spec
 	grep -q '%{_libdir}/pkgconfig/libinput.pc' libinput-rs.spec
 	grep -Eq '^install .*%\{_libdir\}/libinput\.so\.10' libinput-rs.spec
-	test "$(PACKAGE_VERSION)" = "$$(awk '/^\[package\]/{package=1; next} package && /^version = /{gsub(/[\" ]/, "", $$3); print $$3; exit}' Cargo.toml)"
+	test "$(PACKAGE_VERSION)" = "$$(awk '/^\[package\]/{package=1; next} package && /^version = /{gsub(/[" ]/, "", $$3); print $$3; exit}' Cargo.toml)"
 	test -f packaging/libinput.h
 	test -f packaging/libinput-rs.pc.in
 	test -f packaging/libinput-rs-smoke.c
@@ -109,6 +112,7 @@ install: all
 	install -Dm755 target/release/libinput-rs $(DESTDIR)$(PREFIX)/bin/libinput-rs
 	install -Dm644 src/config.json $(DESTDIR)/etc/libinput-rs/config.json
 	install -Dm644 systemd/libinput-rs.service $(DESTDIR)$(UNITDIR)/libinput-rs.service
+	install -Dm644 systemd/90-libinput-rs.preset $(DESTDIR)$(PRESETDIR)/90-libinput-rs.preset
 	install -Dm755 target/release/libinput.so $(DESTDIR)$(LIBDIR)/libinput.so.10.13.0
 	ln -sf libinput.so.10.13.0 $(DESTDIR)$(LIBDIR)/libinput.so.10
 	ln -sf libinput.so.10 $(DESTDIR)$(LIBDIR)/libinput.so
