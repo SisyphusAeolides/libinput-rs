@@ -3,7 +3,7 @@
 
 Name:           libinput-rs
 Version:        0.2.1
-Release:        3%{?dist}
+Release:        4%{?dist}
 Summary:        Rust drop-in replacement for libinput
 
 Provides:       libinput = %{libinput_compat_version}
@@ -16,15 +16,11 @@ Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  cargo >= 1.75
 BuildRequires:  rust >= 1.75
-BuildRequires:  Agda
-BuildRequires:  idris2
 BuildRequires:  gcc
-BuildRequires:  gcc-gfortran
 BuildRequires:  make
 BuildRequires:  pkgconfig(libudev)
 BuildRequires:  systemd-devel
 BuildRequires:  systemd-rpm-macros
-BuildRequires:  libwacom-devel >= 2.18
 Requires:       systemd
 
 %description
@@ -79,7 +75,6 @@ done
 
 %check
 CARGO_NET_OFFLINE=true cargo test --frozen --workspace
-make proofs-strict
 test -e %{buildroot}%{_libdir}/libinput.so.10
 
 %post
@@ -94,7 +89,7 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 %files
 %license LICENSE
 %license %{_licensedir}/%{name}/third-party
-%doc README.md proofs/README.md
+%doc README.md
 %{_bindir}/libinput-rs
 %config(noreplace) %{_sysconfdir}/libinput-rs/config.json
 %{_unitdir}/libinput-rs.service
@@ -110,6 +105,12 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 %{_libdir}/pkgconfig/libinput.pc
 
 %changelog
+* Mon Jul 27 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.2.1-4
+- Make COPR builds portable across Fedora, EPEL, and RHEL chroots
+- Keep formal proof compilers in CI instead of RPM build dependencies
+- Remove the unused libwacom build and linker dependency
+- Eliminate the duplicate README documentation entry
+
 * Mon Jul 27 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.2.1-3
 - Enable the companion daemon on first installation with a vendor preset
 - Preserve explicit administrator enable and disable choices on upgrades
