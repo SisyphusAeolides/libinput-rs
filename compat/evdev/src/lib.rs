@@ -87,9 +87,9 @@ mod tests {
         let directory = TestDirectory::new();
         symlink(directory.0.join("missing-target"), directory.0.join("event0"))
             .expect("create unopenable event node");
-        fs::write(directory.0.join("event12"), []).expect("create event node");
-        fs::write(directory.0.join("eventx"), []).expect("create invalid event name");
-        fs::write(directory.0.join("mouse0"), []).expect("create non-event node");
+        fs::write(directory.0.join("event12"), b"").expect("create event node");
+        fs::write(directory.0.join("eventx"), b"").expect("create invalid event name");
+        fs::write(directory.0.join("mouse0"), b"").expect("create non-event node");
 
         let names = enumerate_directory(&directory.0)
             .map(|(path, ())| {
@@ -100,7 +100,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(names, ["event0", "event12"]);
+        assert_eq!(
+            names,
+            vec!["event0".to_string(), "event12".to_string()]
+        );
     }
 
     #[test]
