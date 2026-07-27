@@ -1,32 +1,55 @@
 .TH LIBINPUT-RS 8 "July 2026" "libinput-rs 0.2.0" "System Administration"
 .SH NAME
-libinput-rs \- optional fail-open touchpad companion
+libinput-rs \- libinput ABI replacement and optional touchpad companion
 .SH SYNOPSIS
 .B libinput-rs
 .SH DESCRIPTION
+The libinput-rs package installs a drop-in implementation of
+.IR libinput.so.10
+in the system library directory. Display managers, compositors, and other
+libinput clients use it after the dynamic linker cache is refreshed and the
+clients are restarted.
+.PP
+The optional
 .B libinput-rs
-creates a uinput pointer before exclusively grabbing supported physical
+service creates a uinput pointer before exclusively grabbing supported physical
 touchpads. Keyboards are observed without an exclusive grab for
 disable-while-typing behavior. If the output device cannot be created or event
 forwarding fails, the process exits and the kernel releases all grabs.
 .PP
-The service is disabled by default. It is not ordered before a display manager.
+The service is disabled by default and is not required by the ABI replacement.
 .SH CONFIGURATION
-Configuration is read from
+Companion-daemon configuration is read from
 .IR /etc/libinput-rs/config.json .
-.SH EXPERIMENTAL ABI LIBRARY
-The experimental libinput ABI implementation is installed at
-.IR /usr/lib64/libinput-rs/libinput.so.10 .
-That directory is not in the system dynamic linker path. The library must not
-replace the distribution-provided
-.IR /usr/lib64/libinput.so.10 .
 .SH FILES
 .TP
+.I /usr/lib64/libinput.so.10.13.0
+Replacement shared library on 64-bit Fedora systems.
+.TP
+.I /usr/lib64/libinput.so.10
+Runtime SONAME link.
+.TP
+.I /usr/lib64/libinput.so
+Development linker name.
+.TP
+.I /usr/include/libinput.h
+C development header.
+.TP
+.I /usr/lib64/pkgconfig/libinput.pc
+pkg-config metadata on 64-bit Fedora systems.
+.TP
 .I /etc/libinput-rs/config.json
-Daemon configuration.
+Optional companion-daemon configuration.
 .TP
 .I /usr/lib/systemd/system/libinput-rs.service
-Optional systemd service.
+Optional companion service.
+.SH ROLLBACK
+Reinstall the distribution packages to restore the system implementation:
+.PP
+.nf
+sudo dnf reinstall libinput libinput-devel
+.fi
 .SH SEE ALSO
 .BR libinput (1),
+.BR ldconfig (8),
 .BR systemctl (1)
