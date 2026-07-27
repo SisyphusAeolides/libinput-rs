@@ -113,7 +113,7 @@ jobs:
 
     steps:
       - name: Install rpmlint
-        run: dnf -y -q install rpmlint >/dev/null
+        run: dnf -y -q install rpmlint >/dev/null 2>&1
 
       - name: Download binary RPM
         uses: actions/download-artifact@v4
@@ -122,7 +122,17 @@ jobs:
           path: rpm
 
       - name: Lint RPM
-        run: rpmlint rpm/*.rpm
+        shell: bash
+        run: |
+          set -o pipefail
+          rpmlint rpm/*.rpm 2>&1 | tee rpmlint.txt
+
+      - name: Upload RPM lint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpmlint-report
+          path: rpmlint.txt
 
   proofs:
     name: Safety proofs
