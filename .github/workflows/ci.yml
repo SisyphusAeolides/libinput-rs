@@ -42,19 +42,7 @@ jobs:
         run: cargo test --locked --package libinput-rs-evdev
 
       - name: Test libinput implementation
-        shell: bash
-        run: |
-          set -o pipefail
-          cargo test --locked --package libinput-rs 2>&1 | tee libinput-test-output.txt
-
-      - name: Upload libinput test diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: libinput-test-diagnostics
-          path: |
-            libinput-test-output.txt
-            src/quirks.rs
+        run: cargo test --locked --package libinput-rs
 
       - name: Check safety models
         run: make proofs-strict
