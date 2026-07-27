@@ -3,7 +3,7 @@
 
 Name:           libinput-rs
 Version:        0.2.1
-Release:        2%{?dist}
+Release:        3%{?dist}
 Summary:        Rust drop-in replacement for libinput
 
 Provides:       libinput = %{libinput_compat_version}
@@ -29,9 +29,8 @@ Requires:       systemd
 
 %description
 libinput-rs installs a Rust implementation of the libinput.so.10 ABI in the
-system library path. It also includes an optional fail-open touchpad companion
-daemon. The companion service is disabled by default and is not required by
-the ABI replacement.
+system library path. It also includes a fail-open touchpad companion daemon
+that is enabled by vendor preset on first installation.
 
 %package devel
 Summary:        Development files for the libinput-rs replacement
@@ -57,6 +56,7 @@ CARGO_NET_OFFLINE=true CARGO_PROFILE_RELEASE_DEBUG=2 RPM_LD_FLAGS="%{build_ldfla
 install -Dm755 target/release/libinput-rs %{buildroot}%{_bindir}/libinput-rs
 install -Dm644 src/config.json %{buildroot}%{_sysconfdir}/libinput-rs/config.json
 install -Dm644 systemd/libinput-rs.service %{buildroot}%{_unitdir}/libinput-rs.service
+install -Dm644 systemd/90-libinput-rs.preset %{buildroot}%{_presetdir}/90-libinput-rs.preset
 install -Dm755 target/release/libinput.so %{buildroot}%{_libdir}/libinput.so.10.13.0
 ln -s libinput.so.10.13.0 %{buildroot}%{_libdir}/libinput.so.10
 ln -s libinput.so.10 %{buildroot}%{_libdir}/libinput.so
@@ -98,6 +98,7 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 %{_bindir}/libinput-rs
 %config(noreplace) %{_sysconfdir}/libinput-rs/config.json
 %{_unitdir}/libinput-rs.service
+%{_presetdir}/90-libinput-rs.preset
 %{_libdir}/libinput.so.10.13.0
 %{_libdir}/libinput.so.10
 %{_mandir}/man8/libinput-rs.8*
@@ -109,6 +110,10 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 %{_libdir}/pkgconfig/libinput.pc
 
 %changelog
+* Mon Jul 27 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.2.1-3
+- Enable the companion daemon on first installation with a vendor preset
+- Preserve explicit administrator enable and disable choices on upgrades
+
 * Mon Jul 27 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.2.1-2
 - Preserve the live-tested 2.2 pointer setting across normalized motion
 - Interpret existing acceleration values against the 2.5 normalization reference
