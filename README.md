@@ -5,16 +5,16 @@
 - an optional touchpad companion daemon using evdev and uinput;
 - a 100% drop-in replacement implementation of the `libinput.so.10` C ABI.
 
-The runtime and development RPMs replace Fedora's `libinput` and
+The runtime and development RPMs replace the distribution's `libinput` and
 `libinput-devel` packages. Display managers and compositors use the replacement
 after they restart.
 
 ## Supported systems
 
-The supported packaging path is DNF/RPM on Fedora releases whose repositories
-provide `libwacom-devel` 2.18 or newer. The initial COPR builds target Fedora;
-Enterprise Linux 9 and 10 do not currently provide the libwacom ABI required
-by this implementation.
+The supported packaging path is DNF/RPM. The COPR project targets Fedora 44,
+Fedora rawhide, EPEL 9, EPEL 10, RHEL 9, and RHEL 10 on x86_64. Formal Agda,
+Idris 2, and Fortran models are verified in Fedora CI and are not runtime or RPM
+build dependencies.
 
 ## Install from COPR
 
@@ -48,7 +48,7 @@ To opt out of the companion daemon without changing the ABI replacement:
 sudo systemctl disable --now libinput-rs.service
 ```
 
-To restore Fedora's original runtime and development packages:
+To restore the distribution's original runtime and development packages:
 
 ```bash
 sudo systemctl disable --now libinput-rs.service 2>/dev/null || true
@@ -60,7 +60,7 @@ sudo systemctl reboot
 ## Build with DNF dependencies
 
 ```bash
-sudo dnf install rust cargo gcc make systemd-devel libwacom-devel pkgconf-pkg-config
+sudo dnf install rust cargo gcc make systemd-devel pkgconf-pkg-config
 make all
 make check
 make test
@@ -117,8 +117,8 @@ under `proofs/`:
   fail-open grabbing, permission-independent discovery, exactly-once descriptor
   closure, and udev-only hotplug.
 
-Agda, Idris 2, and GNU Fortran are available through DNF on the supported
-Fedora targets:
+Agda, Idris 2, and GNU Fortran are available through DNF on the Fedora CI
+target:
 
 ```bash
 sudo dnf install Agda idris2 gcc-gfortran
