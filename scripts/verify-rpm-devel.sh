@@ -2,25 +2,32 @@
 set -euo pipefail
 
 usage() {
-    printf '%s\n' "usage: $0 PACKAGE_RPM" >&2
+    printf '%s\n' "usage: $0 RUNTIME_RPM DEVEL_RPM" >&2
 }
 
-if [[ $# -ne 1 ]]; then
+if [[ $# -ne 2 ]]; then
     usage
     exit 2
 fi
 
-package_rpm=$1
+runtime_rpm=$1
+devel_rpm=$2
 for command in awk cc cpio eu-elflint pkg-config readelf readlink rg rpm rpm2cpio; do
     command -v "$command" >/dev/null
 done
-[[ -f "$package_rpm" ]] || {
-    printf '%s\n' "missing RPM: $package_rpm" >&2
+for package in "$runtime_rpm" "$devel_rpm"; do
+    [[ -f "$package" ]] || {
+        printf '%s\n' "missing RPM: $package" >&2
+        exit 2
+    }
+done
+
+[[ "$(rpm -qp --qf '%{NAME}' "$runtime_rpm")" == "libinput-rs" ]] || {
+    printf '%s\n' "not a libinput-rs runtime RPM: $runtime_rpm" >&2
     exit 2
 }
-
-[[ "$(rpm -qp --qf '%{NAME}' "$package_rpm")" == "libinput-rs" ]] || {
-    printf '%s\n' "not a libinput-rs RPM: $package_rpm" >&2
+[[ "$(rpm -qp --qf '%{NAME}' "$devel_rpm")" == "libinput-rs-devel" ]] || {
+    printf '%s\n' "not a libinput-rs development RPM: $devel_rpm" >&2
     exit 2
 }
 
@@ -41,7 +48,8 @@ trap cleanup EXIT
 
 (
     cd "$stage"
-    rpm2cpio "$package_rpm" | cpio -idm --quiet
+    rpm2cpio "$runtime_rpm" | cpio -idm --quiet
+    rpm2cpio "$devel_rpm" | cpio -idm --quiet
 )
 
 libdir=$(rpm --eval '%{_libdir}')
@@ -65,17 +73,26 @@ readelf -nW "$runtime_library" | rg 'Build ID:'
 ! readelf -lW "$runtime_library" | rg 'GNU_STACK.*RWE'
 eu-elflint --gnu-ld "$runtime_library"
 
-rpm -qp --provides "$package_rpm" | rg '^libinput-rs = '
-rpm -qp --provides "$package_rpm" | rg '^libinput = '
-rpm -qp --provides "$package_rpm" | rg '^libinput-devel = '
-rpm -qp --provides "$package_rpm" | rg '^libinput\.so\.10\('
-rpm -qp --obsoletes "$package_rpm" | rg '^libinput < '
-rpm -qp --obsoletes "$package_rpm" | rg '^libinput-devel < '
-rpm -qpl "$package_rpm" | rg -Fx "$includedir/libinput.h"
-rpm -qpl "$package_rpm" | rg -Fx "$libdir/pkgconfig/libinput.pc"
-rpm -qpl "$package_rpm" | rg -Fx "$libdir/libinput.so.10.13.0"
-rpm -qpl "$package_rpm" | rg -Fx "$libdir/libinput.so.10"
-rpm -qpl "$package_rpm" | rg -Fx "$libdir/libinput.so"
+rpm -qp --provides "$runtime_rpm" | rg '^libinput-rs = '
+rpm -qp --provides "$runtime_rpm" | rg '^libinput = 1\.31\.3$'
+rpm -qp --provides "$runtime_rpm" | rg '^libinput\.so\.10\('
+rpm -qp --obsoletes "$runtime_rpm" | rg '^libinput < 1\.32\.0$'
+rpm -qpl "$runtime_rpm" | rg -Fx "$libdir/libinput.so.10.13.0"
+rpm -qpl "$runtime_rpm" | rg -Fx "$libdir/libinput.so.10"
+! rpm -qpl "$runtime_rpm" | rg -Fx "$libdir/libinput.so"
+! rpm -qpl "$runtime_rpm" | rg -Fx "$includedir/libinput.h"
+! rpm -qpl "$runtime_rpm" | rg -Fx "$libdir/pkgconfig/libinput.pc"
+
+rpm -qp --provides "$devel_rpm" | rg '^libinput-rs-devel = '
+rpm -qp --provides "$devel_rpm" | rg '^libinput-devel = 1\.31\.3$'
+rpm -qp --provides "$devel_rpm" | rg '^pkgconfig\(libinput\) = 1\.31\.3$'
+rpm -qp --obsoletes "$devel_rpm" | rg '^libinput-devel < 1\.32\.0$'
+rpm -qp --requires "$devel_rpm" | rg '^libinput-rs(\(.*\))? = '
+rpm -qpl "$devel_rpm" | rg -Fx "$libdir/libinput.so"
+rpm -qpl "$devel_rpm" | rg -Fx "$includedir/libinput.h"
+rpm -qpl "$devel_rpm" | rg -Fx "$libdir/pkgconfig/libinput.pc"
+! rpm -qpl "$devel_rpm" | rg -Fx "$libdir/libinput.so.10.13.0"
+! rpm -qpl "$devel_rpm" | rg -Fx "$libdir/libinput.so.10"
 
 pkg_config=(
     env
