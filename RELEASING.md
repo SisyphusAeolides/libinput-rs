@@ -23,7 +23,10 @@ rpmdev-setuptree
 make srpm
 ```
 
-The resulting file is written below `$HOME/rpmbuild/SRPMS/`.
+The resulting file is written below `$HOME/rpmbuild/SRPMS/`. The 0.2.1 RPM
+release installs a vendor preset that enables `libinput-rs.service` on first
+installation; explicit administrator enable and disable choices remain
+preserved during upgrades.
 
 ## Publish to COPR
 
@@ -49,7 +52,7 @@ copr-cli create libinput-rs \
   --chroot fedora-44-x86_64 \
   --chroot fedora-rawhide-x86_64 \
   --description "Rust drop-in replacement for libinput" \
-  --instructions "Test from a text console or SSH session and keep the companion daemon disabled until the ABI replacement is confirmed."
+  --instructions "Test from a text console or SSH session and keep rollback available."
 ```
 
 EPEL and RHEL chroots are not enabled because they do not provide the libwacom
@@ -58,11 +61,13 @@ ABI required by this implementation.
 Submit the source RPM:
 
 ```bash
-copr-cli build libinput-rs "$HOME/rpmbuild/SRPMS/libinput-rs-0.2.1-2.fc45.src.rpm"
+copr-cli build libinput-rs "$HOME/rpmbuild/SRPMS/libinput-rs-0.2.1-3.fc45.src.rpm"
 ```
 
-After the build succeeds, test installation and rollback from the COPR before
-announcing the repository.
+After the build succeeds, verify that the runtime RPM contains
+`/usr/lib/systemd/system-preset/90-libinput-rs.preset`, then test installation,
+boot-time service activation, and rollback from COPR before announcing the
+repository.
 
 ## Publish to crates.io
 
