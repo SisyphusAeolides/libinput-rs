@@ -53,7 +53,7 @@ copr-cli create libinput-rs \
 Submit the source RPM:
 
 ```bash
-copr-cli build libinput-rs "$HOME/rpmbuild/SRPMS/libinput-rs-0.2.1-1.fc45.src.rpm"
+copr-cli build libinput-rs "$HOME/rpmbuild/SRPMS/libinput-rs-0.2.1-2.fc45.src.rpm"
 ```
 
 After the build succeeds, test installation and rollback from the COPR before
