@@ -1,6 +1,6 @@
 .TH LIBINPUT-RS 8 "July 2026" "libinput-rs 0.2.1" "System Administration"
 .SH NAME
-libinput-rs \- libinput ABI replacement and optional touchpad companion
+libinput-rs \- libinput ABI replacement and touchpad companion
 .SH SYNOPSIS
 .B libinput-rs
 .SH DESCRIPTION
@@ -17,14 +17,17 @@ The
 package installs the public header, unversioned linker name, and pkg-config
 metadata that replace the distribution's libinput development package.
 .PP
-The optional
+The
 .B libinput-rs
 service creates a uinput pointer before exclusively grabbing supported physical
 touchpads. Keyboards are observed without an exclusive grab for
 disable-while-typing behavior. If the output device cannot be created or event
 forwarding fails, the process exits and the kernel releases all grabs.
 .PP
-The service is disabled by default and is not required by the ABI replacement.
+A vendor preset enables the service on first installation so it starts on the
+next boot. An administrator's explicit enable or disable choice is preserved
+on package upgrades. The ABI replacement remains installed when the service is
+disabled.
 .SH CONFIGURATION
 Companion-daemon configuration is read from
 .IR /etc/libinput-rs/config.json .
@@ -55,19 +58,27 @@ C development header supplied by libinput-rs-devel.
 pkg-config metadata supplied by libinput-rs-devel on 64-bit Fedora systems.
 .TP
 .I /etc/libinput-rs/config.json
-Optional companion-daemon configuration.
+Companion-daemon configuration.
 .TP
 .I /usr/lib/systemd/system/libinput-rs.service
-Optional companion service.
+Companion service unit.
+.TP
+.I /usr/lib/systemd/system-preset/90-libinput-rs.preset
+Vendor preset enabling the companion service on first installation.
 .SH INSTALLATION
 Perform replacement testing from a text console or SSH session. Install both
 replacement packages in one DNF transaction:
 .PP
 .nf
-sudo systemctl disable --now libinput-rs.service 2>/dev/null || true
 sudo dnf install libinput-rs libinput-rs-devel --allowerasing
 sudo ldconfig
 sudo systemctl reboot
+.fi
+.PP
+To disable only the companion daemon while retaining the ABI replacement:
+.PP
+.nf
+sudo systemctl disable --now libinput-rs.service
 .fi
 .SH ROLLBACK
 Restore Fedora's runtime and development packages in one transaction:
