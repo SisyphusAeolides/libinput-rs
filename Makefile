@@ -6,8 +6,12 @@ FC = gfortran
 REFERENCE_LIBINPUT ?= /usr/lib64/libinput.so.10
 RPM_RUNTIME ?=
 RPM_DEVEL ?=
+RPM_TOPDIR ?= $(HOME)/rpmbuild
+PACKAGE_NAME := $(shell rpmspec -q --srpm --qf '%{NAME}' libinput-rs.spec 2>/dev/null)
+PACKAGE_VERSION := $(shell rpmspec -q --srpm --qf '%{VERSION}' libinput-rs.spec 2>/dev/null)
+SOURCE_ARCHIVE := $(RPM_TOPDIR)/SOURCES/$(PACKAGE_NAME)-$(PACKAGE_VERSION).tar.gz
 
-.PHONY: all build shared check packaging-check crate-package-check rpm-devel-check test abi-check proofs proofs-strict install
+.PHONY: all build shared check packaging-check crate-package-check main-crate-package-check source-archive srpm rpm-devel-check test abi-check proofs proofs-strict install
 
 all: build shared
 
@@ -35,6 +39,7 @@ packaging-check:
 	grep -q '%{_includedir}/libinput.h' libinput-rs.spec
 	grep -q '%{_libdir}/pkgconfig/libinput.pc' libinput-rs.spec
 	grep -Eq '^install .*%\{_libdir\}/libinput\.so\.10' libinput-rs.spec
+	test "$(PACKAGE_VERSION)" = "$$(awk '/^\[package\]/{package=1; next} package && /^version = /{gsub(/[\" ]/, "", $$3); print $$3; exit}' Cargo.toml)"
 	test -f packaging/libinput.h
 	test -f packaging/libinput-rs.pc.in
 	test -f packaging/libinput-rs-smoke.c
@@ -42,8 +47,25 @@ packaging-check:
 
 crate-package-check:
 	cargo metadata --locked --offline --no-deps >/dev/null
+	! grep -q '^publish = false' Cargo.toml compat/evdev/Cargo.toml
+	grep -Eq '^evdev = \{ package = "libinput-rs-evdev", version = "0\.1\.0", path = "compat/evdev" \}$$' Cargo.toml
 	cargo package --locked --no-verify --package libinput-rs-evdev
-	! cargo package --locked --list --package libinput-rs-evdev | grep -Eq '/(vendor|\.cargo)/'
+	! cargo package --locked --list --package libinput-rs-evdev | grep -Eq '/(vendor|\.cargo|rpmbuild)'
+
+main-crate-package-check:
+	cargo package --locked --no-verify --package libinput-rs
+	! cargo package --locked --list --package libinput-rs | grep -Eq '/(vendor|\.cargo|rpmbuild)'
+
+source-archive:
+	mkdir -p "$(RPM_TOPDIR)/SOURCES"
+	tar --exclude='./target' --exclude='./rpmbuild' --exclude='./rpmbuild2' \
+		--exclude='./proofs/fortran/build' --exclude='./.git' \
+		--transform='s|^\./|$(PACKAGE_NAME)-$(PACKAGE_VERSION)/|' \
+		-czf "$(SOURCE_ARCHIVE)" .
+
+srpm: source-archive
+	mkdir -p "$(RPM_TOPDIR)/SRPMS"
+	rpmbuild -bs libinput-rs.spec --define "_topdir $(RPM_TOPDIR)"
 
 rpm-devel-check:
 	test -n "$(RPM_RUNTIME)"

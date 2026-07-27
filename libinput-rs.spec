@@ -2,8 +2,8 @@
 %global libinput_replace_before 1.32.0
 
 Name:           libinput-rs
-Version:        0.2.0
-Release:        2%{?dist}
+Version:        0.2.1
+Release:        1%{?dist}
 Summary:        Rust drop-in replacement for libinput
 
 Provides:       libinput = %{libinput_compat_version}
@@ -66,6 +66,17 @@ sed 's|@LIBDIR@|%{_libdir}|g' packaging/libinput-rs.pc.in \
     > %{buildroot}%{_libdir}/pkgconfig/libinput.pc
 install -Dm644 packaging/libinput-rs.8 %{buildroot}%{_mandir}/man8/libinput-rs.8
 
+install -d %{buildroot}%{_licensedir}/%{name}/third-party
+for crate in vendor/*; do
+    test -d "$crate" || continue
+    destination=%{buildroot}%{_licensedir}/%{name}/third-party/$(basename "$crate")
+    for license in "$crate"/LICENSE* "$crate"/COPYING*; do
+        test -f "$license" || continue
+        install -d "$destination"
+        install -m644 "$license" "$destination/"
+    done
+done
+
 %check
 CARGO_NET_OFFLINE=true cargo test --frozen --workspace
 make proofs-strict
@@ -82,8 +93,7 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 
 %files
 %license LICENSE
-%license vendor/*/LICENSE*
-%license vendor/*/COPYING
+%license %{_licensedir}/%{name}/third-party
 %doc README.md proofs/README.md
 %{_bindir}/libinput-rs
 %config(noreplace) %{_sysconfdir}/libinput-rs/config.json
@@ -99,6 +109,11 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 %{_libdir}/pkgconfig/libinput.pc
 
 %changelog
+* Mon Jul 27 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.2.1-1
+- Normalize companion pointer and scroll motion by hardware axis resolution
+- Use the live-tested motion scale when devices omit resolution metadata
+- Prepare the workspace crates and RPM source package for publication
+
 * Mon Jul 27 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.2.0-2
 - Preserve discovery of devices behind restricted-open callbacks
 - Split runtime and development payloads into policy-compliant RPMs

@@ -1,9 +1,15 @@
 [package]
 name = "libinput-rs-evdev"
 version = "0.1.0"
+authors = ["Kenny Glowner <SisyphusAeolides@pm.me>"]
 edition = "2021"
 rust-version = "1.75"
-publish = false
+description = "evdev compatibility layer with permission-independent input-node discovery"
+license = "MIT"
+repository = "https://github.com/SisyphusAeolides/libinput-rs"
+readme = "README.md"
+keywords = ["evdev", "input", "linux", "libinput"]
+categories = ["hardware-support", "os::linux-apis"]
 
 [dependencies]
 evdev-upstream = { package = "evdev", version = "=0.13.2" }
