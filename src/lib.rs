@@ -207,7 +207,18 @@ pub unsafe extern "C" fn libinput_path_add_device(
     if ctx.is_null() || path.is_null() || (*ctx).backend_kind != BackendKind::Path {
         return std::ptr::null_mut();
     }
-    let devnode = CStr::from_ptr(path).to_string_lossy().into_owned();
+    let path = CStr::from_ptr(path);
+    if path.to_bytes().len() > libc::PATH_MAX as usize {
+        emit_error_log(
+            ctx,
+            &format!(
+                "client bug: Unexpected path, limited to {} characters.",
+                libc::PATH_MAX
+            ),
+        );
+        return std::ptr::null_mut();
+    }
+    let devnode = path.to_string_lossy().into_owned();
     let p = std::path::PathBuf::from(&devnode);
     use std::os::unix::fs::FileTypeExt;
     if !p

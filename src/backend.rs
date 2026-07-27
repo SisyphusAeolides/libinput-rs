@@ -3733,18 +3733,6 @@ impl BackendState {
             } else {
                 td.tablet_active_tool_keys.retain(|code| *code != ev.code());
             }
-            let selected_tool_type = [
-                KeyCode::BTN_TOOL_RUBBER.0,
-                KeyCode::BTN_TOOL_BRUSH.0,
-                KeyCode::BTN_TOOL_PENCIL.0,
-                KeyCode::BTN_TOOL_AIRBRUSH.0,
-                KeyCode::BTN_TOOL_MOUSE.0,
-                KeyCode::BTN_TOOL_LENS.0,
-                KeyCode::BTN_TOOL_PEN.0,
-            ]
-            .into_iter()
-            .find(|code| td.tablet_active_tool_keys.contains(code))
-            .and_then(tool_type_for_key);
             // Some tablets advertise BTN_TOOL_PEN but omit proximity-out.
             // Keep the watchdog until a real pen-out arrives. Other tool
             // types do not use the pen-only fallback.
@@ -3752,14 +3740,31 @@ impl BackendState {
                 td.tablet_proximity_timer_enabled = false;
                 td.tablet_zero_pressure_since = None;
             }
-            if let Some(selected_tool_type) = selected_tool_type {
+            if pressed {
+                let selected_tool_type = [
+                    KeyCode::BTN_TOOL_RUBBER.0,
+                    KeyCode::BTN_TOOL_BRUSH.0,
+                    KeyCode::BTN_TOOL_PENCIL.0,
+                    KeyCode::BTN_TOOL_AIRBRUSH.0,
+                    KeyCode::BTN_TOOL_MOUSE.0,
+                    KeyCode::BTN_TOOL_LENS.0,
+                    KeyCode::BTN_TOOL_PEN.0,
+                ]
+                .into_iter()
+                .find(|code| td.tablet_active_tool_keys.contains(code))
+                .and_then(tool_type_for_key)
+                .unwrap_or(event_tool_type);
                 if selected_tool_type != td.tablet_tool_type
                     || (!(*lib_dev).tablet_in_proximity && td.tablet_tool.is_null())
                 {
                     td.tablet_tool_type = selected_tool_type;
                     td.tablet_proximity_pending = Some(true);
                 }
-            } else {
+            } else if event_tool_type == td.tablet_tool_type {
+                // A direct tool switch can leave BTN_TOOL_PEN asserted while
+                // BTN_TOOL_RUBBER toggles. Releasing the current tool only
+                // sends proximity-out; the still-asserted key does not select
+                // a replacement until the kernel updates that tool again.
                 td.tablet_proximity_pending = Some(false);
             }
             return;
@@ -3844,7 +3849,12 @@ impl BackendState {
         // only reliable indication that a pen is in range. The same rule
         // restores proximity after the watchdog synthesized an out event.
         if td.tablet_tool.is_null()
-            && (td.tablet_x_changed || td.tablet_y_changed)
+            && (td.tablet_x_changed
+                || td.tablet_y_changed
+                || (td.tablet_pressure_changed
+                    && td
+                        .tablet_pressure_range
+                        .is_some_and(|(minimum, _)| td.tablet_pressure > f64::from(minimum))))
             && td.tablet_proximity_pending.is_none()
         {
             td.tablet_tool_type = 1;
