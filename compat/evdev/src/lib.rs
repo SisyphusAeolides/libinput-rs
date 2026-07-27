@@ -85,8 +85,11 @@ mod tests {
     #[test]
     fn enumeration_does_not_open_event_nodes() {
         let directory = TestDirectory::new();
-        symlink(directory.0.join("missing-target"), directory.0.join("event0"))
-            .expect("create unopenable event node");
+        symlink(
+            directory.0.join("missing-target"),
+            directory.0.join("event0"),
+        )
+        .expect("create unopenable event node");
         fs::write(directory.0.join("event12"), b"").expect("create event node");
         fs::write(directory.0.join("eventx"), b"").expect("create invalid event name");
         fs::write(directory.0.join("mouse0"), b"").expect("create non-event node");
