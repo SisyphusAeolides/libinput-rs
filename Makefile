@@ -18,15 +18,18 @@ shared:
 	CARGO_NET_OFFLINE=true CARGO_PROFILE_RELEASE_DEBUG=2 ./build-shared.sh
 
 check: packaging-check
-	cargo check --locked
-	cargo clippy --locked --all-targets -- -D warnings
+	cargo check --locked --workspace
+	cargo clippy --locked --workspace --all-targets -- -D warnings
 	cargo fmt --all -- --check
 
 packaging-check:
 	grep -Eq '^Before=.*display-manager|^DefaultDependencies=no|^Restart=always' systemd/libinput-rs.service
-	grep -Eq '^(Provides|Obsoletes):.*libinput' libinput-rs.spec
-	! grep -q '^Requires: *libinput$$' libinput-rs.spec
-	! grep -q '^%package devel' libinput-rs.spec
+	grep -Eq '^Provides: *libinput( |%)' libinput-rs.spec
+	grep -Eq '^Obsoletes: *libinput ' libinput-rs.spec
+	grep -q '^%package devel' libinput-rs.spec
+	grep -Eq '^Provides: *libinput-devel( |%)' libinput-rs.spec
+	grep -Eq '^Obsoletes: *libinput-devel ' libinput-rs.spec
+	grep -q '^%files devel' libinput-rs.spec
 	grep -q '%{_libdir}/libinput.so.10.13.0' libinput-rs.spec
 	grep -q '%{_libdir}/libinput.so.10' libinput-rs.spec
 	grep -q '%{_includedir}/libinput.h' libinput-rs.spec
@@ -38,8 +41,9 @@ packaging-check:
 	test -x scripts/verify-rpm-devel.sh
 
 crate-package-check:
-	cargo package --locked
-	! cargo package --locked --list | grep -Eq '/(vendor|\.cargo)/'
+	cargo metadata --locked --offline --no-deps >/dev/null
+	cargo package --locked --no-verify --package libinput-rs-evdev
+	! cargo package --locked --list --package libinput-rs-evdev | grep -Eq '/(vendor|\.cargo)/'
 
 rpm-devel-check:
 	test -n "$(RPM_RUNTIME)"
@@ -47,7 +51,7 @@ rpm-devel-check:
 	scripts/verify-rpm-devel.sh "$(RPM_RUNTIME)" "$(RPM_DEVEL)"
 
 test:
-	cargo test --locked
+	cargo test --locked --workspace
 
 abi-check: shared
 	scripts/check-abi.sh "$(REFERENCE_LIBINPUT)" target/release/libinput.so
@@ -55,8 +59,10 @@ abi-check: shared
 proofs:
 	cd proofs/agda && agda FailOpen.agda
 	cd proofs/agda && agda ResourceLifecycle.agda
+	cd proofs/agda && agda RestrictedDiscovery.agda
 	cd proofs/idris && idris2 --check FailOpen.idr
 	cd proofs/idris && idris2 --check ResourceLifecycle.idr
+	cd proofs/idris && idris2 --check RestrictedDiscovery.idr
 	mkdir -p proofs/fortran/build
 	$(FC) -std=f2018 -Wall -Wextra -Werror -fcheck=all \
 		-J proofs/fortran/build -o proofs/fortran/build/fail-open \
@@ -66,6 +72,10 @@ proofs:
 		-J proofs/fortran/build -o proofs/fortran/build/resource-lifecycle \
 		proofs/fortran/resource_lifecycle.f90
 	proofs/fortran/build/resource-lifecycle
+	$(FC) -std=f2018 -Wall -Wextra -Werror -fcheck=all \
+		-J proofs/fortran/build -o proofs/fortran/build/restricted-discovery \
+		proofs/fortran/restricted_discovery.f90
+	proofs/fortran/build/restricted-discovery
 
 proofs-strict:
 	command -v agda >/dev/null

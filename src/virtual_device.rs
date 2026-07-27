@@ -26,7 +26,7 @@ impl VirtualDevice {
         rel_axes.insert(RelativeAxisCode::REL_WHEEL);
 
         let device = EvdevVirtualDevice::builder()?
-            .name("libinput-rs Virtual Pointer")
+            .name("Rust Input Companion Pointer")
             .with_keys(&keys)?
             .with_relative_axes(&rel_axes)?
             .build()?;

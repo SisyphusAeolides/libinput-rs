@@ -27,7 +27,7 @@ done
     exit 2
 }
 [[ "$(rpm -qp --qf '%{NAME}' "$devel_rpm")" == "libinput-rs-devel" ]] || {
-    printf '%s\n' "not a libinput-rs-devel RPM: $devel_rpm" >&2
+    printf '%s\n' "not a libinput-rs development RPM: $devel_rpm" >&2
     exit 2
 }
 
@@ -54,12 +54,11 @@ trap cleanup EXIT
 
 libdir=$(rpm --eval '%{_libdir}')
 includedir=$(rpm --eval '%{_includedir}')
-runtime_dir="$stage$libdir/libinput-rs"
-runtime_library="$runtime_dir/libinput.so.10.13.0"
-runtime_link="$runtime_dir/libinput.so.10"
-devel_link="$runtime_dir/libinput.so"
-header="$stage$includedir/libinput-rs/libinput.h"
-pc_file="$stage$libdir/pkgconfig/libinput-rs.pc"
+runtime_library="$stage$libdir/libinput.so.10.13.0"
+runtime_link="$stage$libdir/libinput.so.10"
+devel_link="$stage$libdir/libinput.so"
+header="$stage$includedir/libinput.h"
+pc_file="$stage$libdir/pkgconfig/libinput.pc"
 
 [[ -f "$runtime_library" ]]
 [[ -L "$runtime_link" && "$(readlink "$runtime_link")" == "libinput.so.10.13.0" ]]
@@ -75,37 +74,45 @@ readelf -nW "$runtime_library" | rg 'Build ID:'
 eu-elflint --gnu-ld "$runtime_library"
 
 rpm -qp --provides "$runtime_rpm" | rg '^libinput-rs = '
-! rpm -qp --provides "$runtime_rpm" | rg '^libinput\.so\.10\('
-! rpm -qp --provides "$runtime_rpm" | rg '^libinput([[:space:]]|$)'
-! rpm -qp --obsoletes "$runtime_rpm" | rg '^libinput([[:space:]]|$)'
-! rpm -qp --conflicts "$runtime_rpm" | rg '^libinput([[:space:]]|$)'
-for package in "$runtime_rpm" "$devel_rpm"; do
-	! rpm -qpl "$package" | rg -Fx "$includedir/libinput.h"
-	! rpm -qpl "$package" | rg -Fx "$libdir/pkgconfig/libinput.pc"
-	! rpm -qpl "$package" | rg -Fx '/usr/share/pkgconfig/libinput.pc'
-	! rpm -qp --provides "$package" | rg '^pkgconfig\(libinput\)([[:space:]]|$)'
-	! rpm -qpl "$package" | awk -v libdir="$libdir" \
-		'$0 ~ ("^" libdir "/libinput\\.so(\\..*)?$") { found = 1 } END { exit !found }'
-done
+rpm -qp --provides "$runtime_rpm" | rg '^libinput = 1\.31\.3$'
+rpm -qp --provides "$runtime_rpm" | rg '^libinput\.so\.10\('
+rpm -qp --obsoletes "$runtime_rpm" | rg '^libinput < 1\.32\.0$'
+rpm -qpl "$runtime_rpm" | rg -Fx "$libdir/libinput.so.10.13.0"
+rpm -qpl "$runtime_rpm" | rg -Fx "$libdir/libinput.so.10"
+! rpm -qpl "$runtime_rpm" | rg -Fx "$libdir/libinput.so"
+! rpm -qpl "$runtime_rpm" | rg -Fx "$includedir/libinput.h"
+! rpm -qpl "$runtime_rpm" | rg -Fx "$libdir/pkgconfig/libinput.pc"
+
+rpm -qp --provides "$devel_rpm" | rg '^libinput-rs-devel = '
+rpm -qp --provides "$devel_rpm" | rg '^libinput-devel = 1\.31\.3$'
+rpm -qp --provides "$devel_rpm" | rg '^pkgconfig\(libinput\) = 1\.31\.3$'
+rpm -qp --obsoletes "$devel_rpm" | rg '^libinput-devel < 1\.32\.0$'
+rpm -qp --requires "$devel_rpm" | rg '^libinput-rs(\(.*\))? = '
+rpm -qpl "$devel_rpm" | rg -Fx "$libdir/libinput.so"
+rpm -qpl "$devel_rpm" | rg -Fx "$includedir/libinput.h"
+rpm -qpl "$devel_rpm" | rg -Fx "$libdir/pkgconfig/libinput.pc"
+! rpm -qpl "$devel_rpm" | rg -Fx "$libdir/libinput.so.10.13.0"
+! rpm -qpl "$devel_rpm" | rg -Fx "$libdir/libinput.so.10"
 
 pkg_config=(
     env
     PKG_CONFIG_PATH=
-    "PKG_CONFIG_LIBDIR=$stage$libdir/pkgconfig:$libdir/pkgconfig"
+    "PKG_CONFIG_LIBDIR=$stage$libdir/pkgconfig:$libdir/pkgconfig:/usr/share/pkgconfig"
     "PKG_CONFIG_SYSROOT_DIR=$stage"
     pkg-config
 )
-read -r -a cflags <<<"$("${pkg_config[@]}" --cflags libinput-rs)"
-read -r -a libs <<<"$("${pkg_config[@]}" --libs libinput-rs)"
+[[ "$("${pkg_config[@]}" --variable=pcfiledir libinput)" == "$stage$libdir/pkgconfig" ]]
+read -r -a cflags <<<"$("${pkg_config[@]}" --cflags libinput)"
+read -r -a libs <<<"$("${pkg_config[@]}" --libs libinput)"
 consumer="$stage/libinput-rs-smoke"
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 cc -Wl,-z,defs -o "$consumer" "$script_dir/../packaging/libinput-rs-smoke.c" \
     "${cflags[@]}" "${libs[@]}"
 readelf -dW "$consumer" | rg 'Shared library: \[libinput\.so\.10\]'
 
-env -i PATH="$PATH" LD_LIBRARY_PATH="$runtime_dir" "$consumer"
+env -i PATH="$PATH" LD_LIBRARY_PATH="$stage$libdir" "$consumer"
 loader_trace=$(env -i PATH="$PATH" LD_TRACE_LOADED_OBJECTS=1 \
-    LD_LIBRARY_PATH="$runtime_dir" "$consumer")
+    LD_LIBRARY_PATH="$stage$libdir" "$consumer")
 loaded_library=$(printf '%s\n' "$loader_trace" | awk '$1 == "libinput.so.10" && $2 == "=>" { print $3; exit }')
 [[ -n "$loaded_library" ]]
 [[ "$(readlink -f "$loaded_library")" == "$(readlink -f "$runtime_link")" ]]

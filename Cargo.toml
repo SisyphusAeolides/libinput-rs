@@ -1,3 +1,7 @@
+[workspace]
+members = ["compat/evdev"]
+resolver = "2"
+
 [package]
 name = "libinput-rs"
 version = "0.2.0"
@@ -9,6 +13,7 @@ license = "MIT"
 repository = "https://github.com/SisyphusAeolides/libinput-rs"
 readme = "README.md"
 exclude = [".cargo", "vendor"]
+publish = false
 
 [[bin]]
 name = "libinput-rs"
@@ -20,7 +25,7 @@ crate-type = ["staticlib"]
 path = "src/lib.rs"
 
 [dependencies]
-evdev = "0.13"
+evdev = { package = "libinput-rs-evdev", version = "0.1.0", path = "compat/evdev" }
 mio = { version = "1", features = ["os-poll", "os-ext", "net"] }
 nix = { version = "0.29", features = ["ioctl", "fs", "inotify"] }
 serde = { version = "1.0", features = ["derive"] }

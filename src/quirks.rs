@@ -425,7 +425,10 @@ mod tests {
 
     #[test]
     fn applies_apple_touchpad_onebutton_quirk_by_identity() {
-        std::env::set_var("LIBINPUT_QUIRKS_DIR", "/tmp/libinput-rs-quirks-debug/");
+        std::env::set_var(
+            "LIBINPUT_QUIRKS_DIR",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/quirks"),
+        );
         let mut event_codes = Vec::new();
         let applied = apply_quirks(
             "litest appletouch",
