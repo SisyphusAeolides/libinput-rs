@@ -4,9 +4,10 @@ UNITDIR ?= $(PREFIX)/lib/systemd/system
 DESTDIR ?=
 FC = gfortran
 REFERENCE_LIBINPUT ?= /usr/lib64/libinput.so.10
-RPM_PACKAGE ?=
+RPM_RUNTIME ?=
+RPM_DEVEL ?=
 
-.PHONY: all build shared check packaging-check crate-package-check rpm-check test abi-check proofs proofs-strict install
+.PHONY: all build shared check packaging-check crate-package-check rpm-devel-check test abi-check proofs proofs-strict install
 
 all: build shared
 
@@ -23,9 +24,12 @@ check: packaging-check
 
 packaging-check:
 	grep -Eq '^Before=.*display-manager|^DefaultDependencies=no|^Restart=always' systemd/libinput-rs.service
-	grep -Eq '^(Provides|Obsoletes):.*libinput' libinput-rs.spec
-	! grep -q '^Requires: *libinput$$' libinput-rs.spec
-	! grep -q '^%package devel' libinput-rs.spec
+	grep -Eq '^Provides: *libinput( |%)' libinput-rs.spec
+	grep -Eq '^Obsoletes: *libinput ' libinput-rs.spec
+	grep -q '^%package devel' libinput-rs.spec
+	grep -Eq '^Provides: *libinput-devel( |%)' libinput-rs.spec
+	grep -Eq '^Obsoletes: *libinput-devel ' libinput-rs.spec
+	grep -q '^%files devel' libinput-rs.spec
 	grep -q '%{_libdir}/libinput.so.10.13.0' libinput-rs.spec
 	grep -q '%{_libdir}/libinput.so.10' libinput-rs.spec
 	grep -q '%{_includedir}/libinput.h' libinput-rs.spec
@@ -41,9 +45,10 @@ crate-package-check:
 	cargo package --locked --no-verify --package libinput-rs-evdev
 	! cargo package --locked --list --package libinput-rs-evdev | grep -Eq '/(vendor|\.cargo)/'
 
-rpm-check:
-	test -n "$(RPM_PACKAGE)"
-	scripts/verify-rpm-devel.sh "$(RPM_PACKAGE)"
+rpm-devel-check:
+	test -n "$(RPM_RUNTIME)"
+	test -n "$(RPM_DEVEL)"
+	scripts/verify-rpm-devel.sh "$(RPM_RUNTIME)" "$(RPM_DEVEL)"
 
 test:
 	cargo test --locked --workspace
