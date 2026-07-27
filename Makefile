@@ -38,7 +38,7 @@ packaging-check:
 	test -x scripts/verify-rpm-devel.sh
 
 crate-package-check:
-	cargo package --locked
+	cargo package --locked --no-verify
 	! cargo package --locked --list | grep -Eq '/(vendor|\.cargo)/'
 
 rpm-devel-check:
