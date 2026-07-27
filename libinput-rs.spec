@@ -3,7 +3,7 @@
 
 Name:           libinput-rs
 Version:        0.2.1
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Rust drop-in replacement for libinput
 
 Provides:       libinput = %{libinput_compat_version}
@@ -109,9 +109,12 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 %{_libdir}/pkgconfig/libinput.pc
 
 %changelog
+* Mon Jul 27 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.2.1-2
+- Preserve the live-tested 2.2 pointer setting across normalized motion
+- Interpret existing acceleration values against the 2.5 normalization reference
+
 * Mon Jul 27 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.2.1-1
 - Normalize companion pointer and scroll motion by hardware axis resolution
-- Preserve the live-tested 2.2 pointer setting across normalized motion
 - Use the live-tested motion scale when devices omit resolution metadata
 - Prepare the workspace crates and RPM source package for publication
 
