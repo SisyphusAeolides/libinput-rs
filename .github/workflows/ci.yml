@@ -67,7 +67,7 @@ jobs:
           objdump -T target/release/libinput.so | grep -q 'LIBINPUT_0.12.0.*libinput_get_fd'
           test -z "$(nm -D target/release/libinput.so | grep -E ' T (rust_|__rd)' || true)"
 
-      - name: Build and inspect RPMs
+      - name: Build and inspect RPM
         run: |
           mkdir -p "$PWD/rpmbuild/SOURCES" "$PWD/rpmbuild/SRPMS" "$PWD/rpmbuild/RPMS"
           package_name=$(rpmspec -q --srpm --qf '%{NAME}' libinput-rs.spec)
@@ -76,12 +76,10 @@ jobs:
             --output="$PWD/rpmbuild/SOURCES/$package_name-$package_version.tar.gz" HEAD
           rpmbuild -bs libinput-rs.spec --define "_topdir $PWD/rpmbuild"
           rpmbuild --rebuild "$PWD"/rpmbuild/SRPMS/*.src.rpm --define "_topdir $PWD/rpmbuild"
-          runtime_package=$(find "$PWD/rpmbuild/RPMS" -name 'libinput-rs-[0-9]*.rpm' -print -quit)
-          devel_package=$(find "$PWD/rpmbuild/RPMS" -name 'libinput-rs-devel-[0-9]*.rpm' -print -quit)
-          test -n "$runtime_package"
-          test -n "$devel_package"
-          make rpm-devel-check RPM_RUNTIME="$runtime_package" RPM_DEVEL="$devel_package"
-          rpmlint "$runtime_package" "$devel_package"
+          package=$(find "$PWD/rpmbuild/RPMS" -name 'libinput-rs-[0-9]*.rpm' -print -quit)
+          test -n "$package"
+          make rpm-check RPM_PACKAGE="$package"
+          rpmlint "$package"
 
   proofs:
     name: Safety proofs
