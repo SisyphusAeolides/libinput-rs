@@ -5,8 +5,9 @@
 - an optional touchpad companion daemon using evdev and uinput;
 - a 100% drop-in replacement implementation of the `libinput.so.10` C ABI.
 
-The RPM replaces Fedora or Enterprise Linux's system `libinput` library.
-Display managers and compositors will use this implementation automatically.
+The runtime and development RPMs replace Fedora's `libinput` and
+`libinput-devel` packages. Display managers and compositors use the replacement
+after they restart.
 
 ## Supported systems
 
@@ -17,31 +18,41 @@ by this implementation.
 
 ## Install from COPR
 
+Perform replacement testing from a text console or an SSH session so rollback
+remains available even if the graphical session cannot start.
+
 ```bash
 sudo dnf install dnf-plugins-core
 sudo dnf copr enable sisyphuscode/libinput-rs
-sudo dnf install libinput-rs
+sudo systemctl disable --now libinput-rs.service 2>/dev/null || true
+sudo dnf install libinput-rs libinput-rs-devel --allowerasing
+sudo ldconfig
+sudo systemctl reboot
 ```
 
-Installation does not enable the daemon. Test it from a text console or an SSH
-session before enabling it permanently:
+The companion daemon is optional and remains disabled after package
+installation. Test the ABI replacement first. Only then test the companion from
+a text console or SSH session:
 
 ```bash
-sudo systemctl start libinput-rs
-systemctl status libinput-rs
-sudo systemctl enable libinput-rs
+sudo systemctl start libinput-rs.service
+systemctl status libinput-rs.service
+sudo systemctl enable libinput-rs.service
 ```
 
-To stop using the daemon:
+To stop using the companion daemon without changing the ABI replacement:
 
 ```bash
-sudo systemctl disable --now libinput-rs
+sudo systemctl disable --now libinput-rs.service
 ```
 
-If you wish to restore the original system library:
+To restore Fedora's original runtime and development packages:
 
 ```bash
-sudo dnf reinstall libinput
+sudo systemctl disable --now libinput-rs.service 2>/dev/null || true
+sudo dnf install libinput libinput-devel --allowerasing
+sudo ldconfig
+sudo systemctl reboot
 ```
 
 ## Build with DNF dependencies
@@ -53,8 +64,8 @@ make check
 make test
 ```
 
-The daemon is built at `target/release/libinput-rs`. The ABI
-library is built at `target/release/libinput.so`.
+The daemon is built at `target/release/libinput-rs`. The ABI library is built
+at `target/release/libinput.so`.
 
 ## Configuration
 
@@ -69,10 +80,11 @@ The daemon reads `/etc/libinput-rs/config.json`:
 }
 ```
 
-## Drop-in Replacement
+## Drop-in replacement
 
-The library is installed in the system linker path as a 100% drop-in replacement
-for the distribution's `libinput.so.10`. Development headers are also provided.
+The runtime RPM installs `libinput.so.10` in the system linker path. The
+`libinput-rs-devel` RPM installs `libinput.h`, the unversioned linker name, and
+`libinput.pc`.
 
 The udev backend enumerates `/dev/input/event*` by directory entry and delegates
 the first device open to the compositor's `open_restricted` callback. This keeps
