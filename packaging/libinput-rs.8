@@ -4,11 +4,18 @@ libinput-rs \- libinput ABI replacement and optional touchpad companion
 .SH SYNOPSIS
 .B libinput-rs
 .SH DESCRIPTION
-The libinput-rs package installs a drop-in implementation of
+The
+.B libinput-rs
+runtime package installs a drop-in implementation of
 .IR libinput.so.10
 in the system library directory. Display managers, compositors, and other
 libinput clients use it after the dynamic linker cache is refreshed and the
 clients are restarted.
+.PP
+The
+.B libinput-rs-devel
+package installs the public header, unversioned linker name, and pkg-config
+metadata that replace the distribution's libinput development package.
 .PP
 The optional
 .B libinput-rs
@@ -30,24 +37,37 @@ Replacement shared library on 64-bit Fedora systems.
 Runtime SONAME link.
 .TP
 .I /usr/lib64/libinput.so
-Development linker name.
+Development linker name supplied by libinput-rs-devel.
 .TP
 .I /usr/include/libinput.h
-C development header.
+C development header supplied by libinput-rs-devel.
 .TP
 .I /usr/lib64/pkgconfig/libinput.pc
-pkg-config metadata on 64-bit Fedora systems.
+pkg-config metadata supplied by libinput-rs-devel on 64-bit Fedora systems.
 .TP
 .I /etc/libinput-rs/config.json
 Optional companion-daemon configuration.
 .TP
 .I /usr/lib/systemd/system/libinput-rs.service
 Optional companion service.
-.SH ROLLBACK
-Reinstall the distribution packages to restore the system implementation:
+.SH INSTALLATION
+Perform replacement testing from a text console or SSH session. Install both
+replacement packages in one DNF transaction:
 .PP
 .nf
-sudo dnf reinstall libinput libinput-devel
+sudo systemctl disable --now libinput-rs.service 2>/dev/null || true
+sudo dnf install libinput-rs libinput-rs-devel --allowerasing
+sudo ldconfig
+sudo systemctl reboot
+.fi
+.SH ROLLBACK
+Restore Fedora's runtime and development packages in one transaction:
+.PP
+.nf
+sudo systemctl disable --now libinput-rs.service 2>/dev/null || true
+sudo dnf install libinput libinput-devel --allowerasing
+sudo ldconfig
+sudo systemctl reboot
 .fi
 .SH SEE ALSO
 .BR libinput (1),
