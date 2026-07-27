@@ -4,6 +4,61 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+const REFERENCE_TOUCHPAD_RESOLUTION: f32 = 40.0;
+const FALLBACK_MOTION_SCALE: f32 = 0.45;
+const FALLBACK_SCROLL_SCALE: f32 = 0.02;
+const POINTER_UNITS_PER_MM: f32 = FALLBACK_MOTION_SCALE * REFERENCE_TOUCHPAD_RESOLUTION;
+const SCROLL_TICKS_PER_MM: f32 = FALLBACK_SCROLL_SCALE * REFERENCE_TOUCHPAD_RESOLUTION;
+const MIN_NORMALIZED_SCALE: f32 = 0.01;
+const MAX_NORMALIZED_SCALE: f32 = 2.0;
+
+fn normalized_scale(resolution: Option<i32>, units_per_mm: f32, fallback: f32) -> f32 {
+    let Some(resolution) = resolution.filter(|value| *value > 0) else {
+        return fallback;
+    };
+
+    let scale = units_per_mm / resolution as f32;
+    if scale.is_finite() && (MIN_NORMALIZED_SCALE..=MAX_NORMALIZED_SCALE).contains(&scale) {
+        scale
+    } else {
+        fallback
+    }
+}
+
+fn device_axis_scales(device: &Device) -> (f32, f32, f32) {
+    let mut x_resolution = None;
+    let mut y_resolution = None;
+    let mut mt_x_resolution = None;
+    let mut mt_y_resolution = None;
+
+    if let Ok(absinfo) = device.get_absinfo() {
+        for (axis, info) in absinfo {
+            if axis == AbsoluteAxisCode::ABS_X {
+                x_resolution = Some(info.resolution());
+            } else if axis == AbsoluteAxisCode::ABS_Y {
+                y_resolution = Some(info.resolution());
+            } else if axis == AbsoluteAxisCode::ABS_MT_POSITION_X {
+                mt_x_resolution = Some(info.resolution());
+            } else if axis == AbsoluteAxisCode::ABS_MT_POSITION_Y {
+                mt_y_resolution = Some(info.resolution());
+            }
+        }
+    }
+
+    let x_resolution = x_resolution
+        .filter(|value| *value > 0)
+        .or(mt_x_resolution.filter(|value| *value > 0));
+    let y_resolution = y_resolution
+        .filter(|value| *value > 0)
+        .or(mt_y_resolution.filter(|value| *value > 0));
+
+    (
+        normalized_scale(x_resolution, POINTER_UNITS_PER_MM, FALLBACK_MOTION_SCALE),
+        normalized_scale(y_resolution, POINTER_UNITS_PER_MM, FALLBACK_MOTION_SCALE),
+        normalized_scale(y_resolution, SCROLL_TICKS_PER_MM, FALLBACK_SCROLL_SCALE),
+    )
+}
+
 pub struct DeviceWrapper {
     pub device: Device,
     pub path: PathBuf,
@@ -19,6 +74,9 @@ pub struct DeviceWrapper {
     pub current_dy: i32,
     pub remainder_x: f32,
     pub remainder_y: f32,
+    motion_scale_x: f32,
+    motion_scale_y: f32,
+    scroll_scale_y: f32,
 
     // Tap-to-click state
     pub touch_start_time: Option<Instant>,
@@ -45,6 +103,14 @@ impl DeviceWrapper {
             && device
                 .supported_keys()
                 .is_some_and(|keys| keys.contains(KeyCode::KEY_A));
+        let (motion_scale_x, motion_scale_y, scroll_scale_y) = device_axis_scales(&device);
+
+        if is_absolute {
+            info!(
+                "Using normalized touchpad scales x={motion_scale_x:.4}, y={motion_scale_y:.4}, scroll={scroll_scale_y:.4} for {:?}",
+                path
+            );
+        }
 
         Self {
             device,
@@ -59,6 +125,9 @@ impl DeviceWrapper {
             current_dy: 0,
             remainder_x: 0.0,
             remainder_y: 0.0,
+            motion_scale_x,
+            motion_scale_y,
+            scroll_scale_y,
             touch_start_time: None,
             tap_emitted: false,
             last_typing_time: None,
@@ -242,14 +311,12 @@ impl DeviceWrapper {
                         self.tap_emitted = true; // Moved enough to cancel tap
 
                         if self.touch_fingers <= 1 {
-                            // Touchpads emit high-resolution absolute coordinates. We must scale these down
-                            // so they feel like a standard relative mouse to the compositor.
-                            let hardware_scale = 0.18; // Increased from 0.12 for faster speed
-
-                            let total_x = (self.current_dx as f32 * hardware_scale)
+                            // Normalize high-resolution absolute coordinates to physical motion.
+                            // pointer_acceleration remains a user multiplier around neutral 1.0.
+                            let total_x = (self.current_dx as f32 * self.motion_scale_x)
                                 * config.pointer_acceleration
                                 + self.remainder_x;
-                            let total_y = (self.current_dy as f32 * hardware_scale)
+                            let total_y = (self.current_dy as f32 * self.motion_scale_y)
                                 * config.pointer_acceleration
                                 + self.remainder_y;
 
@@ -274,10 +341,8 @@ impl DeviceWrapper {
                                 ))?;
                             }
                         } else if self.touch_fingers == 2 {
-                            // Scroll scaling
-                            let scroll_scale = 0.02; // Wheel ticks are integers, scale heavily down
                             let total_y =
-                                (self.current_dy as f32 * scroll_scale) + self.remainder_y;
+                                (self.current_dy as f32 * self.scroll_scale_y) + self.remainder_y;
                             let emit_wheel = total_y.round() as i32;
                             self.remainder_y = total_y - emit_wheel as f32;
 
@@ -367,4 +432,59 @@ pub fn scan_input_devices() -> Result<Vec<DeviceWrapper>, Box<dyn Error>> {
     }
 
     Ok(tracked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        normalized_scale, FALLBACK_MOTION_SCALE, FALLBACK_SCROLL_SCALE, POINTER_UNITS_PER_MM,
+        SCROLL_TICKS_PER_MM,
+    };
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 0.000_001,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn reference_resolution_matches_live_calibration() {
+        assert_close(
+            normalized_scale(Some(40), POINTER_UNITS_PER_MM, FALLBACK_MOTION_SCALE),
+            0.45,
+        );
+        assert_close(
+            normalized_scale(Some(40), SCROLL_TICKS_PER_MM, FALLBACK_SCROLL_SCALE),
+            0.02,
+        );
+    }
+
+    #[test]
+    fn higher_resolution_produces_the_same_physical_motion() {
+        assert_close(
+            normalized_scale(Some(80), POINTER_UNITS_PER_MM, FALLBACK_MOTION_SCALE),
+            0.225,
+        );
+        assert_close(
+            normalized_scale(Some(80), SCROLL_TICKS_PER_MM, FALLBACK_SCROLL_SCALE),
+            0.01,
+        );
+    }
+
+    #[test]
+    fn missing_or_implausible_resolution_uses_calibrated_fallback() {
+        assert_close(
+            normalized_scale(None, POINTER_UNITS_PER_MM, FALLBACK_MOTION_SCALE),
+            FALLBACK_MOTION_SCALE,
+        );
+        assert_close(
+            normalized_scale(Some(0), POINTER_UNITS_PER_MM, FALLBACK_MOTION_SCALE),
+            FALLBACK_MOTION_SCALE,
+        );
+        assert_close(
+            normalized_scale(Some(100_000), POINTER_UNITS_PER_MM, FALLBACK_MOTION_SCALE),
+            FALLBACK_MOTION_SCALE,
+        );
+    }
 }

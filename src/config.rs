@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::fs;
 
-pub const DEFAULT_POINTER_ACCELERATION: f32 = 3.0;
+pub const DEFAULT_POINTER_ACCELERATION: f32 = 1.0;
 
 #[derive(Deserialize, Debug, PartialEq)]
 pub struct InputConfig {

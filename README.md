@@ -75,14 +75,16 @@ The daemon reads `/etc/libinput-rs/config.json`:
 {
   "tap_to_click": true,
   "natural_scrolling": true,
-  "pointer_acceleration": 3.0,
+  "pointer_acceleration": 1.0,
   "disable_while_typing": true
 }
 ```
 
-`pointer_acceleration` is a multiplier applied after touchpad absolute motion is
-converted to relative pointer motion. The shipped default is `3.0`, validated on
-the Fedora 45 touchpad used for live replacement testing.
+The companion normalizes touchpad movement and two-finger scrolling using the
+kernel-reported axis resolution. When a device omits resolution metadata, it
+uses a live-tested calibrated fallback. `pointer_acceleration` is a multiplier:
+`1.0` is neutral, values above `1.0` are faster, and values below `1.0` are
+slower.
 
 ## Drop-in replacement
 
@@ -117,6 +119,13 @@ make proofs
 ```
 
 `make proofs-strict` requires all three compilers and runs every model.
+
+## Publishing
+
+The RPM and crates.io release procedure is documented in [RELEASING.md](RELEASING.md).
+The crates.io workspace publishes `libinput-rs-evdev` first and `libinput-rs`
+second. System replacement installations should use the COPR RPMs rather than
+`cargo install`.
 
 ## Reference behavior
 

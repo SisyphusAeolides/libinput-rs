@@ -1,4 +1,4 @@
-.TH LIBINPUT-RS 8 "July 2026" "libinput-rs 0.2.0" "System Administration"
+.TH LIBINPUT-RS 8 "July 2026" "libinput-rs 0.2.1" "System Administration"
 .SH NAME
 libinput-rs \- libinput ABI replacement and optional touchpad companion
 .SH SYNOPSIS
@@ -28,10 +28,11 @@ The service is disabled by default and is not required by the ABI replacement.
 .SH CONFIGURATION
 Companion-daemon configuration is read from
 .IR /etc/libinput-rs/config.json .
-The
+Touchpad pointer and two-finger scroll motion are normalized with the kernel-reported
+axis resolution. Devices without usable resolution metadata use a calibrated
+fallback. The
 .B pointer_acceleration
-field multiplies relative pointer motion after touchpad coordinate conversion.
-Its shipped default is 3.0.
+field is a multiplier applied after normalization; its neutral default is 1.0.
 .SH FILES
 .TP
 .I /usr/lib64/libinput.so.10.13.0
