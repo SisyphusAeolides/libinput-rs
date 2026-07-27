@@ -22,12 +22,30 @@ jobs:
 
       - name: Install DNF dependencies
         run: >-
-          dnf -y install Agda idris2 cpio elfutils gcc gcc-gfortran libwacom-devel make
+          dnf -y -q install Agda idris2 cpio elfutils gcc gcc-gfortran libwacom-devel make
           pkgconf-pkg-config rust cargo clippy rustfmt binutils rpm-build rpmdevtools rpmlint
           systemd-devel systemd-rpm-macros
 
-      - name: Run Rust, proof, and shared-library gates
-        run: make check test proofs-strict shared
+      - name: Check packaging inputs
+        run: make packaging-check
+
+      - name: Check Rust workspace
+        run: cargo check --locked --workspace
+
+      - name: Lint Rust workspace
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test Rust workspace
+        run: make test
+
+      - name: Check safety models
+        run: make proofs-strict
+
+      - name: Build shared library
+        run: make shared
 
       - name: Compare ABI against system libinput when available
         run: |
@@ -71,7 +89,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install proof compilers
-        run: dnf -y install Agda idris2 gcc-gfortran make
+        run: dnf -y -q install Agda idris2 gcc-gfortran make
 
       - name: Check Agda, Idris, and Fortran models
         run: make proofs-strict
