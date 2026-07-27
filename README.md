@@ -75,16 +75,21 @@ The daemon reads `/etc/libinput-rs/config.json`:
 {
   "tap_to_click": true,
   "natural_scrolling": true,
-  "pointer_acceleration": 1.0,
+  "pointer_acceleration": 2.2,
   "disable_while_typing": true
 }
 ```
 
 The companion normalizes touchpad movement and two-finger scrolling using the
 kernel-reported axis resolution. When a device omits resolution metadata, it
-uses a live-tested calibrated fallback. `pointer_acceleration` is a multiplier:
-`1.0` is neutral, values above `1.0` are faster, and values below `1.0` are
-slower.
+uses a live-tested calibrated fallback. `pointer_acceleration` keeps the
+existing user-facing scale: `2.2` is the live-tested neutral value, larger
+values are faster, and smaller positive values are slower.
+
+The normalized motion base corresponds to the previous `2.5` reference, so the
+daemon divides the configured value by `2.5` internally. This preserves the
+exact effective pointer travel of existing configurations across the 0.2.1
+upgrade. For the shipped default, `0.45 × (2.2 / 2.5) = 0.18 × 2.2 = 0.396`.
 
 ## Drop-in replacement
 

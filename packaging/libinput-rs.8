@@ -32,7 +32,11 @@ Touchpad pointer and two-finger scroll motion are normalized with the kernel-rep
 axis resolution. Devices without usable resolution metadata use a calibrated
 fallback. The
 .B pointer_acceleration
-field is a multiplier applied after normalization; its neutral default is 1.0.
+field keeps the existing user-facing scale. Its live-tested neutral value is
+2.2; larger values are faster and smaller positive values are slower. The
+daemon divides the configured value by the 2.5 normalization reference so an
+existing 2.2 configuration preserves the same effective pointer travel after
+upgrade.
 .SH FILES
 .TP
 .I /usr/lib64/libinput.so.10.13.0

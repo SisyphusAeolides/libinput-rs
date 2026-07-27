@@ -111,6 +111,7 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 %changelog
 * Mon Jul 27 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.2.1-1
 - Normalize companion pointer and scroll motion by hardware axis resolution
+- Preserve the live-tested 2.2 pointer setting across normalized motion
 - Use the live-tested motion scale when devices omit resolution metadata
 - Prepare the workspace crates and RPM source package for publication
 
