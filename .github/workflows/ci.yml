@@ -38,8 +38,11 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
-      - name: Test Rust workspace
-        run: make test
+      - name: Test restricted discovery
+        run: cargo test --locked --package libinput-rs-evdev
+
+      - name: Test libinput implementation
+        run: cargo test --locked --package libinput-rs
 
       - name: Check safety models
         run: make proofs-strict
