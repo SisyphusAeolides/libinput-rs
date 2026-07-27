@@ -13,6 +13,7 @@ license = "MIT"
 repository = "https://github.com/SisyphusAeolides/libinput-rs"
 readme = "README.md"
 exclude = [".cargo", "vendor"]
+publish = false
 
 [[bin]]
 name = "libinput-rs"
