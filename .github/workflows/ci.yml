@@ -69,20 +69,24 @@ jobs:
 
       - name: Build source RPM
         run: |
-          mkdir -p "$PWD/rpmbuild/SOURCES" "$PWD/rpmbuild/SRPMS" "$PWD/rpmbuild/RPMS"
+          rpm_topdir="$RUNNER_TEMP/libinput-rs-rpmbuild"
+          rm -rf "$rpm_topdir"
+          mkdir -p "$rpm_topdir/SOURCES" "$rpm_topdir/SRPMS" "$rpm_topdir/RPMS"
+          echo "RPM_TOPDIR=$rpm_topdir" >> "$GITHUB_ENV"
           package_name=$(rpmspec -q --srpm --qf '%{NAME}' libinput-rs.spec)
           package_version=$(rpmspec -q --srpm --qf '%{VERSION}' libinput-rs.spec)
-          tar --exclude='./target' --exclude='./rpmbuild' --exclude='./proofs/fortran/build' \
+          tar --exclude='./target' --exclude='./rpmbuild' --exclude='./rpmbuild2' \
+            --exclude='./proofs/fortran/build' --exclude='./.git' \
             --transform="s|^\./|$package_name-$package_version/|" \
-            -czf "$PWD/rpmbuild/SOURCES/$package_name-$package_version.tar.gz" .
-          rpmbuild -bs libinput-rs.spec --define "_topdir $PWD/rpmbuild"
+            -czf "$rpm_topdir/SOURCES/$package_name-$package_version.tar.gz" .
+          rpmbuild -bs libinput-rs.spec --define "_topdir $rpm_topdir"
 
       - name: Rebuild binary RPM
-        run: rpmbuild --rebuild "$PWD"/rpmbuild/SRPMS/*.src.rpm --define "_topdir $PWD/rpmbuild"
+        run: rpmbuild --rebuild "$RPM_TOPDIR"/SRPMS/*.src.rpm --define "_topdir $RPM_TOPDIR"
 
       - name: Locate binary RPM
         run: |
-          package=$(find "$PWD/rpmbuild/RPMS" -name 'libinput-rs-[0-9]*.rpm' -print -quit)
+          package=$(find "$RPM_TOPDIR/RPMS" -name 'libinput-rs-[0-9]*.rpm' -print -quit)
           test -n "$package"
           echo "RPM_PACKAGE=$package" >> "$GITHUB_ENV"
 
