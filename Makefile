@@ -42,8 +42,14 @@ packaging-check:
 	grep -q '%{_includedir}/libinput.h' libinput-rs.spec
 	grep -q '%{_libdir}/pkgconfig/libinput.pc' libinput-rs.spec
 	grep -Eq '^install .*%\{_libdir\}/libinput\.so\.10' libinput-rs.spec
-	! grep -Eq '^BuildRequires: *(Agda|idris2|gcc-gfortran|libwacom-devel)' libinput-rs.spec
-	! grep -q -- '-lwacom' build-shared.sh
+	! grep -Eq '^BuildRequires: *(Agda|idris2|gcc-gfortran)' libinput-rs.spec
+	grep -Fq 'default = []' Cargo.toml
+	grep -Fq 'libwacom = []' Cargo.toml
+	grep -Fq '#[cfg(feature = "libwacom")]' src/backend.rs
+	grep -Fq 'native_libraries+=(-lwacom)' build-shared.sh
+	grep -Fq '%if 0%{?fedora}' libinput-rs.spec
+	grep -Fq '%global cargo_features --features libwacom' libinput-rs.spec
+	grep -Fq 'BuildRequires:  libwacom-devel >= 2.18' libinput-rs.spec
 	test "$(PACKAGE_VERSION)" = "$$(awk '/^\[package\]/{package=1; next} package && /^version = /{gsub(/[" ]/, "", $$3); print $$3; exit}' Cargo.toml)"
 	test -f packaging/libinput.h
 	test -f packaging/libinput-rs.pc.in

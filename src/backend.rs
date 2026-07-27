@@ -20,6 +20,7 @@ use crate::ffi_types::{
     TabletPadEvent, TabletToolEvent, TouchEvent,
 };
 
+#[cfg(feature = "libwacom")]
 #[link(name = "wacom")]
 extern "C" {
     fn libwacom_database_new() -> *mut libc::c_void;
@@ -53,6 +54,89 @@ extern "C" {
     fn libwacom_stylus_is_generic(stylus: *const libc::c_void) -> libc::c_int;
     fn libwacom_stylus_has_eraser(stylus: *const libc::c_void) -> libc::c_int;
     fn libwacom_stylus_get_eraser_type(stylus: *const libc::c_void) -> libc::c_int;
+}
+
+#[cfg(not(feature = "libwacom"))]
+unsafe fn libwacom_database_new() -> *mut libc::c_void {
+    std::ptr::null_mut()
+}
+
+#[cfg(not(feature = "libwacom"))]
+unsafe fn libwacom_database_destroy(_database: *mut libc::c_void) {}
+
+#[cfg(not(feature = "libwacom"))]
+unsafe fn libwacom_new_from_path(
+    _database: *const libc::c_void,
+    _path: *const libc::c_char,
+    _fallback: libc::c_int,
+    _error: *mut libc::c_void,
+) -> *mut libc::c_void {
+    std::ptr::null_mut()
+}
+
+#[cfg(not(feature = "libwacom"))]
+unsafe fn libwacom_destroy(_device: *mut libc::c_void) {}
+
+#[cfg(not(feature = "libwacom"))]
+unsafe fn libwacom_get_integration_flags(_device: *const libc::c_void) -> libc::c_int {
+    0
+}
+
+#[cfg(not(feature = "libwacom"))]
+unsafe fn libwacom_new_from_usbid(
+    _database: *const libc::c_void,
+    _vendor_id: libc::c_int,
+    _product_id: libc::c_int,
+    _error: *mut libc::c_void,
+) -> *mut libc::c_void {
+    std::ptr::null_mut()
+}
+
+#[cfg(not(feature = "libwacom"))]
+unsafe fn libwacom_get_num_buttons(_device: *const libc::c_void) -> libc::c_int {
+    0
+}
+
+#[cfg(not(feature = "libwacom"))]
+unsafe fn libwacom_is_reversible(_device: *const libc::c_void) -> libc::c_int {
+    0
+}
+
+#[cfg(not(feature = "libwacom"))]
+unsafe fn libwacom_get_button_evdev_code(
+    _device: *const libc::c_void,
+    _button: libc::c_char,
+) -> libc::c_int {
+    0
+}
+
+#[cfg(not(feature = "libwacom"))]
+unsafe fn libwacom_stylus_get_for_id(
+    _database: *const libc::c_void,
+    _tool_id: libc::c_int,
+) -> *const libc::c_void {
+    std::ptr::null()
+}
+
+#[cfg(not(feature = "libwacom"))]
+unsafe fn libwacom_stylus_get_name(_stylus: *const libc::c_void) -> *const libc::c_char {
+    std::ptr::null()
+}
+
+#[cfg(not(feature = "libwacom"))]
+#[allow(dead_code)]
+unsafe fn libwacom_stylus_is_generic(_stylus: *const libc::c_void) -> libc::c_int {
+    0
+}
+
+#[cfg(not(feature = "libwacom"))]
+unsafe fn libwacom_stylus_has_eraser(_stylus: *const libc::c_void) -> libc::c_int {
+    0
+}
+
+#[cfg(not(feature = "libwacom"))]
+unsafe fn libwacom_stylus_get_eraser_type(_stylus: *const libc::c_void) -> libc::c_int {
+    0
 }
 
 unsafe fn tablet_is_display_device(path: &std::path::Path) -> bool {

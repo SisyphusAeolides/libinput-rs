@@ -3,7 +3,7 @@
 
 Name:           libinput-rs
 Version:        0.2.1
-Release:        4%{?dist}
+Release:        5%{?dist}
 Summary:        Rust drop-in replacement for libinput
 
 Provides:       libinput = %{libinput_compat_version}
@@ -14,6 +14,12 @@ License:        MIT AND Unicode-3.0
 URL:            https://github.com/SisyphusAeolides/libinput-rs
 Source0:        %{name}-%{version}.tar.gz
 
+%if 0%{?fedora}
+%global cargo_features --features libwacom
+%else
+%global cargo_features %{nil}
+%endif
+
 BuildRequires:  cargo >= 1.75
 BuildRequires:  rust >= 1.75
 BuildRequires:  gcc
@@ -21,6 +27,9 @@ BuildRequires:  make
 BuildRequires:  pkgconfig(libudev)
 BuildRequires:  systemd-devel
 BuildRequires:  systemd-rpm-macros
+%if 0%{?fedora}
+BuildRequires:  libwacom-devel >= 2.18
+%endif
 Requires:       systemd
 
 %description
@@ -45,8 +54,8 @@ the libinput-rs implementation of the libinput ABI.
 
 %build
 %set_build_flags
-CARGO_NET_OFFLINE=true CARGO_PROFILE_RELEASE_DEBUG=2 cargo build --frozen --release --bin libinput-rs
-CARGO_NET_OFFLINE=true CARGO_PROFILE_RELEASE_DEBUG=2 RPM_LD_FLAGS="%{build_ldflags}" ./build-shared.sh
+CARGO_NET_OFFLINE=true CARGO_PROFILE_RELEASE_DEBUG=2 cargo build --frozen --release --bin libinput-rs %{cargo_features}
+CARGO_NET_OFFLINE=true CARGO_PROFILE_RELEASE_DEBUG=2 CARGO_FEATURES="%{cargo_features}" RPM_LD_FLAGS="%{build_ldflags}" ./build-shared.sh
 
 %install
 install -Dm755 target/release/libinput-rs %{buildroot}%{_bindir}/libinput-rs
@@ -74,7 +83,7 @@ for crate in vendor/*; do
 done
 
 %check
-CARGO_NET_OFFLINE=true cargo test --frozen --workspace
+CARGO_NET_OFFLINE=true cargo test --frozen --workspace %{cargo_features}
 test -e %{buildroot}%{_libdir}/libinput.so.10
 
 %post
@@ -105,6 +114,11 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 %{_libdir}/pkgconfig/libinput.pc
 
 %changelog
+* Mon Jul 27 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.2.1-5
+- Make libwacom tablet metadata an opt-in Cargo feature
+- Enable libwacom integration automatically for Fedora RPMs
+- Use conservative kernel and udev fallbacks on EPEL and RHEL
+
 * Mon Jul 27 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.2.1-4
 - Make COPR builds portable across Fedora, EPEL, and RHEL chroots
 - Keep formal proof compilers in CI instead of RPM build dependencies

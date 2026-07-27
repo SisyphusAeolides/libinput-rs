@@ -33,6 +33,10 @@ name = "input"
 crate-type = ["rlib", "staticlib"]
 path = "src/lib.rs"
 
+[features]
+default = []
+libwacom = []
+
 [dependencies]
 evdev = { package = "libinput-rs-evdev", version = "0.1.0", path = "compat/evdev" }
 mio = { version = "1", features = ["os-poll", "os-ext", "net"] }

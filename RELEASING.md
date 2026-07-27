@@ -61,12 +61,12 @@ copr-cli create libinput-rs \
 Submit the source RPM:
 
 ```bash
-copr-cli build libinput-rs "$HOME/rpmbuild/SRPMS/libinput-rs-0.2.1-4.fc45.src.rpm"
+copr-cli build libinput-rs "$HOME/rpmbuild/SRPMS/libinput-rs-0.2.1-5.fc45.src.rpm"
 ```
 
 Formal proof compilers are verified separately in Fedora CI and are not COPR
-build dependencies. The shared library does not link to libwacom because this
-implementation does not call its API.
+build dependencies. Fedora RPMs enable the optional libwacom integration.
+EPEL and RHEL RPMs use the portable fallback and do not require libwacom.
 
 After the build succeeds, verify that the runtime RPM contains
 `/usr/lib/systemd/system-preset/90-libinput-rs.preset`, then test installation,

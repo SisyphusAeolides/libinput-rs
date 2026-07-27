@@ -12,9 +12,12 @@ after they restart.
 ## Supported systems
 
 The supported packaging path is DNF/RPM. The COPR project targets Fedora 44,
-Fedora rawhide, EPEL 9, EPEL 10, RHEL 9, and RHEL 10 on x86_64. Formal Agda,
-Idris 2, and Fortran models are verified in Fedora CI and are not runtime or RPM
-build dependencies.
+Fedora rawhide, EPEL 9, EPEL 10, RHEL 9, and RHEL 10 on x86_64. Fedora RPMs
+enable optional libwacom tablet metadata integration. EPEL and RHEL builds use
+conservative kernel, evdev, and udev fallbacks and do not require libwacom.
+
+Formal Agda, Idris 2, and Fortran models are verified in Fedora CI and are not
+runtime or RPM build dependencies.
 
 ## Install from COPR
 
