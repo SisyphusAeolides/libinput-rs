@@ -80,10 +80,11 @@ rpm -qpl "$package_rpm" | rg -Fx "$libdir/libinput.so"
 pkg_config=(
     env
     PKG_CONFIG_PATH=
-    "PKG_CONFIG_LIBDIR=$stage$libdir/pkgconfig"
+    "PKG_CONFIG_LIBDIR=$stage$libdir/pkgconfig:$libdir/pkgconfig:/usr/share/pkgconfig"
     "PKG_CONFIG_SYSROOT_DIR=$stage"
     pkg-config
 )
+[[ "$("${pkg_config[@]}" --variable=pcfiledir libinput)" == "$stage$libdir/pkgconfig" ]]
 read -r -a cflags <<<"$("${pkg_config[@]}" --cflags libinput)"
 read -r -a libs <<<"$("${pkg_config[@]}" --libs libinput)"
 consumer="$stage/libinput-rs-smoke"
