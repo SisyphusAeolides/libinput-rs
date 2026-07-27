@@ -4,10 +4,9 @@ UNITDIR ?= $(PREFIX)/lib/systemd/system
 DESTDIR ?=
 FC = gfortran
 REFERENCE_LIBINPUT ?= /usr/lib64/libinput.so.10
-RPM_RUNTIME ?=
-RPM_DEVEL ?=
+RPM_PACKAGE ?=
 
-.PHONY: all build shared check packaging-check crate-package-check rpm-devel-check test abi-check proofs proofs-strict install
+.PHONY: all build shared check packaging-check crate-package-check rpm-check test abi-check proofs proofs-strict install
 
 all: build shared
 
@@ -42,10 +41,9 @@ crate-package-check:
 	cargo package --locked --no-verify --package libinput-rs-evdev
 	! cargo package --locked --list --package libinput-rs-evdev | grep -Eq '/(vendor|\.cargo)/'
 
-rpm-devel-check:
-	test -n "$(RPM_RUNTIME)"
-	test -n "$(RPM_DEVEL)"
-	scripts/verify-rpm-devel.sh "$(RPM_RUNTIME)" "$(RPM_DEVEL)"
+rpm-check:
+	test -n "$(RPM_PACKAGE)"
+	scripts/verify-rpm-devel.sh "$(RPM_PACKAGE)"
 
 test:
 	cargo test --locked --workspace
