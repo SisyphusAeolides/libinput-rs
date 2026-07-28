@@ -64,8 +64,10 @@ crate-package-check:
 	! cargo package --locked --list --package libinput-rs-evdev | grep -Eq '/(vendor|\.cargo|rpmbuild)'
 
 main-crate-package-check:
-	cargo package --locked --no-verify --package libinput-rs
-	! cargo package --locked --list --package libinput-rs | grep -Eq '/(vendor|\.cargo|rpmbuild)'
+	cd /tmp && cargo package --locked --no-verify --package libinput-rs \
+		--manifest-path "$(CURDIR)/Cargo.toml"
+	cd /tmp && ! cargo package --locked --list --package libinput-rs \
+		--manifest-path "$(CURDIR)/Cargo.toml" | grep -Eq '/(vendor|\.cargo|rpmbuild)'
 
 source-archive:
 	mkdir -p "$(RPM_TOPDIR)/SOURCES"

@@ -2,8 +2,8 @@
 %global libinput_replace_before 1.32.0
 
 Name:           libinput-rs
-Version:        0.2.1
-Release:        5%{?dist}
+Version:        0.2.2
+Release:        1%{?dist}
 Summary:        Rust drop-in replacement for libinput
 
 Provides:       libinput = %{libinput_compat_version}
@@ -114,6 +114,11 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 %{_libdir}/pkgconfig/libinput.pc
 
 %changelog
+* Mon Jul 27 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.2.2-1
+- Prevent the companion daemon from consuming its own virtual pointer events
+- Preserve active touchpad gestures when disable-while-typing becomes active
+- Give the companion pointer a stable virtual input identity
+
 * Mon Jul 27 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.2.1-5
 - Make libwacom tablet metadata an opt-in Cargo feature
 - Enable libwacom integration automatically for Fedora RPMs

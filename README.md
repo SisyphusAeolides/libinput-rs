@@ -85,6 +85,20 @@ The daemon reads `/etc/libinput-rs/config.json`:
 }
 ```
 
+### Elantech SMBus stalls
+
+Some systems expose an Elantech touchpad first through PS/2 and then replace
+it with an SMBus companion. If pointer input periodically stops at the kernel
+device layer, keep the stable PS/2 path by adding this kernel argument:
+
+```bash
+sudo grubby --update-kernel=ALL --args=psmouse.elantech_smbus=0
+sudo reboot
+```
+
+Confirm the workaround after reboot with
+`cat /sys/module/psmouse/parameters/elantech_smbus`; it should print `0`.
+
 The companion normalizes touchpad movement and two-finger scrolling using the
 kernel-reported axis resolution. When a device omits resolution metadata, it
 uses a live-tested calibrated fallback. `pointer_acceleration` keeps the

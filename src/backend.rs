@@ -6983,97 +6983,85 @@ impl BackendState {
                             }
                             return;
                         }
-                    } else {
-                        if !td.scroll_button_down {
-                            // This button press pre-dated the active scroll
-                            // configuration, so its release must stay paired with
-                            // the ordinary press in the generic path.
-                        } else {
-                            td.scroll_button_down = false;
-                            if td.scroll_button_lock_press {
-                                td.scroll_button_lock_press = false;
-                                if td.scroll_lock_active {
-                                    td.scroll_lock_active = false;
-                                    td.scroll_button_press_time = None;
-                                    if td.scroll_button_moved || td.scroll_button_axes != 0 {
-                                        Self::emit_button_scroll_stops(
-                                            ts_usec, lib_dev, ctx, td, out,
-                                        );
-                                    } else {
-                                        let pressed_count = press_seat_button(lib_dev);
-                                        out.push_back(LibinputEvent {
-                                            event_type:
-                                                LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
-                                            payload: EventPayload::PointerButton(
-                                                PointerButtonEvent {
-                                                    time_usec: ts_usec,
-                                                    button: u32::from(code),
-                                                    state: 1,
-                                                    seat_button_count: pressed_count,
-                                                },
-                                            ),
-                                            context: ctx,
-                                            device: lib_dev,
-                                        });
-                                        let released_count = release_seat_button(lib_dev);
-                                        out.push_back(LibinputEvent {
-                                            event_type:
-                                                LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
-                                            payload: EventPayload::PointerButton(
-                                                PointerButtonEvent {
-                                                    time_usec: ts_usec,
-                                                    button: u32::from(code),
-                                                    state: 0,
-                                                    seat_button_count: released_count,
-                                                },
-                                            ),
-                                            context: ctx,
-                                            device: lib_dev,
-                                        });
-                                    }
-                                    td.scroll_button_moved = false;
-                                    td.scroll_button_axes = 0;
-                                    td.scroll_button_accum_x = 0;
-                                    td.scroll_button_accum_y = 0;
-                                } else {
-                                    td.scroll_lock_active = true;
-                                }
-                                return;
-                            }
+                    } else if td.scroll_button_down {
+                        td.scroll_button_down = false;
+                        if td.scroll_button_lock_press {
                             td.scroll_button_lock_press = false;
-                            td.scroll_button_press_time = None;
-                            if td.scroll_button_moved {
-                                Self::emit_button_scroll_stops(ts_usec, lib_dev, ctx, td, out);
+                            if td.scroll_lock_active {
+                                td.scroll_lock_active = false;
+                                td.scroll_button_press_time = None;
+                                if td.scroll_button_moved || td.scroll_button_axes != 0 {
+                                    Self::emit_button_scroll_stops(ts_usec, lib_dev, ctx, td, out);
+                                } else {
+                                    let pressed_count = press_seat_button(lib_dev);
+                                    out.push_back(LibinputEvent {
+                                        event_type:
+                                            LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
+                                        payload: EventPayload::PointerButton(PointerButtonEvent {
+                                            time_usec: ts_usec,
+                                            button: u32::from(code),
+                                            state: 1,
+                                            seat_button_count: pressed_count,
+                                        }),
+                                        context: ctx,
+                                        device: lib_dev,
+                                    });
+                                    let released_count = release_seat_button(lib_dev);
+                                    out.push_back(LibinputEvent {
+                                        event_type:
+                                            LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
+                                        payload: EventPayload::PointerButton(PointerButtonEvent {
+                                            time_usec: ts_usec,
+                                            button: u32::from(code),
+                                            state: 0,
+                                            seat_button_count: released_count,
+                                        }),
+                                        context: ctx,
+                                        device: lib_dev,
+                                    });
+                                }
+                                td.scroll_button_moved = false;
+                                td.scroll_button_axes = 0;
+                                td.scroll_button_accum_x = 0;
+                                td.scroll_button_accum_y = 0;
                             } else {
-                                let pressed_count = press_seat_button(lib_dev);
-                                out.push_back(LibinputEvent {
-                                    event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
-                                    payload: EventPayload::PointerButton(PointerButtonEvent {
-                                        time_usec: ts_usec,
-                                        button: u32::from(code),
-                                        state: 1,
-                                        seat_button_count: pressed_count,
-                                    }),
-                                    context: ctx,
-                                    device: lib_dev,
-                                });
-                                let released_count = release_seat_button(lib_dev);
-                                out.push_back(LibinputEvent {
-                                    event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
-                                    payload: EventPayload::PointerButton(PointerButtonEvent {
-                                        time_usec: ts_usec,
-                                        button: u32::from(code),
-                                        state: 0,
-                                        seat_button_count: released_count,
-                                    }),
-                                    context: ctx,
-                                    device: lib_dev,
-                                });
+                                td.scroll_lock_active = true;
                             }
-                            td.scroll_button_moved = false;
-                            td.scroll_button_axes = 0;
                             return;
                         }
+                        td.scroll_button_lock_press = false;
+                        td.scroll_button_press_time = None;
+                        if td.scroll_button_moved {
+                            Self::emit_button_scroll_stops(ts_usec, lib_dev, ctx, td, out);
+                        } else {
+                            let pressed_count = press_seat_button(lib_dev);
+                            out.push_back(LibinputEvent {
+                                event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
+                                payload: EventPayload::PointerButton(PointerButtonEvent {
+                                    time_usec: ts_usec,
+                                    button: u32::from(code),
+                                    state: 1,
+                                    seat_button_count: pressed_count,
+                                }),
+                                context: ctx,
+                                device: lib_dev,
+                            });
+                            let released_count = release_seat_button(lib_dev);
+                            out.push_back(LibinputEvent {
+                                event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
+                                payload: EventPayload::PointerButton(PointerButtonEvent {
+                                    time_usec: ts_usec,
+                                    button: u32::from(code),
+                                    state: 0,
+                                    seat_button_count: released_count,
+                                }),
+                                context: ctx,
+                                device: lib_dev,
+                            });
+                        }
+                        td.scroll_button_moved = false;
+                        td.scroll_button_axes = 0;
+                        return;
                     }
                 }
                 let is_numbered_button = (KeyCode::BTN_0.0..=KeyCode::BTN_9.0).contains(&code);
