@@ -11,6 +11,14 @@ const POINTER_UNITS_PER_MM: f32 = FALLBACK_MOTION_SCALE * REFERENCE_TOUCHPAD_RES
 const SCROLL_TICKS_PER_MM: f32 = FALLBACK_SCROLL_SCALE * REFERENCE_TOUCHPAD_RESOLUTION;
 const MIN_NORMALIZED_SCALE: f32 = 0.01;
 const MAX_NORMALIZED_SCALE: f32 = 2.0;
+const DWT_TIMEOUT: Duration = Duration::from_millis(500);
+
+fn should_suppress_new_touch(
+    disable_while_typing: bool,
+    elapsed_since_typing: Option<Duration>,
+) -> bool {
+    disable_while_typing && elapsed_since_typing.is_some_and(|elapsed| elapsed < DWT_TIMEOUT)
+}
 
 fn normalized_scale(resolution: Option<i32>, units_per_mm: f32, fallback: f32) -> f32 {
     let Some(resolution) = resolution.filter(|value| *value > 0) else {
@@ -86,6 +94,7 @@ pub struct DeviceWrapper {
     pub last_typing_time: Option<Instant>,
     pub last_movement_time: Option<Instant>,
     pub active_click_button: Option<u16>,
+    pub touch_suppressed: bool,
 }
 
 impl Drop for DeviceWrapper {
@@ -133,6 +142,7 @@ impl DeviceWrapper {
             last_typing_time: None,
             last_movement_time: None,
             active_click_button: None,
+            touch_suppressed: false,
         }
     }
 
@@ -166,17 +176,14 @@ impl DeviceWrapper {
         }
 
         // Disable-While-Typing (DWT) check - moved before tap logic
-        let mut dwt_active = false;
-        if config.disable_while_typing {
-            if let Some(typing_time) = last_global_typing_time {
-                if typing_time.elapsed() < Duration::from_millis(500) {
-                    dwt_active = true;
-                }
-            }
-        }
+        let dwt_active = should_suppress_new_touch(
+            config.disable_while_typing,
+            last_global_typing_time.map(|typing_time| typing_time.elapsed()),
+        );
 
-        // If DWT is active, prevent taps from being emitted
-        if dwt_active {
+        // Typing during an existing gesture must not freeze pointer motion,
+        // but it should still prevent that gesture from becoming a tap.
+        if dwt_active && self.touch_active {
             self.tap_emitted = true;
         }
 
@@ -187,7 +194,8 @@ impl DeviceWrapper {
                     self.touch_active = ev.value() != 0;
                     if self.touch_active {
                         self.touch_start_time = Some(Instant::now());
-                        self.tap_emitted = false;
+                        self.touch_suppressed = dwt_active;
+                        self.tap_emitted = self.touch_suppressed;
                         self.touch_fingers = 1;
                         self.last_x = None;
                         self.last_y = None;
@@ -195,7 +203,7 @@ impl DeviceWrapper {
                         // Reset tracking state when the finger is lifted
 
                         // Tap-to-click logic
-                        if config.tap_to_click && !self.tap_emitted && !dwt_active {
+                        if config.tap_to_click && !self.tap_emitted && !self.touch_suppressed {
                             if let Some(start) = self.touch_start_time {
                                 if start.elapsed() < Duration::from_millis(250) {
                                     // Emit click with proper error handling
@@ -224,6 +232,7 @@ impl DeviceWrapper {
                         self.current_dy = 0;
                         self.touch_start_time = None;
                         self.touch_fingers = 0;
+                        self.touch_suppressed = false;
                     }
                 } else if ev.code() == KeyCode::BTN_TOOL_DOUBLETAP.0 {
                     if ev.value() != 0 {
@@ -300,7 +309,7 @@ impl DeviceWrapper {
                     // SYN_REPORT code is 0
                     let has_movement = self.current_dx != 0 || self.current_dy != 0;
 
-                    if dwt_active {
+                    if self.touch_suppressed {
                         // Throw away movement completely
                         self.current_dx = 0;
                         self.current_dy = 0;
@@ -367,8 +376,10 @@ impl DeviceWrapper {
                         self.current_dy = 0;
                     }
 
-                    // Only emit SYN_REPORT if we have valid movement or if DWT is not active
-                    if has_movement || !dwt_active {
+                    // Keep a complete frame for accepted touches and idle
+                    // state changes. Suppressed contacts intentionally emit
+                    // no pointer frame.
+                    if has_movement || !self.touch_suppressed {
                         v_device.emit_raw(ev)?;
                     }
                 } else {
@@ -388,8 +399,12 @@ pub fn try_open_device(path: &std::path::Path) -> Option<DeviceWrapper> {
     if let Ok(mut device) = evdev::Device::open(path) {
         let name = device.name().unwrap_or("Unknown").to_string();
         info!("Checking device at {:?}: {}", path, name);
-        // Skip virtual devices and non-pointers
-        if name.contains("virtual pointer") || name.contains("libinput-rs") {
+        // Never consume events emitted by our own uinput device. Doing so
+        // creates a feedback loop: each forwarded event becomes readable
+        // again and is forwarded forever. Match the legacy name as well as
+        // the stable virtual input ID so upgrades remain safe.
+        if crate::virtual_device::is_companion_device(device.name(), &device.input_id()) {
+            info!("Ignoring companion output device at {:?}", path);
             return None;
         }
 
@@ -437,8 +452,8 @@ pub fn scan_input_devices() -> Result<Vec<DeviceWrapper>, Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalized_scale, FALLBACK_MOTION_SCALE, FALLBACK_SCROLL_SCALE, POINTER_UNITS_PER_MM,
-        SCROLL_TICKS_PER_MM,
+        normalized_scale, should_suppress_new_touch, DWT_TIMEOUT, FALLBACK_MOTION_SCALE,
+        FALLBACK_SCROLL_SCALE, POINTER_UNITS_PER_MM, SCROLL_TICKS_PER_MM,
     };
 
     fn assert_close(actual: f32, expected: f32) {
@@ -486,5 +501,19 @@ mod tests {
             normalized_scale(Some(100_000), POINTER_UNITS_PER_MM, FALLBACK_MOTION_SCALE),
             FALLBACK_MOTION_SCALE,
         );
+    }
+
+    #[test]
+    fn dwt_only_suppresses_touches_that_begin_inside_the_timeout() {
+        assert!(should_suppress_new_touch(
+            true,
+            Some(DWT_TIMEOUT - std::time::Duration::from_millis(1))
+        ));
+        assert!(!should_suppress_new_touch(true, Some(DWT_TIMEOUT)));
+        assert!(!should_suppress_new_touch(true, None));
+        assert!(!should_suppress_new_touch(
+            false,
+            Some(std::time::Duration::ZERO)
+        ));
     }
 }
