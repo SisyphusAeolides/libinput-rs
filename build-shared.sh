@@ -23,6 +23,7 @@ objcopy_tool=${OBJCOPY:-objcopy}
 archive=target/release/libinput.a
 compat_archive=target/release/libinput-compat.a
 compat_object=target/release/keyboard_compat.o
+udev_keyboard_object=target/release/udev_keyboard_compat.o
 compat_test=$(mktemp target/release/keyboard-compat-test.XXXXXX)
 trap 'rm -f "$compat_test"' EXIT
 
@@ -37,6 +38,11 @@ trap 'rm -f "$compat_test"' EXIT
   "${compile_flags[@]}" \
   -std=c11 -fPIC -Wall -Wextra -Werror \
   -c src/keyboard_compat.c -o "$compat_object"
+
+"$compiler" \
+  "${compile_flags[@]}" \
+  -std=c11 -fPIC -Wall -Wextra -Werror \
+  -c src/udev_keyboard_compat.c -o "$udev_keyboard_object"
 
 rm -f "$compat_archive"
 "$objcopy_tool" \
@@ -55,7 +61,7 @@ fi
 
 "$compiler" -shared \
   "${link_flags[@]}" \
-  "$compat_object" \
+  "$compat_object" "$udev_keyboard_object" \
   -Wl,--whole-archive "$compat_archive" -Wl,--no-whole-archive \
   -Wl,--version-script=libinput.map \
   -Wl,-soname,libinput.so.10 \
