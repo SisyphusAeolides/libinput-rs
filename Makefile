@@ -56,6 +56,7 @@ packaging-check:
 	test -f packaging/libinput.h
 	test -f packaging/libinput-rs.pc.in
 	test -f packaging/libinput-rs-smoke.c
+	test -f packaging/rpmlintrc
 	test -x scripts/verify-rpm-package.sh
 
 crate-package-check:
