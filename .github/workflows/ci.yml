@@ -158,7 +158,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          rpmlint -f packaging/rpmlintrc rpm/*.rpm 2>&1 | tee rpmlint.txt
+          rpmlint -r packaging/rpmlintrc rpm/*.rpm 2>&1 | tee rpmlint.txt
 
       - name: Upload RPM lint report
         if: always()
