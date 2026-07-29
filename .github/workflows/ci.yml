@@ -180,6 +180,8 @@ jobs:
         env:
           LIBINPUT_RS_ALLOW_UINPUT_TESTS: "1"
           LIBINPUT_RS_PARITY_REPORT: ${{ runner.temp }}/libinput-rs-parity.toml
+          LIBINPUT_RS_RAW_REPORT: ${{ runner.temp }}/libinput-rs-upstream-suite.yaml
+          LIBINPUT_RS_SUITE_QUIET: "1"
         run: |
           sudo modprobe uinput
           test -c /dev/uinput
@@ -188,10 +190,14 @@ jobs:
             "$RUNNER_TEMP/libinput-upstream-build"
 
       - name: Upload test-derived parity evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: libinput-rs-parity
-          path: ${{ runner.temp }}/libinput-rs-parity.toml
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/libinput-rs-parity.toml
+            ${{ runner.temp }}/libinput-rs-upstream-suite.yaml
 
   rpm-lint:
     name: RPM lint

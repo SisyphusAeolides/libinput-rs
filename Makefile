@@ -60,6 +60,11 @@ packaging-check:
 	grep -q '^%global libinput_tools_sha256 d5d8c8464f9cb24b0897c03edfe7d7c9e75ff5a91fe9b5b48791781aa9642858' libinput-rs.spec
 	grep -q 'libinput-tool' libinput-rs.spec
 	grep -q 'libinput-replay' libinput-rs.spec
+	test -f packaging/libinput-1.31.3-meson-0.63.patch
+	grep -q 'libinput-1.31.3-meson-0.63.patch' libinput-rs.spec
+	grep -Eq '^BuildRequires: +patch' libinput-rs.spec
+	! test -e packaging/libinput.1
+	! test -e packaging/_libinput
 	grep -Eq '^Requires: +python3-libevdev' libinput-rs.spec
 	grep -Eq '^Requires: +python3-pyudev' libinput-rs.spec
 	grep -Eq '^Requires: +python3-pyyaml' libinput-rs.spec
@@ -113,6 +118,7 @@ upstream-tools-source:
 $(UPSTREAM_TOOLS_SOURCE_DIR)/.stamp: | upstream-tools-source
 	mkdir -p "$(UPSTREAM_TOOLS_SOURCE_DIR)"
 	tar -xzf "$(UPSTREAM_TOOLS_ARCHIVE)" --strip-components=1 -C "$(UPSTREAM_TOOLS_SOURCE_DIR)"
+	patch -d "$(UPSTREAM_TOOLS_SOURCE_DIR)" -p1 < packaging/libinput-1.31.3-meson-0.63.patch
 	touch "$@"
 
 $(UPSTREAM_TOOLS_BUILD_DIR)/.stamp: $(UPSTREAM_TOOLS_SOURCE_DIR)/.stamp

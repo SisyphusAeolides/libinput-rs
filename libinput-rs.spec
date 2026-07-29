@@ -32,8 +32,9 @@ BuildRequires:  binutils
 BuildRequires:  gcc
 BuildRequires:  gcc-gfortran
 BuildRequires:  make
-BuildRequires:  meson >= 0.64
+BuildRequires:  meson >= 0.63
 BuildRequires:  ninja-build
+BuildRequires:  patch
 BuildRequires:  pkgconfig(libevdev) >= 1.10.0
 BuildRequires:  pkgconfig(mtdev) >= 1.1.0
 BuildRequires:  pkgconfig(libudev)
@@ -56,6 +57,7 @@ the shared backend without a second process or exclusive device grab.
 %prep
 echo "%{libinput_tools_sha256}  %{SOURCE1}" | sha256sum -c -
 %autosetup -a 1
+patch -d libinput-%{libinput_tools_commit} -p1 < packaging/libinput-1.31.3-meson-0.63.patch
 
 %build
 %set_build_flags

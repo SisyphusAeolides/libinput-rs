@@ -1,0 +1,12 @@
+--- a/meson.build
++++ b/meson.build
+@@ -5 +5 @@ project('libinput', 'c',
+-	meson_version : '>= 0.64.0')
++	meson_version : '>= 0.63.0')
+--- a/plugins/meson.build
++++ b/plugins/meson.build
+@@ -14 +13,0 @@ plugins = [
+-fs = import('fs')
+@@ -16 +15 @@ foreach plugin : plugins
+-	fs.copyfile(plugin)
++	configure_file(input: plugin, output: '@BASENAME@', copy: true)

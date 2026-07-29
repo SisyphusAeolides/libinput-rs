@@ -55,8 +55,10 @@ template_build=$(realpath "$2")
 shift 2
 
 suite_jobs=${LIBINPUT_RS_SUITE_JOBS:-1}
+suite_quiet=${LIBINPUT_RS_SUITE_QUIET:-0}
 suite_arguments=("$@")
 [[ $suite_jobs =~ ^[1-9][0-9]*$ ]] || die 'LIBINPUT_RS_SUITE_JOBS must be a positive integer'
+[[ $suite_quiet =~ ^[01]$ ]] || die 'LIBINPUT_RS_SUITE_QUIET must be 0 or 1'
 for argument in "$@"; do
 	case "$argument" in
 		--jobs|--jobs=*)
@@ -69,7 +71,7 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 candidate=${LIBINPUT_RS_LIBRARY:-"$repo_root/target/release/libinput.so"}
 candidate=$(realpath "$candidate")
 
-for command in awk flock git grep ldd loginctl meson mktemp ninja patch pgrep readelf realpath rm rsync sed sha256sum sort tee wc; do
+for command in awk flock git grep ldd loginctl meson mktemp ninja patch pgrep readelf realpath rm rsync sed sha256sum sort tail tee wc; do
 	command -v "$command" >/dev/null || die "required command not found: $command"
 done
 
@@ -323,13 +325,39 @@ if (( EUID != 0 )); then
 	command -v sudo >/dev/null || die 'sudo is required when the suite is not run as root'
 	privilege_prefix=(sudo -n)
 fi
-raw_report="$workdir/upstream-suite.yaml"
+raw_report=${LIBINPUT_RS_RAW_REPORT:-"$workdir/upstream-suite.yaml"}
+mkdir -p -- "$(dirname -- "$raw_report")"
 set +e
-"${privilege_prefix[@]}" env \
-		LD_LIBRARY_PATH="$library_dir" \
-		"LIBINPUT_QUIRKS_DIR=$suite_libinput_quirks_override" \
-		"$runner" --jobs "$suite_jobs" "${suite_arguments[@]}" 2>&1 | tee "$raw_report"
-runner_status=${PIPESTATUS[0]}
+suite_command=(
+	"${privilege_prefix[@]}"
+	env
+	"LD_LIBRARY_PATH=$library_dir"
+	"LIBINPUT_QUIRKS_DIR=$suite_libinput_quirks_override"
+	"$runner"
+	--jobs "$suite_jobs"
+	"${suite_arguments[@]}"
+)
+if [[ $suite_quiet == 1 ]]; then
+	"${suite_command[@]}" >"$raw_report" 2>&1 &
+	runner_pid=$!
+	while kill -0 "$runner_pid" 2>/dev/null; do
+		sleep 30
+		if kill -0 "$runner_pid" 2>/dev/null; then
+			report_lines=$(wc -l < "$raw_report")
+			report_lines=${report_lines//[[:space:]]/}
+			printf 'upstream suite still running: %s report lines captured\n' "$report_lines"
+		fi
+	done
+	wait "$runner_pid"
+	runner_status=$?
+	if (( runner_status != 0 )); then
+		printf '%s\n' 'upstream suite failed; final report lines follow:' >&2
+		tail -n 200 "$raw_report" >&2
+	fi
+else
+	"${suite_command[@]}" 2>&1 | tee "$raw_report"
+	runner_status=${PIPESTATUS[0]}
+fi
 set -e
 (( runner_status == 0 )) || exit "$runner_status"
 
