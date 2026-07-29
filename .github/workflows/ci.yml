@@ -185,7 +185,6 @@ jobs:
       - name: Run compositor-facing upstream suite
         env:
           LIBINPUT_RS_ALLOW_UINPUT_TESTS: "1"
-          LIBINPUT_RS_SUITE_JOBS: "8"
           LIBINPUT_RS_PARITY_REPORT: ${{ runner.temp }}/libinput-rs-parity.toml
         run: |
           sudo modprobe uinput
