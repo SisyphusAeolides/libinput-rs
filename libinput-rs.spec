@@ -25,6 +25,7 @@ Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  cargo >= 1.75
 BuildRequires:  rust >= 1.75
+BuildRequires:  binutils
 BuildRequires:  gcc
 BuildRequires:  gcc-gfortran
 BuildRequires:  make
@@ -157,6 +158,11 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 - Compile the capability bitmap and fallback classifier from Fortran
 - Verify total classification and lifecycle laws with Idris 2 and Agda
 - Add deterministic chwd-style profile planning with statically linked Fortran scoring
+
+* Wed Jul 29 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.3.0-2
+- Restore per-key and per-button seat-wide state tracking
+- Forward keyboard lock LED state through the existing evdev device
+- Accept auxiliary keyboard nodes identified by ID_INPUT_KEY
 
 * Tue Jul 28 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.3.0-1
 - Consolidate runtime, development files, and companion into one RPM
