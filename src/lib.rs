@@ -4440,10 +4440,8 @@ mod tests {
             assert_eq!((*ctx).plugin_paths.len(), 3);
             assert_eq!((&(*ctx).plugin_paths)[0].as_bytes(), b"/tmp/plugins");
             assert_eq!(libinput_plugin_system_load_plugins(ctx, 0), -libc::ENOSYS);
-            libinput_plugin_system_append_path(
-                ctx,
-                std::ffi::CString::new("/ignored").unwrap().as_ptr(),
-            );
+            let ignored = std::ffi::CString::new("/ignored").unwrap();
+            libinput_plugin_system_append_path(ctx, ignored.as_ptr());
             assert_eq!((*ctx).plugin_paths.len(), 3);
             assert_eq!(libinput_plugin_system_load_plugins(ctx, 0), 0);
             libinput_unref(ctx);

@@ -46,7 +46,7 @@ jobs:
 
       - name: Install DNF dependencies
         run: >-
-          dnf -y -q install cpio elfutils gcc libwacom-devel make pkgconf-pkg-config
+          dnf -y -q install cpio elfutils gcc gcc-gfortran libwacom-devel make pkgconf-pkg-config
           ripgrep rust cargo clippy rustfmt binutils rpm-build rpmdevtools systemd-devel
           systemd-rpm-macros
 
@@ -147,7 +147,7 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install -y
           build-essential gfortran git meson ninja-build patch rsync
-          libcheck-dev libevdev-dev libmtdev-dev libudev-dev libwacom-dev
+          check libevdev-dev libmtdev-dev libudev-dev libwacom-dev
           python3-libevdev python3-pytest python3-yaml
 
       - name: Install Rust 1.75

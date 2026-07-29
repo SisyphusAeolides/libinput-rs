@@ -564,14 +564,14 @@ fn ml_classify(system: &SystemFacts, device: &DeviceFacts<'_>) -> Option<(Capabi
 mod tests {
     use super::*;
 
-    fn facts<'a>(name: &'a str, kind: CapabilityKind) -> DeviceFacts<'a> {
+    fn facts(name: &str, kind: CapabilityKind) -> DeviceFacts<'_> {
         DeviceFacts {
             name,
             bus: 0x11,
             vendor: 0x04f3,
             product: 0x0001,
             kind,
-            properties: Box::leak(Box::new(HashMap::new())),
+            properties: Box::leak(Box::default()),
             has_relative_motion: false,
             has_absolute_xy: true,
             has_multitouch: true,
