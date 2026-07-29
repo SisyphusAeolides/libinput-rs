@@ -158,6 +158,10 @@ const PROFILES: &[Profile] = &[
             MatchRule::DmiProduct("p53"),
             MatchRule::Name("elan"),
             MatchRule::Kind(CapabilityKind::Touchpad),
+            // This filter changes click semantics and must be enabled only
+            // from an affected packet recording or an equivalent explicit
+            // device signature, never from DMI and a broad ELAN name alone.
+            MatchRule::Udev("LIBINPUT_RS_P53_PHANTOM_CLICK_SIGNATURE", "1"),
         ],
         centroid: GENERIC_TOUCHPAD_FEATURES,
         apply: ProfileApply {
@@ -580,15 +584,26 @@ mod tests {
     }
 
     #[test]
-    fn hard_match_precedes_statistical_scoring() {
+    fn p53_phantom_click_filter_requires_an_explicit_device_signature() {
         let system = SystemFacts {
             dmi_vendor: "LENOVO".into(),
             dmi_product: "ThinkPad P53".into(),
             thinkpad: true,
             ..SystemFacts::default()
         };
-        let decision =
-            select_profile(&system, &facts("ELAN Touchpad", CapabilityKind::Touchpad)).unwrap();
+        let unsigned = facts("ELAN Touchpad", CapabilityKind::Touchpad);
+        assert!(select_profile(&system, &unsigned).is_none());
+
+        let mut properties = HashMap::new();
+        properties.insert(
+            "LIBINPUT_RS_P53_PHANTOM_CLICK_SIGNATURE".to_string(),
+            "1".to_string(),
+        );
+        let signed = DeviceFacts {
+            properties: &properties,
+            ..unsigned
+        };
+        let decision = select_profile(&system, &signed).unwrap();
         assert_eq!(decision.id, "thinkpad-p53-elan");
         assert!(decision.apply.phantom_click_filter);
     }

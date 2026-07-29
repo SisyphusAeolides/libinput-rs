@@ -252,10 +252,13 @@ pub struct LibinputTabletPadModeGroup {
     pub index: u32,
     pub num_modes: u32,
     pub current_mode: u32,
-    pub num_buttons: u32,
-    pub num_dials: u32,
-    pub num_rings: u32,
-    pub num_strips: u32,
+    pub button_mask: u32,
+    pub dial_mask: u32,
+    pub ring_mask: u32,
+    pub strip_mask: u32,
+    pub toggle_button_mask: u32,
+    /// A negative target means cycle to the next mode.
+    pub toggle_modes: Vec<(u32, i32)>,
 }
 
 unsafe impl Send for LibinputTabletPadModeGroup {}
@@ -754,7 +757,7 @@ pub struct LibinputDevice {
     pub tablet_pad_num_dials: u32,
     pub tablet_pad_num_rings: u32,
     pub tablet_pad_num_strips: u32,
-    pub tablet_pad_mode_group: *mut LibinputTabletPadModeGroup,
+    pub tablet_pad_mode_groups: Vec<*mut LibinputTabletPadModeGroup>,
     pub accel_available: bool,
     pub supports_button_scroll: bool,
     pub event_codes: Vec<u16>,
@@ -864,7 +867,7 @@ impl LibinputDevice {
             tablet_pad_num_dials: 0,
             tablet_pad_num_rings: 0,
             tablet_pad_num_strips: 0,
-            tablet_pad_mode_group: std::ptr::null_mut(),
+            tablet_pad_mode_groups: Vec::new(),
             accel_available: false,
             supports_button_scroll: false,
             event_codes: Vec::new(),
@@ -968,11 +971,12 @@ impl Drop for LibinputDevice {
             }
             self.group = std::ptr::null_mut();
         }
-        if !self.tablet_pad_mode_group.is_null() {
-            unsafe {
-                crate::libinput_tablet_pad_mode_group_unref(self.tablet_pad_mode_group.cast());
+        for group in self.tablet_pad_mode_groups.drain(..) {
+            if !group.is_null() {
+                unsafe {
+                    crate::libinput_tablet_pad_mode_group_unref(group.cast());
+                }
             }
-            self.tablet_pad_mode_group = std::ptr::null_mut();
         }
         if !self.seat.is_null() {
             unsafe {

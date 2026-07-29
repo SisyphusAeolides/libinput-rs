@@ -45,6 +45,7 @@ struct Section {
     thumb_pressure_threshold: Option<u32>,
     thumb_size_threshold: Option<u32>,
     trackpoint_multiplier: Option<f64>,
+    use_velocity_averaging: Option<bool>,
     tablet_smoothing: Option<bool>,
     msc_timestamp_watch: Option<bool>,
     pressure_range: Option<(i32, i32)>,
@@ -146,6 +147,7 @@ pub struct AppliedQuirks {
     pub thumb_pressure_threshold: Option<u32>,
     pub thumb_size_threshold: Option<u32>,
     pub trackpoint_multiplier: Option<f64>,
+    pub use_velocity_averaging: bool,
     pub tablet_smoothing: Option<bool>,
     pub msc_timestamp_watch: bool,
     pub pressure_range: Option<(i32, i32)>,
@@ -362,6 +364,8 @@ fn apply_file(
                 .parse::<f64>()
                 .ok()
                 .filter(|multiplier| multiplier.is_finite() && *multiplier > 0.0);
+        } else if key.trim() == "AttrUseVelocityAveraging" {
+            section.use_velocity_averaging = parse_bool(value);
         } else if key.trim() == "AttrTabletSmoothing" {
             section.tablet_smoothing = parse_bool(value);
         } else if key.trim() == "AttrMscTimestamp" {
@@ -621,6 +625,9 @@ fn apply_section(
     if let Some(multiplier) = section.trackpoint_multiplier {
         applied.trackpoint_multiplier = Some(multiplier);
     }
+    if let Some(enabled) = section.use_velocity_averaging {
+        applied.use_velocity_averaging = enabled;
+    }
     if let Some(smoothing) = section.tablet_smoothing {
         applied.tablet_smoothing = Some(smoothing);
     }
@@ -756,7 +763,10 @@ fn validate_quirk_entry(key: &str, value: &str) -> Option<String> {
                 invalid()
             }
         }
-        "AttrTabletSmoothing" | "AttrIsVirtual" | "ModelTouchpadVisibleMarker" => {
+        "AttrTabletSmoothing"
+        | "AttrUseVelocityAveraging"
+        | "AttrIsVirtual"
+        | "ModelTouchpadVisibleMarker" => {
             if parse_bool(value).is_some() {
                 None
             } else {
@@ -1176,5 +1186,33 @@ mod tests {
             assert!(validate_quirk_entry("AttrInputProp", &format!("+{property}")).is_none());
             assert!(validate_quirk_entry("AttrInputProp", &format!("-{property}")).is_none());
         }
+    }
+
+    #[test]
+    fn velocity_averaging_quirk_is_validated_and_applied() {
+        assert!(validate_quirk_entry("AttrUseVelocityAveraging", "1").is_none());
+        assert!(validate_quirk_entry("AttrUseVelocityAveraging", "0").is_none());
+        assert!(validate_quirk_entry("AttrUseVelocityAveraging", "yes").is_some());
+
+        let identity = DeviceIdentity {
+            name: "Velocity Mouse",
+            bus: 0x03,
+            vendor: 1,
+            product: 2,
+            version: 1,
+            udev_types: &["mouse"],
+            dmi_modalias: "dmi:*",
+            device_tree: "",
+        };
+        let mut codes = Vec::new();
+        let mut applied = AppliedQuirks::default();
+        apply_file(
+            Path::new("velocity.quirks"),
+            "[Velocity]\nMatchName=Velocity Mouse\nAttrUseVelocityAveraging=1\n",
+            &identity,
+            &mut codes,
+            &mut applied,
+        );
+        assert!(applied.use_velocity_averaging);
     }
 }

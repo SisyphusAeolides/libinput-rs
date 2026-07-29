@@ -3,13 +3,13 @@
 `libinput-rs` is a Rust implementation of the `libinput.so.10` C ABI and
 command-line tools.
 
-One RPM replaces both the distribution's `libinput` and `libinput-devel`
-packages. It includes the runtime, development files, and diagnostic tools;
-display managers and compositors use the replacement after they restart. The
-same RPM also supplies the device-group and axis-fuzz udev callouts and rules
-normally installed with libinput, so replacing the distribution package does
-not remove input-device initialization behavior. It carries the matching
-libinput 1.31.3 hardware-quirks database as well.
+The RPM is an experimental replacement candidate for the distribution's
+`libinput` and `libinput-devel` packages. It includes the runtime, development
+files, and compatibility tools, plus the device-group and axis-fuzz udev
+callouts and rules normally installed with libinput. It carries the matching
+libinput 1.31.3 hardware-quirks database as well. Replacement testing should
+remain recoverable until the upstream behavioral gates pass for the exact
+distribution artifacts being installed.
 
 ## Supported systems
 
@@ -95,7 +95,7 @@ resolution while preserving libinput's separate accelerated and unaccelerated
 coordinate channels. Runtime settings use the standard libinput configuration
 API, so existing compositor and desktop preferences continue to apply.
 
-## Drop-in replacement
+## Replacement layout
 
 The single RPM installs `libinput.so.10` in the system linker path together
 with `libinput.h`, the unversioned linker name, `libinput.pc`, and the libinput
@@ -179,8 +179,10 @@ installations should use the COPR RPM rather than `cargo install`.
 
 Runtime and ABI lifecycle work is compared against the upstream libinput
 architecture and the `complyue/libinput` branch referenced during debugging.
-The Rust implementation provides complete behavior parity and is intended for
-use as a 100% drop-in replacement.
+The project targets libinput C ABI and behavioral compatibility. Passing the
+repository's upstream-derived behavioral gates supports a library-compatibility
+claim for the tested artifacts; it does not by itself establish complete
+distribution-package parity for every utility, device, or downstream patch.
 
 ## License
 

@@ -4,7 +4,7 @@
 Name:           libinput-rs
 Version:        0.3.1
 Release:        1%{?dist}
-Summary:        Rust drop-in replacement for libinput
+Summary:        Rust implementation of the libinput ABI
 
 Provides:       libinput = %{libinput_compat_version}
 Provides:       libinput%{?_isa} = %{libinput_compat_version}

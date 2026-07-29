@@ -60,8 +60,8 @@ copr-cli create libinput-rs \
   --chroot fedora-rawhide-x86_64 \
   --chroot rhel-9-x86_64 \
   --chroot rhel-10-x86_64 \
-  --description "Rust drop-in replacement for libinput" \
-  --instructions "Install from a text console or SSH-capable system. The ABI replacement is active after clients restart."
+  --description "Rust implementation of the libinput ABI and compatibility tools" \
+  --instructions "Experimental replacement testing requires a text console or SSH-capable system and a verified rollback path."
 ```
 
 Submit the source RPM:

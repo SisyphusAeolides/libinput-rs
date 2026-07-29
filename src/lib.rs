@@ -2857,10 +2857,16 @@ pub unsafe extern "C" fn libinput_device_tablet_pad_get_mode_group(
     dev: *const LibinputDevice,
     index: u32,
 ) -> *mut libc::c_void {
-    if dev.is_null() || !(*dev).has_tablet_pad || index != 0 {
+    if dev.is_null() || !(*dev).has_tablet_pad {
         return std::ptr::null_mut();
     }
-    (*dev).tablet_pad_mode_group.cast()
+    (*dev)
+        .tablet_pad_mode_groups
+        .iter()
+        .copied()
+        .find(|group| !group.is_null() && (**group).index == index)
+        .unwrap_or(std::ptr::null_mut())
+        .cast()
 }
 
 #[no_mangle]
@@ -2887,7 +2893,10 @@ pub unsafe extern "C" fn libinput_device_tablet_pad_get_num_dials(
 pub unsafe extern "C" fn libinput_device_tablet_pad_get_num_mode_groups(
     dev: *const LibinputDevice,
 ) -> u32 {
-    u32::from(!dev.is_null() && (*dev).has_tablet_pad)
+    if dev.is_null() || !(*dev).has_tablet_pad {
+        return u32::MAX;
+    }
+    (*dev).tablet_pad_mode_groups.len() as u32
 }
 
 #[no_mangle]
@@ -3770,10 +3779,14 @@ pub unsafe extern "C" fn libinput_plugin_system_load_plugins(
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_tablet_pad_mode_group_button_is_toggle(
-    _group: *const libc::c_void,
-    _button: u32,
+    group: *const libc::c_void,
+    button: u32,
 ) -> libc::c_int {
-    0
+    if group.is_null() || button >= u32::BITS {
+        return 0;
+    }
+    ((*group.cast::<LibinputTabletPadModeGroup>()).toggle_button_mask & (1_u32 << button) != 0)
+        as libc::c_int
 }
 
 #[no_mangle]
@@ -3814,7 +3827,11 @@ pub unsafe extern "C" fn libinput_tablet_pad_mode_group_has_button(
     if group.is_null() {
         return 0;
     }
-    (button < (*group.cast::<LibinputTabletPadModeGroup>()).num_buttons) as libc::c_int
+    if button >= u32::BITS {
+        return 0;
+    }
+    ((*group.cast::<LibinputTabletPadModeGroup>()).button_mask & (1_u32 << button) != 0)
+        as libc::c_int
 }
 
 #[no_mangle]
@@ -3825,7 +3842,10 @@ pub unsafe extern "C" fn libinput_tablet_pad_mode_group_has_dial(
     if group.is_null() {
         return 0;
     }
-    (dial < (*group.cast::<LibinputTabletPadModeGroup>()).num_dials) as libc::c_int
+    if dial >= u32::BITS {
+        return 0;
+    }
+    ((*group.cast::<LibinputTabletPadModeGroup>()).dial_mask & (1_u32 << dial) != 0) as libc::c_int
 }
 
 #[no_mangle]
@@ -3836,7 +3856,10 @@ pub unsafe extern "C" fn libinput_tablet_pad_mode_group_has_ring(
     if group.is_null() {
         return 0;
     }
-    (ring < (*group.cast::<LibinputTabletPadModeGroup>()).num_rings) as libc::c_int
+    if ring >= u32::BITS {
+        return 0;
+    }
+    ((*group.cast::<LibinputTabletPadModeGroup>()).ring_mask & (1_u32 << ring) != 0) as libc::c_int
 }
 
 #[no_mangle]
@@ -3847,7 +3870,11 @@ pub unsafe extern "C" fn libinput_tablet_pad_mode_group_has_strip(
     if group.is_null() {
         return 0;
     }
-    (strip < (*group.cast::<LibinputTabletPadModeGroup>()).num_strips) as libc::c_int
+    if strip >= u32::BITS {
+        return 0;
+    }
+    ((*group.cast::<LibinputTabletPadModeGroup>()).strip_mask & (1_u32 << strip) != 0)
+        as libc::c_int
 }
 
 #[no_mangle]
@@ -4511,10 +4538,12 @@ mod tests {
                 index: 0,
                 num_modes: 1,
                 current_mode: 0,
-                num_buttons: 0,
-                num_dials: 0,
-                num_rings: 0,
-                num_strips: 0,
+                button_mask: 0,
+                dial_mask: 0,
+                ring_mask: 0,
+                strip_mask: 0,
+                toggle_button_mask: 0,
+                toggle_modes: Vec::new(),
             }));
             assert_eq!(
                 libinput_tablet_pad_mode_group_ref(group.cast()),

@@ -14,6 +14,7 @@ struct Tracker {
 
 pub struct MotionHistory {
     trackers: [Tracker; 16],
+    active_trackers: usize,
     current: usize,
     pub last_velocity: f64,
 }
@@ -22,6 +23,7 @@ impl Default for MotionHistory {
     fn default() -> Self {
         Self {
             trackers: [Tracker::default(); 16],
+            active_trackers: 2,
             current: 0,
             last_velocity: 0.0,
         }
@@ -30,7 +32,24 @@ impl Default for MotionHistory {
 
 impl MotionHistory {
     pub fn restart(&mut self) {
-        *self = Self::default();
+        let active_trackers = self.active_trackers;
+        *self = Self {
+            active_trackers,
+            ..Self::default()
+        };
+    }
+
+    pub fn set_use_velocity_averaging(&mut self, enabled: bool) {
+        let active_trackers = if enabled { self.trackers.len() } else { 2 };
+        if self.active_trackers != active_trackers {
+            self.active_trackers = active_trackers;
+            self.restart();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn active_tracker_count(&self) -> usize {
+        self.active_trackers
     }
 
     /// Restart at a known device timestamp.
@@ -49,15 +68,15 @@ impl MotionHistory {
     }
 
     fn by_offset(&self, offset: usize) -> &Tracker {
-        &self.trackers[(self.current + self.trackers.len() - offset) % self.trackers.len()]
+        &self.trackers[(self.current + self.active_trackers - offset) % self.active_trackers]
     }
 
     pub fn feed_velocity(&mut self, dx: f64, dy: f64, time_usec: u64, smooth_10ms: bool) -> f64 {
-        for tracker in &mut self.trackers {
+        for tracker in &mut self.trackers[..self.active_trackers] {
             tracker.dx += dx;
             tracker.dy += dy;
         }
-        self.current = (self.current + 1) % self.trackers.len();
+        self.current = (self.current + 1) % self.active_trackers;
         self.trackers[self.current] = Tracker {
             dx: 0.0,
             dy: 0.0,
@@ -68,7 +87,7 @@ impl MotionHistory {
         let mut result = 0.0;
         let mut initial_velocity = 0.0;
         let mut common_direction = self.by_offset(0).direction;
-        for offset in 1..self.trackers.len() {
+        for offset in 1..self.active_trackers {
             let tracker = self.by_offset(offset);
             if tracker.time_usec > time_usec {
                 break;
@@ -165,5 +184,17 @@ mod tests {
         history.restart_at(10_000);
         let velocity = history.feed_velocity(10.0, 0.0, 20_000, false);
         assert!((velocity - 0.001).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn tracker_count_defaults_to_two_and_only_expands_for_the_quirk() {
+        let mut history = MotionHistory::default();
+        assert_eq!(history.active_tracker_count(), 2);
+        history.set_use_velocity_averaging(true);
+        assert_eq!(history.active_tracker_count(), 16);
+        history.restart_at(10_000);
+        assert_eq!(history.active_tracker_count(), 16);
+        history.set_use_velocity_averaging(false);
+        assert_eq!(history.active_tracker_count(), 2);
     }
 }

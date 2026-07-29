@@ -48,6 +48,11 @@ extern "C" {
         device: *const libc::c_void,
         button: libc::c_char,
     ) -> libc::c_int;
+    fn libwacom_get_button_flag(device: *const libc::c_void, button: libc::c_char) -> libc::c_int;
+    fn libwacom_get_button_led_group(
+        device: *const libc::c_void,
+        button: libc::c_char,
+    ) -> libc::c_int;
     fn libwacom_stylus_get_for_id(
         database: *const libc::c_void,
         tool_id: libc::c_int,
@@ -124,6 +129,41 @@ unsafe fn libwacom_get_strips_num_modes(_device: *const libc::c_void) -> libc::c
 unsafe fn libwacom_get_button_evdev_code(
     _device: *const libc::c_void,
     _button: libc::c_char,
+) -> libc::c_int {
+    0
+}
+
+#[cfg(not(feature = "libwacom"))]
+unsafe fn libwacom_get_button_flag(
+    _device: *const libc::c_void,
+    _button: libc::c_char,
+) -> libc::c_int {
+    0
+}
+
+#[cfg(not(feature = "libwacom"))]
+unsafe fn libwacom_get_button_led_group(
+    _device: *const libc::c_void,
+    _button: libc::c_char,
+) -> libc::c_int {
+    -1
+}
+
+#[cfg(feature = "libwacom")]
+unsafe fn optional_libwacom_mode_count(device: *const libc::c_void, symbol: &[u8]) -> libc::c_int {
+    type ModeCountFn = unsafe extern "C" fn(*const libc::c_void) -> libc::c_int;
+    let address = libc::dlsym(libc::RTLD_DEFAULT, symbol.as_ptr().cast());
+    if address.is_null() {
+        0
+    } else {
+        std::mem::transmute::<*mut libc::c_void, ModeCountFn>(address)(device)
+    }
+}
+
+#[cfg(not(feature = "libwacom"))]
+unsafe fn optional_libwacom_mode_count(
+    _device: *const libc::c_void,
+    _symbol: &[u8],
 ) -> libc::c_int {
     0
 }
@@ -1015,6 +1055,44 @@ fn parse_mouse_dpi(value: &str) -> Option<f64> {
     fallback
 }
 
+fn pointer_profile_input_scale(
+    profile: u32,
+    is_pointing_stick: bool,
+    dpi: f64,
+    trackpoint_multiplier: f64,
+) -> f64 {
+    match profile {
+        // Flat consumes native device units. TrackPoint's own native-unit
+        // filter additionally applies its hardware multiplier.
+        1 if is_pointing_stick => trackpoint_multiplier,
+        1 => 1.0,
+        // Custom curves are explicitly defined in native device units.
+        4 => 1.0,
+        // Adaptive mouse motion is normalized to the upstream 1000-DPI
+        // coordinate space. TrackPoints use their quirk multiplier instead.
+        _ if is_pointing_stick => trackpoint_multiplier,
+        _ => 1_000.0 / dpi.max(1.0),
+    }
+}
+
+fn pointer_constant_filter_scale(
+    profile: u32,
+    speed: f64,
+    is_pointing_stick: bool,
+    dpi: f64,
+    trackpoint_multiplier: f64,
+) -> f64 {
+    match profile {
+        1 if is_pointing_stick => {
+            trackpoint_multiplier * trackpoint_speed_factor(speed.clamp(-1.0, 1.0))
+        }
+        1 => (1.0 + speed.clamp(-1.0, 1.0)).max(0.005),
+        4 => 1.0,
+        _ if is_pointing_stick => trackpoint_multiplier,
+        _ => 1_000.0 / dpi.max(1.0),
+    }
+}
+
 fn t450_update_nonmotion_count(count: &mut u32, motion: bool, other_axis: bool) -> bool {
     if motion {
         let swallow = *count > 10;
@@ -1133,7 +1211,11 @@ unsafe fn configured_motion_factor(
     }
     let speed_setting = (*device).accel_speed;
     if (*device).accel_profile == 1 {
-        return (1.0 + speed_setting).max(0.005);
+        return if is_pointing_stick {
+            trackpoint_speed_factor(speed_setting)
+        } else {
+            (1.0 + speed_setting).max(0.005)
+        };
     }
 
     let velocity = history.feed_velocity(dx, dy, time_usec, is_pointing_stick);
@@ -1183,6 +1265,27 @@ unsafe fn configured_scroll_factor(
         .unwrap_or(1.0)
 }
 
+unsafe fn configured_continuous_scroll_factor(
+    device: *mut LibinputDevice,
+    dx: f64,
+    dy: f64,
+    time_usec: u64,
+    is_pointing_stick: bool,
+    dpi: f64,
+    trackpoint_multiplier: f64,
+) -> f64 {
+    if (*device).accel_profile == 4 {
+        return configured_scroll_factor(device, dx, dy, time_usec);
+    }
+    pointer_constant_filter_scale(
+        (*device).accel_profile,
+        (*device).accel_speed,
+        is_pointing_stick,
+        dpi,
+        trackpoint_multiplier,
+    )
+}
+
 impl TrackedDevice {
     unsafe fn seed_resolved_quirks(
         &mut self,
@@ -1228,6 +1331,8 @@ impl TrackedDevice {
                 .and_then(|profile| profile.apply.trackpoint_multiplier)
                 .unwrap_or_else(|| q.trackpoint_multiplier_or_default())
         });
+        self.motion_history
+            .set_use_velocity_averaging(q.use_velocity_averaging);
         self.invert_horizontal_scrolling = q.model_invert_horizontal_scrolling;
         self.debounce_disabled = q.model_bouncing_keys;
         self.tablet_mode_no_suspend = q.model_tablet_mode_no_suspend;
@@ -3284,6 +3389,259 @@ unsafe fn release_touch_seat_slot(ctx: *mut LibinputContext, seat_slot: i32) {
     }
 }
 
+const WACOM_BUTTON_POSITION_MASK: i32 = 0x1e;
+const WACOM_BUTTON_RING_MODESWITCH: i32 = 1 << 5;
+const WACOM_BUTTON_RING2_MODESWITCH: i32 = 1 << 6;
+const WACOM_BUTTON_TOUCHSTRIP_MODESWITCH: i32 = 1 << 7;
+const WACOM_BUTTON_TOUCHSTRIP2_MODESWITCH: i32 = 1 << 8;
+const WACOM_BUTTON_DIAL_MODESWITCH: i32 = 1 << 10;
+const WACOM_BUTTON_DIAL2_MODESWITCH: i32 = 1 << 11;
+const WACOM_BUTTON_MODESWITCH: i32 = WACOM_BUTTON_RING_MODESWITCH
+    | WACOM_BUTTON_RING2_MODESWITCH
+    | WACOM_BUTTON_TOUCHSTRIP_MODESWITCH
+    | WACOM_BUTTON_TOUCHSTRIP2_MODESWITCH
+    | WACOM_BUTTON_DIAL_MODESWITCH
+    | WACOM_BUTTON_DIAL2_MODESWITCH;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TabletPadModeGroupSpec {
+    index: u32,
+    num_modes: u32,
+    button_mask: u32,
+    dial_mask: u32,
+    ring_mask: u32,
+    strip_mask: u32,
+    toggle_button_mask: u32,
+    toggle_modes: Vec<(u32, i32)>,
+}
+
+fn tablet_pad_element_mask(count: u32) -> u32 {
+    match count {
+        0 => 0,
+        count if count >= u32::BITS => u32::MAX,
+        count => (1_u32 << count) - 1,
+    }
+}
+
+fn fallback_tablet_pad_mode_group(
+    num_buttons: u32,
+    num_dials: u32,
+    num_rings: u32,
+    num_strips: u32,
+) -> TabletPadModeGroupSpec {
+    TabletPadModeGroupSpec {
+        index: 0,
+        num_modes: 1,
+        button_mask: tablet_pad_element_mask(num_buttons),
+        dial_mask: tablet_pad_element_mask(num_dials),
+        ring_mask: tablet_pad_element_mask(num_rings),
+        strip_mask: tablet_pad_element_mask(num_strips),
+        toggle_button_mask: 0,
+        toggle_modes: Vec::new(),
+    }
+}
+
+unsafe fn tablet_pad_mode_group_specs(
+    wacom: *const libc::c_void,
+    button_codes: &[u16],
+    num_dials: u32,
+    num_rings: u32,
+    num_strips: u32,
+) -> Vec<TabletPadModeGroupSpec> {
+    let fallback = || {
+        vec![fallback_tablet_pad_mode_group(
+            button_codes.len() as u32,
+            num_dials,
+            num_rings,
+            num_strips,
+        )]
+    };
+    if wacom.is_null() || button_codes.len() > u32::BITS as usize {
+        return fallback();
+    }
+
+    #[derive(Clone, Copy)]
+    struct ButtonMetadata {
+        logical_index: u32,
+        flags: i32,
+    }
+
+    let mut buttons = Vec::new();
+    for libwacom_index in 0..libwacom_get_num_buttons(wacom).max(0) {
+        let letter = (b'A' + libwacom_index as u8) as libc::c_char;
+        let code = libwacom_get_button_evdev_code(wacom, letter);
+        if !(1..=i32::from(u16::MAX)).contains(&code) {
+            continue;
+        }
+        let Some(logical_index) = button_codes.iter().position(|value| *value == code as u16)
+        else {
+            continue;
+        };
+        buttons.push((
+            libwacom_index,
+            ButtonMetadata {
+                logical_index: logical_index as u32,
+                flags: libwacom_get_button_flag(wacom, letter),
+            },
+        ));
+    }
+    if buttons.len() != button_codes.len() {
+        return fallback();
+    }
+
+    let mut groups = std::collections::BTreeMap::<u32, TabletPadModeGroupSpec>::new();
+    let mut toggle_groups = Vec::<(i32, u32)>::new();
+    for (libwacom_index, button) in &buttons {
+        let mode_flag = button.flags & WACOM_BUTTON_MODESWITCH;
+        if mode_flag == 0 {
+            continue;
+        }
+        if mode_flag.count_ones() != 1 {
+            return fallback();
+        }
+        let letter = (b'A' + *libwacom_index as u8) as libc::c_char;
+        let led_group = libwacom_get_button_led_group(wacom, letter);
+        let group_index = if led_group >= 0 {
+            led_group as u32
+        } else {
+            match mode_flag {
+                WACOM_BUTTON_RING_MODESWITCH
+                | WACOM_BUTTON_TOUCHSTRIP_MODESWITCH
+                | WACOM_BUTTON_DIAL_MODESWITCH => 0,
+                WACOM_BUTTON_RING2_MODESWITCH
+                | WACOM_BUTTON_TOUCHSTRIP2_MODESWITCH
+                | WACOM_BUTTON_DIAL2_MODESWITCH => 1,
+                _ => return fallback(),
+            }
+        };
+        let (num_modes, dial_mask, ring_mask, strip_mask) = match mode_flag {
+            WACOM_BUTTON_RING_MODESWITCH => (libwacom_get_ring_num_modes(wacom), 0, 1, 0),
+            WACOM_BUTTON_RING2_MODESWITCH => (libwacom_get_ring2_num_modes(wacom), 0, 2, 0),
+            WACOM_BUTTON_TOUCHSTRIP_MODESWITCH => (libwacom_get_strips_num_modes(wacom), 0, 0, 1),
+            WACOM_BUTTON_TOUCHSTRIP2_MODESWITCH => (libwacom_get_strips_num_modes(wacom), 0, 0, 2),
+            WACOM_BUTTON_DIAL_MODESWITCH => (
+                optional_libwacom_mode_count(wacom, b"libwacom_get_dial_num_modes\0"),
+                1,
+                0,
+                0,
+            ),
+            WACOM_BUTTON_DIAL2_MODESWITCH => (
+                optional_libwacom_mode_count(wacom, b"libwacom_get_dial2_num_modes\0"),
+                2,
+                0,
+                0,
+            ),
+            _ => return fallback(),
+        };
+        if num_modes <= 1 {
+            continue;
+        }
+        let group = groups.entry(group_index).or_insert(TabletPadModeGroupSpec {
+            index: group_index,
+            num_modes: num_modes as u32,
+            button_mask: 0,
+            dial_mask: 0,
+            ring_mask: 0,
+            strip_mask: 0,
+            toggle_button_mask: 0,
+            toggle_modes: Vec::new(),
+        });
+        group.num_modes = group.num_modes.max(num_modes as u32);
+        group.button_mask |= 1 << button.logical_index;
+        group.dial_mask |= dial_mask;
+        group.ring_mask |= ring_mask;
+        group.strip_mask |= strip_mask;
+        group.toggle_button_mask |= 1 << button.logical_index;
+        group.toggle_modes.push((button.logical_index, -1));
+        toggle_groups.push((button.flags & WACOM_BUTTON_POSITION_MASK, group_index));
+    }
+    if groups.is_empty() {
+        return fallback();
+    }
+
+    for (_, button) in &buttons {
+        if button.flags & WACOM_BUTTON_MODESWITCH != 0 {
+            continue;
+        }
+        let direction = button.flags & WACOM_BUTTON_POSITION_MASK;
+        let Some((_, group_index)) = toggle_groups
+            .iter()
+            .find(|(toggle_direction, _)| *toggle_direction == direction)
+        else {
+            return fallback();
+        };
+        let Some(group) = groups.get_mut(group_index) else {
+            return fallback();
+        };
+        group.button_mask |= 1 << button.logical_index;
+    }
+
+    let groups = groups.into_values().collect::<Vec<_>>();
+    let all_buttons = groups
+        .iter()
+        .fold(0, |mask, group| mask | group.button_mask);
+    let all_dials = groups.iter().fold(0, |mask, group| mask | group.dial_mask);
+    let all_rings = groups.iter().fold(0, |mask, group| mask | group.ring_mask);
+    let all_strips = groups.iter().fold(0, |mask, group| mask | group.strip_mask);
+    if all_buttons != tablet_pad_element_mask(button_codes.len() as u32)
+        || all_dials != tablet_pad_element_mask(num_dials)
+        || all_rings != tablet_pad_element_mask(num_rings)
+        || all_strips != tablet_pad_element_mask(num_strips)
+    {
+        return fallback();
+    }
+    groups
+}
+
+unsafe fn tablet_pad_group_for_mask(
+    device: *mut LibinputDevice,
+    kind: u8,
+    index: u32,
+) -> *mut LibinputTabletPadModeGroup {
+    if index >= u32::BITS {
+        return std::ptr::null_mut();
+    }
+    let bit = 1_u32 << index;
+    (*device)
+        .tablet_pad_mode_groups
+        .iter()
+        .copied()
+        .find(|group| {
+            if group.is_null() {
+                return false;
+            }
+            let mask = match kind {
+                0 => (**group).button_mask,
+                1 => (**group).dial_mask,
+                2 => (**group).ring_mask,
+                3 => (**group).strip_mask,
+                _ => 0,
+            };
+            mask & bit != 0
+        })
+        .unwrap_or(std::ptr::null_mut())
+}
+
+unsafe fn tablet_pad_update_mode(group: *mut LibinputTabletPadModeGroup, button: u32, down: bool) {
+    if group.is_null()
+        || !down
+        || button >= u32::BITS
+        || (*group).toggle_button_mask & (1_u32 << button) == 0
+    {
+        return;
+    }
+    let target = (*group)
+        .toggle_modes
+        .iter()
+        .find_map(|(candidate, target)| (*candidate == button).then_some(*target))
+        .unwrap_or(-1);
+    (*group).current_mode = if target < 0 {
+        ((*group).current_mode + 1) % (*group).num_modes.max(1)
+    } else {
+        (target as u32).min((*group).num_modes.saturating_sub(1))
+    };
+}
+
 unsafe fn tablet_tool_for(
     ctx: *mut LibinputContext,
     device: *mut LibinputDevice,
@@ -3321,12 +3679,14 @@ unsafe fn tablet_tool_for(
         return tool;
     }
     let mut eraser_button_modes = u32::from(tool_type == 1);
-    let name = tablet_tool_name_for_id(tool_id);
-    if let Some(stylus) = libwacom_stylus_for_id(tool_id) {
-        if libwacom_stylus_has_eraser(stylus) != 0 && libwacom_stylus_get_eraser_type(stylus) == 2 {
-            eraser_button_modes = 0;
-        }
+    let stylus = libwacom_stylus_metadata(tool_id);
+    // libwacom's has_eraser flag means the stylus has a distinct invert
+    // eraser tool. Button-style erasers deliberately report false and use
+    // the eraser type field instead, so they remain configurable here.
+    if stylus.as_ref().is_some_and(|stylus| stylus.has_eraser) {
+        eraser_button_modes = 0;
     }
+    let name = stylus.and_then(|stylus| stylus.name);
     let tool_buttons: Vec<u32> = buttons
         .iter()
         .copied()
@@ -3386,7 +3746,17 @@ unsafe fn set_tablet_tool_device(tool: *mut LibinputTabletTool, device: *mut Lib
     }
 }
 
-pub(crate) fn tablet_tool_name_for_id(tool_id: u64) -> Option<std::ffi::CString> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LibwacomStylusMetadata {
+    pub name: Option<std::ffi::CString>,
+    pub has_eraser: bool,
+    pub eraser_type: i32,
+}
+
+/// Copy every stylus property while its owning libwacom database is alive.
+/// libwacom stylus pointers are database-owned and must never escape this
+/// function.
+pub(crate) fn libwacom_stylus_metadata(tool_id: u64) -> Option<LibwacomStylusMetadata> {
     let tool_id = i32::try_from(tool_id).ok()?;
     unsafe {
         let database = libwacom_database_new();
@@ -3394,24 +3764,23 @@ pub(crate) fn tablet_tool_name_for_id(tool_id: u64) -> Option<std::ffi::CString>
             return None;
         }
         let stylus = libwacom_stylus_get_for_id(database, tool_id);
-        let name = stylus.as_ref().and_then(|stylus| {
-            let value = libwacom_stylus_get_name(stylus);
-            (!value.is_null()).then(|| std::ffi::CStr::from_ptr(value).to_owned())
-        });
+        if stylus.is_null() {
+            libwacom_database_destroy(database);
+            return None;
+        }
+        let value = libwacom_stylus_get_name(stylus);
+        let metadata = LibwacomStylusMetadata {
+            name: (!value.is_null()).then(|| std::ffi::CStr::from_ptr(value).to_owned()),
+            has_eraser: libwacom_stylus_has_eraser(stylus) != 0,
+            eraser_type: libwacom_stylus_get_eraser_type(stylus),
+        };
         libwacom_database_destroy(database);
-        name
+        Some(metadata)
     }
 }
 
-pub(crate) fn libwacom_stylus_for_id(tool_id: u64) -> Option<*const libc::c_void> {
-    let tool_id = i32::try_from(tool_id).ok()?;
-    let database = unsafe { libwacom_database_new() };
-    if database.is_null() {
-        return None;
-    }
-    let stylus = unsafe { libwacom_stylus_get_for_id(database, tool_id) };
-    unsafe { libwacom_database_destroy(database) };
-    Some(stylus).filter(|s| !s.is_null())
+pub(crate) fn tablet_tool_name_for_id(tool_id: u64) -> Option<std::ffi::CString> {
+    libwacom_stylus_metadata(tool_id).and_then(|stylus| stylus.name)
 }
 
 unsafe fn tablet_tool_payload(
@@ -4883,7 +5252,6 @@ impl BackendState {
         if has_tablet_pad {
             let mut pad_button_codes = Vec::new();
             let mut pad_left_handed_available = true;
-            let mut pad_num_modes = 1;
             let database = libwacom_database_new();
             if !database.is_null() {
                 let wacom = libwacom_new_from_usbid(
@@ -4894,15 +5262,6 @@ impl BackendState {
                 );
                 if !wacom.is_null() {
                     pad_left_handed_available = libwacom_is_reversible(wacom) != 0;
-                    pad_num_modes = [
-                        libwacom_get_ring_num_modes(wacom),
-                        libwacom_get_ring2_num_modes(wacom),
-                        libwacom_get_strips_num_modes(wacom),
-                    ]
-                    .into_iter()
-                    .max()
-                    .unwrap_or(1)
-                    .max(1) as u32;
                     for index in 0..libwacom_get_num_buttons(wacom).max(0) {
                         let code = libwacom_get_button_evdev_code(
                             wacom,
@@ -4945,19 +5304,54 @@ impl BackendState {
             (*lib_dev).tablet_pad_num_strips =
                 u32::from(abs.is_some_and(|axes| axes.contains(AbsoluteAxisCode::ABS_RX)))
                     + u32::from(abs.is_some_and(|axes| axes.contains(AbsoluteAxisCode::ABS_RY)));
-            (*lib_dev).tablet_pad_mode_group =
-                Box::into_raw(Box::new(LibinputTabletPadModeGroup {
-                    refcount: std::sync::atomic::AtomicI32::new(1),
-                    user_data: std::ptr::null_mut(),
-                    device: lib_dev,
-                    index: 0,
-                    num_modes: pad_num_modes,
-                    current_mode: 0,
-                    num_buttons: (*lib_dev).tablet_pad_button_codes.len() as u32,
-                    num_dials: (*lib_dev).tablet_pad_num_dials,
-                    num_rings: (*lib_dev).tablet_pad_num_rings,
-                    num_strips: (*lib_dev).tablet_pad_num_strips,
-                }));
+            let database = libwacom_database_new();
+            let mode_group_specs = if database.is_null() {
+                tablet_pad_mode_group_specs(
+                    std::ptr::null(),
+                    &(*lib_dev).tablet_pad_button_codes,
+                    (*lib_dev).tablet_pad_num_dials,
+                    (*lib_dev).tablet_pad_num_rings,
+                    (*lib_dev).tablet_pad_num_strips,
+                )
+            } else {
+                let wacom = libwacom_new_from_usbid(
+                    database,
+                    libc::c_int::from(input_id.vendor()),
+                    libc::c_int::from(input_id.product()),
+                    std::ptr::null_mut(),
+                );
+                let specs = tablet_pad_mode_group_specs(
+                    wacom,
+                    &(*lib_dev).tablet_pad_button_codes,
+                    (*lib_dev).tablet_pad_num_dials,
+                    (*lib_dev).tablet_pad_num_rings,
+                    (*lib_dev).tablet_pad_num_strips,
+                );
+                if !wacom.is_null() {
+                    libwacom_destroy(wacom);
+                }
+                libwacom_database_destroy(database);
+                specs
+            };
+            (*lib_dev).tablet_pad_mode_groups = mode_group_specs
+                .into_iter()
+                .map(|spec| {
+                    Box::into_raw(Box::new(LibinputTabletPadModeGroup {
+                        refcount: std::sync::atomic::AtomicI32::new(1),
+                        user_data: std::ptr::null_mut(),
+                        device: lib_dev,
+                        index: spec.index,
+                        num_modes: spec.num_modes,
+                        current_mode: 0,
+                        button_mask: spec.button_mask,
+                        dial_mask: spec.dial_mask,
+                        ring_mask: spec.ring_mask,
+                        strip_mask: spec.strip_mask,
+                        toggle_button_mask: spec.toggle_button_mask,
+                        toggle_modes: spec.toggle_modes,
+                    }))
+                })
+                .collect();
         }
         let has_left_button = (*lib_dev).event_codes.contains(&KeyCode::BTN_LEFT.0);
         let has_right_button = (*lib_dev).event_codes.contains(&KeyCode::BTN_RIGHT.0);
@@ -7213,7 +7607,7 @@ impl BackendState {
         td: &mut TrackedDevice,
         out: &mut VecDeque<LibinputEvent>,
     ) {
-        let payload = |time_usec, device: *mut LibinputDevice| TabletPadEvent {
+        let payload = |time_usec, group: *mut LibinputTabletPadModeGroup| TabletPadEvent {
             time_usec,
             button: 0,
             button_state: 0,
@@ -7221,15 +7615,12 @@ impl BackendState {
             key_state: 0,
             dial_delta_v120: 0.0,
             dial_number: 0,
-            mode: if (*device).tablet_pad_mode_group.is_null() {
+            mode: if group.is_null() {
                 0
             } else {
-                (*(*device).tablet_pad_mode_group).current_mode
+                (*group).current_mode
             },
-            mode_group: crate::libinput_tablet_pad_mode_group_ref(
-                (*device).tablet_pad_mode_group.cast(),
-            )
-            .cast(),
+            mode_group: crate::libinput_tablet_pad_mode_group_ref(group.cast()).cast(),
             ring_number: 0,
             ring_position: 0.0,
             ring_source: 0,
@@ -7244,9 +7635,7 @@ impl BackendState {
             }
             let state = u32::from(ev.value() != 0);
             if (*lib_dev).vendor_id == 0x056a && matches!(ev.code(), 0x240 | 0x243 | 0x278) {
-                let mut event = payload(ts_usec, lib_dev);
-                crate::libinput_tablet_pad_mode_group_unref(event.mode_group.cast());
-                event.mode_group = std::ptr::null_mut();
+                let mut event = payload(ts_usec, std::ptr::null_mut());
                 event.key = u32::from(ev.code());
                 event.key_state = state;
                 out.push_back(LibinputEvent {
@@ -7264,19 +7653,9 @@ impl BackendState {
             else {
                 return;
             };
-            if state == 1 && (*lib_dev).vendor_id == 0x056a && (*lib_dev).product_id == 0x034e {
-                let mode = match ev.code() {
-                    0x109 => Some(0),
-                    0x130 => Some(1),
-                    0x131 => Some(2),
-                    0x132 => Some(3),
-                    _ => None,
-                };
-                if let Some(mode) = mode {
-                    (*(*lib_dev).tablet_pad_mode_group).current_mode = mode;
-                }
-            }
-            let mut event = payload(ts_usec, lib_dev);
+            let group = tablet_pad_group_for_mask(lib_dev, 0, button as u32);
+            tablet_pad_update_mode(group, button as u32, state != 0);
+            let mut event = payload(ts_usec, group);
             event.button = button as u32;
             event.button_state = state;
             out.push_back(LibinputEvent {
@@ -7345,7 +7724,8 @@ impl BackendState {
 
         for dial in 0..2 {
             if let Some(delta) = td.pad_dial_values[dial].take() {
-                let mut event = payload(ts_usec, lib_dev);
+                let group = tablet_pad_group_for_mask(lib_dev, 1, dial as u32);
+                let mut event = payload(ts_usec, group);
                 let event_type = if td.pad_dials_map_to_ring {
                     let degrees = dial_v120_to_ring(
                         &mut td.pad_dial_ring_values[dial],
@@ -7391,7 +7771,8 @@ impl BackendState {
             } else if (*lib_dev).left_handed {
                 position = (position + 180.0) % 360.0;
             }
-            let mut event = payload(ts_usec, lib_dev);
+            let group = tablet_pad_group_for_mask(lib_dev, 2, ring as u32);
+            let mut event = payload(ts_usec, group);
             event.ring_number = ring as u32;
             event.ring_position = position;
             event.ring_source = 2;
@@ -7429,7 +7810,8 @@ impl BackendState {
             } else if (*lib_dev).left_handed {
                 position = 1.0 - position;
             }
-            let mut event = payload(ts_usec, lib_dev);
+            let group = tablet_pad_group_for_mask(lib_dev, 3, strip as u32);
+            let mut event = payload(ts_usec, group);
             event.strip_number = strip as u32;
             event.strip_position = position;
             event.strip_source = 2;
@@ -8345,7 +8727,15 @@ impl BackendState {
                                 let natural_direction =
                                     if (*lib_dev).natural_scroll { -1.0 } else { 1.0 };
                                 let value = value as f64
-                                    * configured_scroll_factor(lib_dev, dx, dy, ts_usec)
+                                    * configured_continuous_scroll_factor(
+                                        lib_dev,
+                                        dx,
+                                        dy,
+                                        ts_usec,
+                                        td.is_pointing_stick,
+                                        td.pointer_dpi,
+                                        td.trackpoint_multiplier,
+                                    )
                                     * natural_direction;
                                 for event_type in [
                                     LibinputEventType::LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS,
@@ -8369,11 +8759,12 @@ impl BackendState {
                 }
 
                 if td.pending_rel_x != 0 || td.pending_rel_y != 0 {
-                    let normalization = if td.is_pointing_stick {
-                        td.trackpoint_multiplier
-                    } else {
-                        1_000.0 / td.pointer_dpi
-                    };
+                    let normalization = pointer_profile_input_scale(
+                        (*lib_dev).accel_profile,
+                        td.is_pointing_stick,
+                        td.pointer_dpi,
+                        td.trackpoint_multiplier,
+                    );
                     // The public unaccelerated channel is the raw evdev
                     // delta. DPI and pointing-stick normalization belongs
                     // only to the filtered channel; exposing it here breaks
@@ -8452,7 +8843,15 @@ impl BackendState {
                         };
                         let natural_direction = if (*lib_dev).natural_scroll { -1.0 } else { 1.0 };
                         let value = raw_value
-                            * configured_scroll_factor(lib_dev, dx, dy, ts_usec)
+                            * configured_continuous_scroll_factor(
+                                lib_dev,
+                                dx,
+                                dy,
+                                ts_usec,
+                                td.is_pointing_stick,
+                                td.pointer_dpi,
+                                td.trackpoint_multiplier,
+                            )
                             * natural_direction;
                         for event_type in [
                             LibinputEventType::LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS,
@@ -11519,10 +11918,133 @@ mod tests {
     }
 
     #[test]
+    fn tablet_pad_fallback_group_owns_every_exposed_element() {
+        let group = fallback_tablet_pad_mode_group(3, 2, 1, 2);
+        assert_eq!(group.index, 0);
+        assert_eq!(group.num_modes, 1);
+        assert_eq!(group.button_mask, 0b111);
+        assert_eq!(group.dial_mask, 0b11);
+        assert_eq!(group.ring_mask, 0b1);
+        assert_eq!(group.strip_mask, 0b11);
+        assert_eq!(group.toggle_button_mask, 0);
+    }
+
+    #[test]
+    fn tablet_pad_groups_select_elements_and_transition_independently() {
+        unsafe {
+            let mut device = Box::new(LibinputDevice::new(
+                "mode groups",
+                "/dev/null",
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ));
+            let device_ptr = (&mut *device) as *mut LibinputDevice;
+            let group0 = Box::into_raw(Box::new(LibinputTabletPadModeGroup {
+                refcount: std::sync::atomic::AtomicI32::new(1),
+                user_data: std::ptr::null_mut(),
+                device: device_ptr,
+                index: 0,
+                num_modes: 3,
+                current_mode: 0,
+                button_mask: 0b0011,
+                dial_mask: 0b0001,
+                ring_mask: 0,
+                strip_mask: 0,
+                toggle_button_mask: 0b0001,
+                toggle_modes: vec![(0, -1)],
+            }));
+            let group1 = Box::into_raw(Box::new(LibinputTabletPadModeGroup {
+                refcount: std::sync::atomic::AtomicI32::new(1),
+                user_data: std::ptr::null_mut(),
+                device: device_ptr,
+                index: 1,
+                num_modes: 2,
+                current_mode: 0,
+                button_mask: 0b1100,
+                dial_mask: 0b0010,
+                ring_mask: 0b0001,
+                strip_mask: 0b0001,
+                toggle_button_mask: 0b0100,
+                toggle_modes: vec![(2, -1)],
+            }));
+            device.tablet_pad_mode_groups = vec![group0, group1];
+
+            assert_eq!(tablet_pad_group_for_mask(device_ptr, 0, 1), group0);
+            assert_eq!(tablet_pad_group_for_mask(device_ptr, 0, 3), group1);
+            assert_eq!(tablet_pad_group_for_mask(device_ptr, 1, 1), group1);
+            assert_eq!(tablet_pad_group_for_mask(device_ptr, 2, 0), group1);
+            assert_eq!(tablet_pad_group_for_mask(device_ptr, 3, 0), group1);
+
+            tablet_pad_update_mode(group0, 0, true);
+            assert_eq!((*group0).current_mode, 1);
+            assert_eq!((*group1).current_mode, 0);
+            tablet_pad_update_mode(group0, 0, false);
+            assert_eq!((*group0).current_mode, 1);
+            tablet_pad_update_mode(group1, 2, true);
+            tablet_pad_update_mode(group1, 2, true);
+            assert_eq!((*group1).current_mode, 0);
+        }
+    }
+
+    #[cfg(feature = "libwacom")]
+    #[test]
+    fn libwacom_stylus_metadata_survives_database_destruction_and_covers_erasers() {
+        // These IDs are shipped by Fedora/RHEL's libwacom database and cover
+        // both button-style and separate invert erasers.
+        let aes_button = libwacom_stylus_metadata(0x1).expect("AES stylus metadata");
+        assert!(aes_button.name.is_some());
+        assert!(!aes_button.has_eraser);
+        assert_eq!(aes_button.eraser_type, 3);
+
+        let intuos_pen = libwacom_stylus_metadata(0x802).expect("Intuos pen metadata");
+        assert!(intuos_pen.name.is_some());
+        assert!(intuos_pen.has_eraser);
+
+        let invert_eraser = libwacom_stylus_metadata(0x82a).expect("invert eraser metadata");
+        let copied_name = invert_eraser.name.expect("invert eraser name");
+        assert!(!copied_name.to_bytes().is_empty());
+    }
+
+    #[test]
     fn upstream_speed_curves_preserve_default_and_nonzero_minimum() {
         assert!(trackpoint_speed_factor(-1.0) > 0.0);
         assert!((trackpoint_speed_factor(0.0) - 1.0).abs() < 0.01);
         assert!((trackpoint_speed_factor(1.0) - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn pointer_dpi_normalization_is_adaptive_only() {
+        assert_eq!(pointer_profile_input_scale(2, false, 500.0, 0.4), 2.0);
+        assert_eq!(pointer_profile_input_scale(2, false, 2_000.0, 0.4), 0.5);
+        assert_eq!(pointer_profile_input_scale(1, false, 500.0, 0.4), 1.0);
+        assert_eq!(pointer_profile_input_scale(4, false, 500.0, 0.4), 1.0);
+
+        assert_eq!(pointer_profile_input_scale(2, true, 500.0, 0.4), 0.4);
+        assert_eq!(pointer_profile_input_scale(1, true, 500.0, 0.4), 0.4);
+        assert_eq!(pointer_profile_input_scale(4, true, 500.0, 0.4), 1.0);
+    }
+
+    #[test]
+    fn continuous_scroll_uses_each_profiles_constant_filter() {
+        assert_eq!(
+            pointer_constant_filter_scale(2, 0.0, false, 500.0, 0.4),
+            2.0
+        );
+        assert_eq!(
+            pointer_constant_filter_scale(1, 0.5, false, 500.0, 0.4),
+            1.5
+        );
+        assert_eq!(
+            pointer_constant_filter_scale(4, 0.5, false, 500.0, 0.4),
+            1.0
+        );
+        assert!((pointer_constant_filter_scale(2, 0.0, true, 500.0, 0.4) - 0.4).abs() < 1e-9);
+        assert!(
+            (pointer_constant_filter_scale(1, 0.0, true, 500.0, 0.4)
+                - 0.4 * trackpoint_speed_factor(0.0))
+            .abs()
+                < 1e-9
+        );
     }
 
     #[test]
