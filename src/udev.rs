@@ -3,7 +3,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 #[link(name = "udev")]
-unsafe extern "C" {
+extern "C" {
     fn udev_new() -> *mut libc::c_void;
     fn udev_unref(udev: *mut libc::c_void) -> *mut libc::c_void;
     fn udev_device_new_from_devnum(

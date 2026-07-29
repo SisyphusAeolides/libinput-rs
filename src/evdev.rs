@@ -4,18 +4,15 @@ pub use evdev_upstream::*;
 
 use std::path::{Path, PathBuf};
 
-/// Crawls `/dev/input` for event-device paths without opening the device nodes.
+/// Crawls `/dev/input` for event-device paths without opening device nodes.
 ///
-/// The caller remains responsible for opening each returned path. This is
-/// required by libinput-style restricted-open callbacks, where the compositor
-/// may list device nodes but only logind is allowed to open them.
+/// Opening remains the caller's responsibility so a compositor can discover
+/// nodes first and then use its restricted-open callback through logind.
 pub fn enumerate() -> EnumerateDevices {
     enumerate_directory(Path::new("/dev/input"))
 }
 
-/// An iterator over event-device paths. The second tuple element is retained
-/// for source compatibility with the upstream iterator and is intentionally
-/// empty because opening belongs to the caller's restricted-open path.
+/// Event-device paths discovered without requiring read access to the nodes.
 pub struct EnumerateDevices {
     paths: std::vec::IntoIter<PathBuf>,
 }

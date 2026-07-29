@@ -1,5 +1,5 @@
-use evdev::uinput::VirtualDevice as EvdevVirtualDevice;
-use evdev::{AttributeSet, BusType, InputEvent, InputId, KeyCode, RelativeAxisCode};
+use crate::evdev::uinput::VirtualDevice as EvdevVirtualDevice;
+use crate::evdev::{AttributeSet, BusType, InputEvent, InputId, KeyCode, RelativeAxisCode};
 use log::info;
 use std::error::Error;
 

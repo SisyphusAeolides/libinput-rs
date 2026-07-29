@@ -1,5 +1,6 @@
 mod config;
 mod device;
+mod evdev;
 mod event_loop;
 mod virtual_device;
 

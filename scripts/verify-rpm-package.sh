@@ -2,32 +2,24 @@
 set -euo pipefail
 
 usage() {
-    printf '%s\n' "usage: $0 RUNTIME_RPM DEVEL_RPM" >&2
+    printf '%s\n' "usage: $0 LIBINPUT_RS_RPM" >&2
 }
 
-if [[ $# -ne 2 ]]; then
+if [[ $# -ne 1 ]]; then
     usage
     exit 2
 fi
 
-runtime_rpm=$1
-devel_rpm=$2
+package=$1
 for command in awk cc cpio eu-elflint pkg-config readelf readlink rg rpm rpm2cpio; do
     command -v "$command" >/dev/null
 done
-for package in "$runtime_rpm" "$devel_rpm"; do
-    [[ -f "$package" ]] || {
-        printf '%s\n' "missing RPM: $package" >&2
-        exit 2
-    }
-done
-
-[[ "$(rpm -qp --qf '%{NAME}' "$runtime_rpm")" == "libinput-rs" ]] || {
-    printf '%s\n' "not a libinput-rs runtime RPM: $runtime_rpm" >&2
+[[ -f "$package" ]] || {
+    printf '%s\n' "missing RPM: $package" >&2
     exit 2
 }
-[[ "$(rpm -qp --qf '%{NAME}' "$devel_rpm")" == "libinput-rs-devel" ]] || {
-    printf '%s\n' "not a libinput-rs development RPM: $devel_rpm" >&2
+[[ "$(rpm -qp --qf '%{NAME}' "$package")" == "libinput-rs" ]] || {
+    printf '%s\n' "not a libinput-rs RPM: $package" >&2
     exit 2
 }
 
@@ -48,22 +40,30 @@ trap cleanup EXIT
 
 (
     cd "$stage"
-    rpm2cpio "$runtime_rpm" | cpio -idm --quiet
-    rpm2cpio "$devel_rpm" | cpio -idm --quiet
+    rpm2cpio "$package" | cpio -idm --quiet
 )
 
 libdir=$(rpm --eval '%{_libdir}')
 includedir=$(rpm --eval '%{_includedir}')
 runtime_library="$stage$libdir/libinput.so.10.13.0"
 runtime_link="$stage$libdir/libinput.so.10"
-devel_link="$stage$libdir/libinput.so"
+development_link="$stage$libdir/libinput.so"
 header="$stage$includedir/libinput.h"
 pc_file="$stage$libdir/pkgconfig/libinput.pc"
+udev_dir="$stage/usr/lib/udev"
+udev_rules_dir="$udev_dir/rules.d"
 
 [[ -f "$runtime_library" ]]
 [[ -L "$runtime_link" && "$(readlink "$runtime_link")" == "libinput.so.10.13.0" ]]
-[[ -L "$devel_link" && "$(readlink "$devel_link")" == "libinput.so.10" ]]
+[[ -L "$development_link" && "$(readlink "$development_link")" == "libinput.so.10" ]]
 [[ -f "$header" && -f "$pc_file" ]]
+for helper in libinput-device-group libinput-fuzz-extract libinput-fuzz-to-zero; do
+    [[ -x "$udev_dir/$helper" ]]
+done
+[[ -f "$udev_rules_dir/80-libinput-device-groups.rules" ]]
+[[ -f "$udev_rules_dir/90-libinput-fuzz-override.rules" ]]
+[[ -f "$stage/usr/share/libinput/10-generic-keyboard.quirks" ]]
+[[ -f "$stage/usr/share/libinput/30-vendor-elantech.quirks" ]]
 
 readelf -dW "$runtime_library" | rg 'SONAME.*\[libinput\.so\.10\]'
 ! readelf -dW "$runtime_library" | rg '\((RPATH|RUNPATH)\)'
@@ -73,26 +73,28 @@ readelf -nW "$runtime_library" | rg 'Build ID:'
 ! readelf -lW "$runtime_library" | rg 'GNU_STACK.*RWE'
 eu-elflint --gnu-ld "$runtime_library"
 
-rpm -qp --provides "$runtime_rpm" | rg '^libinput-rs = '
-rpm -qp --provides "$runtime_rpm" | rg '^libinput = 1\.31\.3$'
-rpm -qp --provides "$runtime_rpm" | rg '^libinput\.so\.10\('
-rpm -qp --obsoletes "$runtime_rpm" | rg '^libinput < 1\.32\.0$'
-rpm -qpl "$runtime_rpm" | rg -Fx "$libdir/libinput.so.10.13.0"
-rpm -qpl "$runtime_rpm" | rg -Fx "$libdir/libinput.so.10"
-! rpm -qpl "$runtime_rpm" | rg -Fx "$libdir/libinput.so"
-! rpm -qpl "$runtime_rpm" | rg -Fx "$includedir/libinput.h"
-! rpm -qpl "$runtime_rpm" | rg -Fx "$libdir/pkgconfig/libinput.pc"
-
-rpm -qp --provides "$devel_rpm" | rg '^libinput-rs-devel = '
-rpm -qp --provides "$devel_rpm" | rg '^libinput-devel = 1\.31\.3$'
-rpm -qp --provides "$devel_rpm" | rg '^pkgconfig\(libinput\) = 1\.31\.3$'
-rpm -qp --obsoletes "$devel_rpm" | rg '^libinput-devel < 1\.32\.0$'
-rpm -qp --requires "$devel_rpm" | rg '^libinput-rs(\(.*\))? = '
-rpm -qpl "$devel_rpm" | rg -Fx "$libdir/libinput.so"
-rpm -qpl "$devel_rpm" | rg -Fx "$includedir/libinput.h"
-rpm -qpl "$devel_rpm" | rg -Fx "$libdir/pkgconfig/libinput.pc"
-! rpm -qpl "$devel_rpm" | rg -Fx "$libdir/libinput.so.10.13.0"
-! rpm -qpl "$devel_rpm" | rg -Fx "$libdir/libinput.so.10"
+rpm -qp --provides "$package" | rg '^libinput-rs = '
+rpm -qp --provides "$package" | rg '^libinput = 1\.31\.3$'
+rpm -qp --provides "$package" | rg '^libinput-devel = 1\.31\.3$'
+rpm -qp --provides "$package" | rg '^pkgconfig\(libinput\) = 1\.31\.3$'
+rpm -qp --provides "$package" | rg '^libinput\.so\.10\('
+rpm -qp --obsoletes "$package" | rg '^libinput < 1\.32\.0$'
+rpm -qp --obsoletes "$package" | rg '^libinput-devel < 1\.32\.0$'
+for installed_path in \
+    "$libdir/libinput.so.10.13.0" \
+    "$libdir/libinput.so.10" \
+    "$libdir/libinput.so" \
+    "$includedir/libinput.h" \
+    "$libdir/pkgconfig/libinput.pc" \
+    /usr/lib/udev/libinput-device-group \
+    /usr/lib/udev/libinput-fuzz-extract \
+    /usr/lib/udev/libinput-fuzz-to-zero \
+    /usr/lib/udev/rules.d/80-libinput-device-groups.rules \
+    /usr/lib/udev/rules.d/90-libinput-fuzz-override.rules \
+    /usr/share/libinput/10-generic-keyboard.quirks \
+    /usr/share/libinput/30-vendor-elantech.quirks; do
+    rpm -qpl "$package" | rg -Fx "$installed_path"
+done
 
 pkg_config=(
     env

@@ -1,7 +1,7 @@
 use crate::config::InputConfig;
 use crate::device::DeviceWrapper;
+use crate::evdev::InputEvent;
 use crate::virtual_device::VirtualDevice;
-use evdev::InputEvent;
 use log::{error, info, warn};
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};

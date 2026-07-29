@@ -23,7 +23,7 @@ rpmdev-setuptree
 make srpm
 ```
 
-The resulting file is written below `$HOME/rpmbuild/SRPMS/`. The 0.2.2 RPM
+The resulting file is written below `$HOME/rpmbuild/SRPMS/`. The 0.3.0 RPM
 release installs a vendor preset that enables `libinput-rs.service` on first
 installation; explicit administrator enable and disable choices remain
 preserved during upgrades.
@@ -61,7 +61,7 @@ copr-cli create libinput-rs \
 Submit the source RPM:
 
 ```bash
-copr-cli build libinput-rs "$HOME/rpmbuild/SRPMS/libinput-rs-0.2.2-1.fc45.src.rpm"
+copr-cli build libinput-rs "$HOME/rpmbuild/SRPMS/libinput-rs-0.3.0-1.fc45.src.rpm"
 ```
 
 Formal proof compilers are verified separately in Fedora CI and are not COPR
@@ -69,9 +69,10 @@ build dependencies. Fedora RPMs enable the optional libwacom integration.
 EPEL and RHEL RPMs use the portable fallback and do not require libwacom.
 
 After the build succeeds, verify that the runtime RPM contains
-`/usr/lib/systemd/system-preset/90-libinput-rs.preset`, then test installation,
-boot-time service activation, and rollback from COPR before announcing the
-repository.
+`/usr/lib/systemd/system-preset/90-libinput-rs.preset`, the three callouts below
+`/usr/lib/udev/`, both libinput udev rule files, and the quirks database below
+`/usr/share/libinput/`. Then test installation, boot-time service activation,
+and rollback from COPR before announcing the repository.
 
 ## Publish to crates.io
 
@@ -82,37 +83,22 @@ token at its prompt so it is not written into shell history:
 cargo login
 ```
 
-Publish the compatibility crate first only when it changed:
-
-```bash
-cargo publish --dry-run --locked --package libinput-rs-evdev
-cargo publish --locked --package libinput-rs-evdev
-```
-
-Wait until the new version is visible in the crates.io index. Releases that
-only change the main package keep using the existing compatibility crate and
-skip these commands.
-
-```bash
-cargo info libinput-rs-evdev@0.1.0
-```
-
-Then validate and publish the main package:
+Validate and publish the single source package:
 
 ```bash
 make main-crate-package-check
-cargo publish --dry-run --locked --package libinput-rs
-cargo publish --locked --package libinput-rs
+cargo publish --dry-run --locked --package libinput-rs --registry crates-io
+cargo publish --locked --package libinput-rs --registry crates-io
 ```
 
-The crates.io packages distribute Rust source. System replacement users should
-install the runtime and development RPMs from COPR.
+The crates.io package distributes Rust source. System replacement users should
+install the single RPM from COPR.
 
 ## Tag the release
 
 After both publication paths succeed:
 
 ```bash
-git tag -s v0.2.2 -m "libinput-rs 0.2.2"
-git push origin v0.2.2
+git tag -s v0.3.0 -m "libinput-rs 0.3.0"
+git push origin v0.3.0
 ```

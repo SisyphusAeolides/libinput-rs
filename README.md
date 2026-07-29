@@ -5,9 +5,13 @@
 - an optional touchpad companion daemon using evdev and uinput;
 - a 100% drop-in replacement implementation of the `libinput.so.10` C ABI.
 
-The runtime and development RPMs replace the distribution's `libinput` and
-`libinput-devel` packages. Display managers and compositors use the replacement
-after they restart.
+One RPM replaces both the distribution's `libinput` and `libinput-devel`
+packages. It includes the runtime, development files, and companion daemon;
+display managers and compositors use the replacement after they restart. The
+same RPM also supplies the device-group and axis-fuzz udev callouts and rules
+normally installed with libinput, so replacing the distribution package does
+not remove input-device initialization behavior. It carries the matching
+libinput 1.31.3 hardware-quirks database as well.
 
 ## Supported systems
 
@@ -27,12 +31,12 @@ remains available even if the graphical session cannot start.
 ```bash
 sudo dnf install dnf-plugins-core
 sudo dnf copr enable sisyphuscode/libinput-rs
-sudo dnf install libinput-rs libinput-rs-devel --allowerasing
+sudo dnf install libinput-rs --allowerasing
 sudo ldconfig
 sudo systemctl reboot
 ```
 
-The runtime RPM ships a vendor preset that enables `libinput-rs.service` on
+The RPM ships a vendor preset that enables `libinput-rs.service` on
 first installation. The daemon starts automatically on the next boot. An
 administrator's explicit enable or disable choice is preserved during package
 upgrades.
@@ -112,9 +116,9 @@ upgrade. For the shipped default, `0.45 × (2.2 / 2.5) = 0.18 × 2.2 = 0.396`.
 
 ## Drop-in replacement
 
-The runtime RPM installs `libinput.so.10` in the system linker path. The
-`libinput-rs-devel` RPM installs `libinput.h`, the unversioned linker name, and
-`libinput.pc`.
+The single RPM installs `libinput.so.10` in the system linker path together
+with `libinput.h`, the unversioned linker name, `libinput.pc`, and the libinput
+udev callouts and rules.
 
 The udev backend enumerates `/dev/input/event*` by directory entry and delegates
 the first device open to the compositor's `open_restricted` callback. This keeps
@@ -127,12 +131,13 @@ The fail-open and restricted-discovery state machines are modeled three ways
 under `proofs/`:
 
 - Agda proves that a grab cannot be authorized while the output sink is absent
-  and that listed event nodes remain discoverable without direct-open access;
+  and that listed event nodes remain discoverable without direct-open access,
+  while also proving balanced physical-button transitions;
 - Idris 2 uses indexed states and total transitions so invalid runtime and
   restricted-open states are unconstructable;
 - Fortran provides independently compiled executable reference models for
   fail-open grabbing, permission-independent discovery, exactly-once descriptor
-  closure, and udev-only hotplug.
+  closure, udev-only hotplug, and balanced physical-button lifecycles.
 
 Agda, Idris 2, and GNU Fortran are available through DNF on the Fedora CI
 target:
@@ -147,9 +152,8 @@ make proofs
 ## Publishing
 
 The RPM and crates.io release procedure is documented in [RELEASING.md](RELEASING.md).
-The crates.io workspace publishes `libinput-rs-evdev` first and `libinput-rs`
-second. System replacement installations should use the COPR RPMs rather than
-`cargo install`.
+Crates.io publishes one `libinput-rs` source crate. System replacement
+installations should use the COPR RPM rather than `cargo install`.
 
 ## Reference behavior
 

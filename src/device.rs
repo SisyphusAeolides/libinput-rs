@@ -1,4 +1,5 @@
-use evdev::{AbsoluteAxisCode, Device, EventType, InputEvent, KeyCode, RelativeAxisCode};
+use crate::evdev;
+use crate::evdev::{AbsoluteAxisCode, Device, EventType, InputEvent, KeyCode, RelativeAxisCode};
 use log::{info, warn};
 use std::error::Error;
 use std::path::PathBuf;

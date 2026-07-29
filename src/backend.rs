@@ -10,14 +10,15 @@ use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use evdev::{AbsoluteAxisCode, Device, EventType, InputEvent, KeyCode, RelativeAxisCode};
+use crate::evdev;
+use crate::evdev::{AbsoluteAxisCode, Device, EventType, InputEvent, KeyCode, RelativeAxisCode};
 use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
 
 use crate::ffi_types::{
     BackendKind, EventPayload, GestureEvent, KeyboardKeyEvent, LibinputContext, LibinputDevice,
     LibinputEvent, LibinputEventType, LibinputTabletPadModeGroup, LibinputTabletTool,
     PointerAxisEvent, PointerButtonEvent, PointerMotionAbsoluteEvent, PointerMotionEvent,
-    TabletPadEvent, TabletToolEvent, TouchEvent,
+    SwitchEvent, TabletPadEvent, TabletToolEvent, TouchEvent,
 };
 
 #[cfg(feature = "libwacom")]
@@ -41,6 +42,9 @@ extern "C" {
     ) -> *mut libc::c_void;
     fn libwacom_get_num_buttons(device: *const libc::c_void) -> libc::c_int;
     fn libwacom_is_reversible(device: *const libc::c_void) -> libc::c_int;
+    fn libwacom_get_ring_num_modes(device: *const libc::c_void) -> libc::c_int;
+    fn libwacom_get_ring2_num_modes(device: *const libc::c_void) -> libc::c_int;
+    fn libwacom_get_strips_num_modes(device: *const libc::c_void) -> libc::c_int;
     fn libwacom_get_button_evdev_code(
         device: *const libc::c_void,
         button: libc::c_char,
@@ -99,6 +103,21 @@ unsafe fn libwacom_get_num_buttons(_device: *const libc::c_void) -> libc::c_int 
 
 #[cfg(not(feature = "libwacom"))]
 unsafe fn libwacom_is_reversible(_device: *const libc::c_void) -> libc::c_int {
+    0
+}
+
+#[cfg(not(feature = "libwacom"))]
+unsafe fn libwacom_get_ring_num_modes(_device: *const libc::c_void) -> libc::c_int {
+    0
+}
+
+#[cfg(not(feature = "libwacom"))]
+unsafe fn libwacom_get_ring2_num_modes(_device: *const libc::c_void) -> libc::c_int {
+    0
+}
+
+#[cfg(not(feature = "libwacom"))]
+unsafe fn libwacom_get_strips_num_modes(_device: *const libc::c_void) -> libc::c_int {
     0
 }
 
@@ -252,7 +271,14 @@ struct MtSlot {
     began_this_frame: bool,
     dwt_released_this_frame: bool,
     palm_suppressed: bool,
+    thumb_suppressed: bool,
+    direct_palm_cancelled: bool,
+    pressure_suppressed: bool,
+    size_suppressed: bool,
     generic_palm: Option<GenericPalmKind>,
+    palm_initial_x: f64,
+    palm_initial_y: f64,
+    palm_started_usec: u64,
     dwt_palm: Option<DwtPalmKind>,
     dwt_palm_started_usec: Option<u64>,
     cancel_pending: bool,
@@ -261,6 +287,12 @@ struct MtSlot {
     button_area_initial_x: f64,
     button_area_initial_y: f64,
     button_area_down_usec: u64,
+    top_button_contact: bool,
+    top_button_code: u16,
+    top_button_left_at: Option<Instant>,
+    click_pinned: bool,
+    click_pin_x: f64,
+    click_pin_y: f64,
     gesture_initial_x: f64,
     gesture_initial_y: f64,
     gesture_rebase_pending: bool,
@@ -283,6 +315,13 @@ struct MtSlot {
     touch_major: f64,
     touch_minor: f64,
     distance: f64, // ABS_MT_DISTANCE (for stylus / palm)
+    movement_samples: u32,
+}
+
+fn clear_kernel_abs_fuzz(device: &Device) {
+    for axis in crate::udev_callout::FUZZ_AXES {
+        crate::udev_callout::set_abs_fuzz(device, axis, 0);
+    }
 }
 
 /// Why a touch contact was ignored by the touchpad's typing/trackpoint palm
@@ -300,6 +339,7 @@ enum DwtPalmKind {
 /// state, which may be released by a later contact update.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GenericPalmKind {
+    Edge,
     Pressure,
     Size,
 }
@@ -348,9 +388,9 @@ struct DwtPairingInfo {
     is_dwt_keyboard: bool,
     keyboard_internal: bool,
     is_pointing_stick: bool,
+    pointing_stick_internal: bool,
     vendor_id: u16,
     product_id: u16,
-    bus_type: u16,
 }
 
 enum DwtFollowup {
@@ -364,6 +404,18 @@ enum DwtFollowup {
     TrackpointActivity {
         source_fd: RawFd,
         at: Instant,
+        time_usec: u64,
+    },
+    TrackpointButton {
+        device: *mut LibinputDevice,
+        button: u16,
+        down: bool,
+        time_usec: u64,
+    },
+    SwitchToggle {
+        device: *mut LibinputDevice,
+        switch: u32,
+        state: bool,
         time_usec: u64,
     },
 }
@@ -410,6 +462,8 @@ struct TrackedDevice {
     is_absolute: bool,
     is_absolute_pointer: bool,
     has_mt: bool,
+    has_mt_pressure: bool,
+    is_semi_mt: bool,
     protocol_a: bool,
     mt_x_fuzz: i32,
     mt_y_fuzz: i32,
@@ -422,15 +476,18 @@ struct TrackedDevice {
     is_clickpad: bool,
     is_topbuttonpad: bool,
     is_pointing_stick: bool,
+    pointing_stick_internal: bool,
+    lid_write_open: bool,
     vendor_id: u16,
     product_id: u16,
-    bus_type: u16,
     supports_hi_res_vertical: bool,
     supports_hi_res_horizontal: bool,
     warned_missing_hi_res_vertical: bool,
     warned_missing_hi_res_horizontal: bool,
     wheel_is_virtual: bool,
     is_lenovo_scrollpoint: bool,
+    trackpoint_multiplier: f64,
+    invert_horizontal_scrolling: bool,
     wheel_state: u8,
     wheel_min_movement: i64,
     wheel_accum_vertical: i64,
@@ -455,6 +512,9 @@ struct TrackedDevice {
     debounce_buttons: HashMap<u16, DebounceButton>,
     debounce_spurious: bool,
     debounce_bypass: bool,
+    debounce_disabled: bool,
+    last_button_time_usec: u64,
+    lagging_frame_count: u32,
     scroll_button_accum_x: i64,
     scroll_button_accum_y: i64,
 
@@ -489,6 +549,9 @@ struct TrackedDevice {
     touchpad_left_handed_sequence_active: bool,
     palm_pressure_threshold: Option<f64>,
     palm_size_threshold: Option<f64>,
+    touch_pressure_range: Option<(f64, f64)>,
+    global_touch_pressure: f64,
+    touch_size_range: Option<(f64, f64)>,
     tap_emitted: bool,
     tap_button_down: Option<u16>,
     tap_release_since: Option<Instant>,
@@ -498,6 +561,16 @@ struct TrackedDevice {
     last_movement_time: Option<Instant>,
     active_click_button: Option<u16>,
     active_click_device: Option<*mut LibinputDevice>,
+    click_sequence_suppressed: bool,
+    touchpad_phantom_clicks: bool,
+    tablet_mode_no_suspend: bool,
+    touchpad_visible_marker: bool,
+    thumb_pressure_threshold: Option<f64>,
+    thumb_size_threshold: Option<f64>,
+    thumb_detection_enabled: bool,
+    palm_left_edge: Option<f64>,
+    palm_right_edge: Option<f64>,
+    palm_upper_edge: Option<f64>,
 
     // --- tablet tool ---
     tablet_serial: u64,
@@ -612,10 +685,12 @@ struct TrackedDevice {
     drag_3fg_active: bool,
     drag_3fg_button_down: bool,
     drag_3fg_release_since: Option<Instant>,
+    drag_3fg_resume_scroll_active: bool,
 
     // --- keyboard repeat ---
     held_keys: Vec<HeldKey>,
     held_buttons: Vec<u16>,
+    ignored_initial_switches: HashSet<u16>,
 
     // --- per-touchpad typing and pointing-stick suppression ---
     dwt: DwtRuntime,
@@ -832,6 +907,46 @@ struct DebounceButton {
     pending_since: Option<Instant>,
 }
 
+/// Applies the exactly-once logical lifecycle for one physical button.
+///
+/// Kernel clients can miss a release while another process holds EVIOCGRAB.
+/// In that case a repeated press must not increase the seat count; the next
+/// release closes the original logical press.
+fn transition_button_state(held_buttons: &mut Vec<u16>, code: u16, down: bool) -> bool {
+    if down {
+        if held_buttons.contains(&code) {
+            return false;
+        }
+        held_buttons.push(code);
+    } else {
+        if !held_buttons.contains(&code) {
+            return false;
+        }
+        held_buttons.retain(|button| *button != code);
+    }
+    true
+}
+
+fn is_evdev_button_code(code: u16) -> bool {
+    matches!(code, 0x100..=0x15f | 0x2c0..=0x2ff)
+}
+
+fn map_left_handed_button(code: u16, left_handed: bool, click_method: u32) -> u16 {
+    // Clickfinger already derives a logical button from the finger count.
+    // Unlike physical buttons and clickpad button areas, upstream libinput
+    // deliberately leaves that logical mapping unchanged in left-handed mode.
+    if !left_handed || click_method == 2 {
+        return code;
+    }
+    if code == KeyCode::BTN_LEFT.0 {
+        KeyCode::BTN_RIGHT.0
+    } else if code == KeyCode::BTN_RIGHT.0 {
+        KeyCode::BTN_LEFT.0
+    } else {
+        code
+    }
+}
+
 impl TrackedDevice {
     fn dwt_pairing_info(&self, fd: RawFd) -> DwtPairingInfo {
         DwtPairingInfo {
@@ -841,9 +956,9 @@ impl TrackedDevice {
             is_dwt_keyboard: self.is_dwt_keyboard,
             keyboard_internal: self.keyboard_internal,
             is_pointing_stick: self.is_pointing_stick,
+            pointing_stick_internal: self.pointing_stick_internal,
             vendor_id: self.vendor_id,
             product_id: self.product_id,
-            bus_type: self.bus_type,
         }
     }
 
@@ -918,6 +1033,9 @@ impl TrackedDevice {
             slot.dwt_palm_started_usec = None;
             slot.dwt_released_this_frame = true;
             slot.palm_suppressed = slot.generic_palm.is_some()
+                || slot.thumb_suppressed
+                || slot.pressure_suppressed
+                || slot.size_suppressed
                 || slot.tool_type == 2
                 || self.touch_arbitration_suppressed;
             slot.gesture_rebase_pending = false;
@@ -934,10 +1052,166 @@ impl TrackedDevice {
     /// lifts. Upstream checks pressure before (and after) DWT so a contact
     /// suppressed while typing can transition to a permanent pressure or
     /// touch-size palm when the typing timeout expires.
-    fn refresh_generic_palms(&mut self) {
+    unsafe fn refresh_generic_palms(&mut self, time_usec: u64) {
         let pressure_threshold = self.palm_pressure_threshold;
         let size_threshold = self.palm_size_threshold;
         let mut palm_detected = false;
+
+        // A fast-moving finger followed by a distant second contact is the
+        // characteristic resting-thumb pattern. With edge scrolling enabled,
+        // any late second contact is a thumb because two-finger scrolling is
+        // not active. This mirrors libinput's contextual thumb classifier.
+        if self.thumb_detection_enabled {
+            let x_range = (*self.lib_device).abs_x_range.or(self.abs_x_range);
+            let y_range = (*self.lib_device).abs_y_range.or(self.abs_y_range);
+            let new_slots: Vec<usize> = self
+                .mt_slots
+                .iter()
+                .enumerate()
+                .filter_map(|(index, slot)| (slot.active && slot.began_this_frame).then_some(index))
+                .collect();
+            for new_index in new_slots {
+                let newest = &self.mt_slots[new_index];
+                let newest_position = (newest.x, newest.y);
+                let moving_position = self.mt_slots.iter().enumerate().find_map(|(index, slot)| {
+                    (index != new_index
+                        && slot.active
+                        && !slot.palm_suppressed
+                        && !slot.thumb_suppressed
+                        && slot.movement_samples > 5)
+                        .then_some((slot.x, slot.y))
+                });
+                let Some((other_x, other_y)) = moving_position else {
+                    continue;
+                };
+                let separation_x = touchpad_delta_mm(
+                    newest_position.0 - other_x,
+                    (*self.lib_device).abs_x_resolution,
+                    x_range,
+                    (*self.lib_device).width_mm,
+                )
+                .abs();
+                let separation_y = touchpad_delta_mm(
+                    newest_position.1 - other_y,
+                    (*self.lib_device).abs_y_resolution,
+                    y_range,
+                    (*self.lib_device).height_mm,
+                )
+                .abs();
+                if (*self.lib_device).scroll_method != 1
+                    || separation_x > 20.0
+                    || separation_y > 30.0
+                {
+                    let slot = &mut self.mt_slots[new_index];
+                    slot.thumb_suppressed = true;
+                    slot.palm_suppressed = true;
+                    palm_detected = true;
+                }
+            }
+        }
+
+        // Contacts that begin in a wide internal touchpad's side/top palm
+        // zones are suppressed. As upstream does, a regular second contact
+        // revives an edge palm so two-finger scrolling remains available;
+        // two simultaneous edge palms remain suppressed.
+        for slot in &mut self.mt_slots {
+            if !slot.active || !slot.began_this_frame || slot.palm_suppressed {
+                continue;
+            }
+            let in_right_edge = self.palm_right_edge.is_some_and(|edge| slot.x > edge);
+            let in_side_edge =
+                self.palm_left_edge.is_some_and(|edge| slot.x < edge) || in_right_edge;
+            let in_top_edge = self.palm_upper_edge.is_some_and(|edge| slot.y < edge);
+            let right_edge_scroll = (*self.lib_device).scroll_method == 2 && in_right_edge;
+            if (in_side_edge || in_top_edge) && !right_edge_scroll {
+                slot.generic_palm = Some(GenericPalmKind::Edge);
+                slot.palm_initial_x = slot.x;
+                slot.palm_initial_y = slot.y;
+                slot.palm_started_usec = time_usec;
+                slot.palm_suppressed = true;
+                palm_detected = true;
+            }
+        }
+
+        for slot in &mut self.mt_slots {
+            if !slot.active || !matches!(slot.generic_palm, Some(GenericPalmKind::Edge)) {
+                continue;
+            }
+            let still_in_edge = self.palm_left_edge.is_some_and(|edge| slot.x < edge)
+                || self.palm_right_edge.is_some_and(|edge| slot.x > edge)
+                || self.palm_upper_edge.is_some_and(|edge| slot.y < edge);
+            let began_in_side = self
+                .palm_left_edge
+                .is_some_and(|edge| slot.palm_initial_x < edge)
+                || self
+                    .palm_right_edge
+                    .is_some_and(|edge| slot.palm_initial_x > edge);
+            let dx = slot.x - slot.palm_initial_x;
+            let dy = slot.y - slot.palm_initial_y;
+            let direction_releases = if began_in_side {
+                dx.abs() >= dy.abs()
+            } else {
+                dy > 0.0
+            };
+            if !still_in_edge
+                && time_usec.saturating_sub(slot.palm_started_usec) < 200_000
+                && direction_releases
+            {
+                slot.generic_palm = None;
+                slot.palm_suppressed = slot.thumb_suppressed
+                    || slot.pressure_suppressed
+                    || slot.size_suppressed
+                    || slot.dwt_palm.is_some()
+                    || slot.tool_type == 2
+                    || self.touch_arbitration_suppressed;
+                self.mt_contact_count_changed = true;
+            }
+        }
+
+        // Semi-MT devices report a bounding box rather than stable contact
+        // identities. When the second contact appears, the old edge contact
+        // may become the center slot while the new slot takes over the edge.
+        // Reclassify by the current geometry so palm state follows the edge,
+        // not the kernel's synthetic slot number.
+        if self.is_semi_mt && self.touch_fingers >= 2 {
+            for slot in &mut self.mt_slots {
+                if !slot.active || !matches!(slot.generic_palm, Some(GenericPalmKind::Edge)) {
+                    continue;
+                }
+                let still_in_edge = self.palm_left_edge.is_some_and(|edge| slot.x < edge)
+                    || self.palm_right_edge.is_some_and(|edge| slot.x > edge)
+                    || self.palm_upper_edge.is_some_and(|edge| slot.y < edge);
+                if !still_in_edge {
+                    slot.generic_palm = None;
+                    slot.palm_suppressed = slot.thumb_suppressed
+                        || slot.dwt_palm.is_some()
+                        || slot.tool_type == 2
+                        || self.touch_arbitration_suppressed;
+                    self.mt_contact_count_changed = true;
+                }
+            }
+        }
+
+        let has_regular_contact = self.touch_fingers >= 2
+            && self.mt_slots.iter().any(|slot| {
+                slot.active
+                    && !slot.thumb_suppressed
+                    && !matches!(slot.generic_palm, Some(GenericPalmKind::Edge))
+                    && slot.dwt_palm.is_none()
+                    && slot.tool_type != 2
+            });
+        if has_regular_contact {
+            for slot in &mut self.mt_slots {
+                if slot.active && matches!(slot.generic_palm, Some(GenericPalmKind::Edge)) {
+                    slot.generic_palm = None;
+                    slot.palm_suppressed = slot.thumb_suppressed
+                        || slot.dwt_palm.is_some()
+                        || slot.tool_type == 2
+                        || self.touch_arbitration_suppressed;
+                    self.mt_contact_count_changed = true;
+                }
+            }
+        }
 
         for slot in &mut self.mt_slots {
             if !slot.active {
@@ -1022,16 +1296,19 @@ impl TrackedDevice {
         touchpad_is_external: bool,
         palm_pressure_threshold: Option<u32>,
         palm_size_threshold: Option<u32>,
+        touch_pressure_range: Option<(i32, i32)>,
+        touch_size_range: Option<(i32, i32)>,
         is_clickpad: bool,
         is_topbuttonpad: bool,
         is_pointing_stick: bool,
         vendor_id: u16,
         product_id: u16,
-        bus_type: u16,
     ) -> Self {
         let is_absolute = uses_absolute_events;
         let relative_axes = device.supported_relative_axes();
         let absolute_axes = device.supported_absolute_axes();
+        let has_mt_pressure =
+            absolute_axes.is_some_and(|axes| axes.contains(AbsoluteAxisCode::ABS_MT_PRESSURE));
         let tablet_has_pressure =
             absolute_axes.is_some_and(|axes| axes.contains(AbsoluteAxisCode::ABS_PRESSURE));
         let tablet_has_distance =
@@ -1270,6 +1547,8 @@ impl TrackedDevice {
             is_absolute,
             is_absolute_pointer,
             has_mt,
+            has_mt_pressure,
+            is_semi_mt: false,
             protocol_a: has_mt && !has_mt_slot,
             mt_x_fuzz,
             mt_y_fuzz,
@@ -1282,15 +1561,18 @@ impl TrackedDevice {
             is_clickpad,
             is_topbuttonpad,
             is_pointing_stick,
+            pointing_stick_internal: is_pointing_stick,
+            lid_write_open: false,
             vendor_id,
             product_id,
-            bus_type,
             supports_hi_res_vertical,
             supports_hi_res_horizontal,
             warned_missing_hi_res_vertical: false,
             warned_missing_hi_res_horizontal: false,
             wheel_is_virtual: false,
             is_lenovo_scrollpoint: false,
+            trackpoint_multiplier: 1.0,
+            invert_horizontal_scrolling: false,
             wheel_state: 0,
             wheel_min_movement: 47,
             wheel_accum_vertical: 0,
@@ -1315,6 +1597,9 @@ impl TrackedDevice {
             debounce_buttons: HashMap::new(),
             debounce_spurious: false,
             debounce_bypass: false,
+            debounce_disabled: false,
+            last_button_time_usec: 0,
+            lagging_frame_count: 0,
             scroll_button_accum_x: 0,
             scroll_button_accum_y: 0,
             pending_rel_x: 0,
@@ -1345,6 +1630,10 @@ impl TrackedDevice {
             touchpad_left_handed_sequence_active: false,
             palm_pressure_threshold: palm_pressure_threshold.map(f64::from),
             palm_size_threshold: palm_size_threshold.map(f64::from),
+            touch_pressure_range: touch_pressure_range
+                .map(|(down, up)| (f64::from(down), f64::from(up))),
+            global_touch_pressure: tablet_pressure,
+            touch_size_range: touch_size_range.map(|(down, up)| (f64::from(down), f64::from(up))),
             tap_emitted: false,
             tap_button_down: None,
             tap_release_since: None,
@@ -1354,6 +1643,16 @@ impl TrackedDevice {
             last_movement_time: None,
             active_click_button: None,
             active_click_device: None,
+            click_sequence_suppressed: false,
+            touchpad_phantom_clicks: false,
+            tablet_mode_no_suspend: false,
+            touchpad_visible_marker: false,
+            thumb_pressure_threshold: None,
+            thumb_size_threshold: None,
+            thumb_detection_enabled: false,
+            palm_left_edge: None,
+            palm_right_edge: None,
+            palm_upper_edge: None,
             tablet_serial: 0,
             tablet_tool_id: 0,
             tablet_tool_type: initial_tablet_tool_type.unwrap_or(1),
@@ -1474,8 +1773,10 @@ impl TrackedDevice {
             drag_3fg_active: false,
             drag_3fg_button_down: false,
             drag_3fg_release_since: None,
+            drag_3fg_resume_scroll_active: false,
             held_keys: Vec::new(),
             held_buttons: Vec::new(),
+            ignored_initial_switches: HashSet::new(),
             dwt: DwtRuntime::default(),
             dwtp: DwtpRuntime::default(),
             lib_device,
@@ -1517,6 +1818,8 @@ impl TrackedDevice {
     fn gesture_slot_eligible(slot: &MtSlot, button_areas: bool) -> bool {
         slot.active
             && !slot.palm_suppressed
+            && !slot.thumb_suppressed
+            && !slot.click_pinned
             && slot.edge_state == EdgeScrollState::Area
             && (!button_areas || !slot.button_area_excluded)
     }
@@ -1529,9 +1832,21 @@ impl TrackedDevice {
     }
 
     fn gesture_finger_count(&self, button_areas: bool) -> usize {
+        if self.is_semi_mt {
+            return self.touch_fingers as usize;
+        }
         let active = self.active_slot_count();
         let eligible = self.gesture_tracked_contact_count(button_areas);
-        let untracked = (self.touch_fingers as usize).saturating_sub(active);
+        // On pressure-aware hardware BTN_TOOL_* includes hovering contacts,
+        // so only counts beyond the device's physical slot capacity are
+        // genuinely untracked. Without per-slot pressure, active slots are
+        // the best available denominator for the kernel-reported remainder.
+        let tracked_denominator = if self.has_mt_pressure {
+            self.mt_slots.len()
+        } else {
+            active
+        };
+        let untracked = (self.touch_fingers as usize).saturating_sub(tracked_denominator);
         eligible + untracked
     }
 
@@ -1546,7 +1861,22 @@ impl TrackedDevice {
                 count += 1;
             }
         }
-        (count != 0).then(|| (x / count as f64, y / count as f64))
+        (count != 0).then_some((x / count as f64, y / count as f64))
+    }
+
+    fn click_drag_centroid(&self) -> Option<(f64, f64)> {
+        let mut x = 0.0;
+        let mut y = 0.0;
+        let mut count = 0usize;
+        for slot in &self.mt_slots {
+            if slot.active && !slot.palm_suppressed && !slot.thumb_suppressed && !slot.click_pinned
+            {
+                x += slot.x;
+                y += slot.y;
+                count += 1;
+            }
+        }
+        (count != 0).then_some((x / count as f64, y / count as f64))
     }
 
     fn reset_gesture_contact_initials(&mut self, button_areas: bool) {
@@ -1700,19 +2030,62 @@ impl TrackedDevice {
         Some(f64::from(maximum) - button_height)
     }
 
+    fn top_button_area_bottom(
+        y_range: Option<(i32, i32)>,
+        y_resolution: Option<i32>,
+        height_mm: Option<f64>,
+    ) -> Option<f64> {
+        let (minimum, maximum) = y_range?;
+        let span = f64::from(maximum) - f64::from(minimum);
+        if span <= 0.0 {
+            return None;
+        }
+        let button_height = if let Some(resolution) = y_resolution.filter(|value| *value > 0) {
+            10.0 * f64::from(resolution)
+        } else if let Some(height_mm) = height_mm.filter(|value| value.is_finite() && *value > 0.0)
+        {
+            span * 10.0 / height_mm
+        } else {
+            span * 0.15
+        };
+        Some(f64::from(minimum) + button_height.min(span))
+    }
+
     fn classify_gesture_contacts(
         &mut self,
         button_areas: bool,
         button_top: Option<f64>,
+        top_button_bottom: Option<f64>,
+        x_range: Option<(i32, i32)>,
         time_usec: u64,
     ) {
+        let is_topbuttonpad = self.is_topbuttonpad;
         for slot in &mut self.mt_slots {
             if slot.active && !slot.palm_suppressed && slot.button_area_classification_pending {
                 slot.button_area_initial_x = slot.x;
                 slot.button_area_initial_y = slot.y;
                 slot.button_area_down_usec = time_usec;
-                slot.button_area_excluded =
-                    button_areas && button_top.is_some_and(|top| slot.y >= top);
+                slot.top_button_contact =
+                    is_topbuttonpad && top_button_bottom.is_some_and(|bottom| slot.y <= bottom);
+                slot.top_button_code = if slot.top_button_contact {
+                    x_range
+                        .map(|(minimum, maximum)| {
+                            let third = f64::from(maximum - minimum) / 3.0;
+                            if slot.x >= f64::from(minimum) + third * 2.0 {
+                                KeyCode::BTN_RIGHT.0
+                            } else if slot.x >= f64::from(minimum) + third {
+                                KeyCode::BTN_MIDDLE.0
+                            } else {
+                                KeyCode::BTN_LEFT.0
+                            }
+                        })
+                        .unwrap_or(KeyCode::BTN_LEFT.0)
+                } else {
+                    KeyCode::BTN_LEFT.0
+                };
+                slot.top_button_left_at = None;
+                slot.button_area_excluded = slot.top_button_contact
+                    || (button_areas && button_top.is_some_and(|top| slot.y >= top));
                 slot.button_area_classification_pending = false;
             }
         }
@@ -1723,6 +2096,7 @@ impl TrackedDevice {
         &mut self,
         button_areas: bool,
         button_top: Option<f64>,
+        top_button_bottom: Option<f64>,
         x_resolution: Option<i32>,
         y_resolution: Option<i32>,
         x_range: Option<(i32, i32)>,
@@ -1737,11 +2111,26 @@ impl TrackedDevice {
             return false;
         };
 
+        for slot in &mut self.mt_slots {
+            if !slot.active || !slot.top_button_contact {
+                continue;
+            }
+            if top_button_bottom.is_some_and(|bottom| slot.y > bottom) {
+                slot.top_button_left_at.get_or_insert_with(Instant::now);
+            } else {
+                slot.top_button_left_at = None;
+            }
+        }
+
         let activation_times: Vec<u64> = self
             .mt_slots
             .iter()
             .filter_map(|slot| {
-                if !slot.active || slot.palm_suppressed || !slot.button_area_excluded {
+                if !slot.active
+                    || slot.palm_suppressed
+                    || !slot.button_area_excluded
+                    || slot.top_button_contact
+                {
                     return None;
                 }
                 let movement_mm = touchpad_delta_mm(
@@ -1768,6 +2157,7 @@ impl TrackedDevice {
             if slot.active
                 && !slot.palm_suppressed
                 && slot.button_area_excluded
+                && !slot.top_button_contact
                 && activation_times
                     .iter()
                     .any(|time_usec| slot.button_area_down_usec.abs_diff(*time_usec) <= 80_000)
@@ -2049,14 +2439,35 @@ impl TrackedDevice {
         width_mm: Option<f64>,
         height_mm: Option<f64>,
     ) -> u32 {
+        let lower_thumb_line = self
+            .thumb_detection_enabled
+            .then(|| {
+                y_range.map(|(minimum, maximum)| {
+                    f64::from(minimum) + f64::from(maximum - minimum) * 0.92
+                })
+            })
+            .flatten();
         let contacts: Vec<&MtSlot> = self
             .mt_slots
             .iter()
-            .filter(|slot| slot.active && !slot.palm_suppressed)
+            .filter(|slot| slot.active && !slot.palm_suppressed && !slot.thumb_suppressed)
             .collect();
-        let mut fingers = self.touch_fingers.max(contacts.len() as u32);
+        let reported_fingers = self.touch_fingers.max(self.active_slot_count() as u32);
+        let untracked_fingers = reported_fingers.saturating_sub(self.active_slot_count() as u32);
+        let mut fingers = contacts.len() as u32 + untracked_fingers;
+        let mut ignored_bottom_thumb = false;
+        if untracked_fingers > 0 && contacts.len() >= 2 {
+            if let Some(line) = lower_thumb_line {
+                let below = contacts.iter().filter(|slot| slot.y > line).count();
+                if below > 0 && below < contacts.len() {
+                    fingers = fingers.saturating_sub(1);
+                    ignored_bottom_thumb = true;
+                }
+            }
+        }
         if fingers == 2
             && contacts.len() >= 2
+            && !ignored_bottom_thumb
             && !Self::clickfinger_contacts_within_distance(
                 contacts[0],
                 contacts[1],
@@ -2268,6 +2679,21 @@ fn systime_to_usec(t: SystemTime) -> u64 {
         .as_micros() as u64
 }
 
+fn monotonic_now() -> Option<Duration> {
+    let mut timestamp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timestamp) };
+    if result != 0 || timestamp.tv_sec < 0 || timestamp.tv_nsec < 0 {
+        return None;
+    }
+    Some(Duration::new(
+        timestamp.tv_sec as u64,
+        timestamp.tv_nsec as u32,
+    ))
+}
+
 unsafe fn press_seat_button(device: *mut LibinputDevice) -> u32 {
     (*(*device).seat)
         .button_count
@@ -2277,6 +2703,25 @@ unsafe fn press_seat_button(device: *mut LibinputDevice) -> u32 {
 
 unsafe fn release_seat_button(device: *mut LibinputDevice) -> u32 {
     let count = &(*(*device).seat).button_count;
+    let previous = count
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |value| Some(value.saturating_sub(1)),
+        )
+        .unwrap_or(0);
+    previous.saturating_sub(1)
+}
+
+unsafe fn press_seat_key(device: *mut LibinputDevice) -> u32 {
+    (*(*device).seat)
+        .key_count
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1
+}
+
+unsafe fn release_seat_key(device: *mut LibinputDevice) -> u32 {
+    let count = &(*(*device).seat).key_count;
     let previous = count
         .fetch_update(
             std::sync::atomic::Ordering::Relaxed,
@@ -2953,6 +3398,9 @@ pub struct BackendState {
     requested_paths: Vec<PathBuf>,
     inotify: Option<Inotify>,
     suspended: bool,
+    lid_closed: bool,
+    lid_client_closed: bool,
+    tablet_mode: bool,
 }
 
 unsafe impl Send for BackendState {}
@@ -2987,6 +3435,9 @@ impl BackendState {
             requested_paths: Vec::new(),
             inotify,
             suspended: false,
+            lid_closed: false,
+            lid_client_closed: false,
+            tablet_mode: false,
         }
     }
 
@@ -3006,7 +3457,7 @@ impl BackendState {
             && touchpad.is_touchpad
             && !touchpad.touchpad_is_external
             && trackpoint.is_pointing_stick
-            && !matches!(trackpoint.bus_type, 0x03 | 0x05)
+            && trackpoint.pointing_stick_internal
     }
 
     /// Build DWT/DWTP relationships on every device addition. This handles
@@ -3055,7 +3506,7 @@ impl BackendState {
             }
         }
 
-        if new_info.is_pointing_stick && !matches!(new_info.bus_type, 0x03 | 0x05) {
+        if new_info.is_pointing_stick && new_info.pointing_stick_internal {
             let targets: Vec<RawFd> = infos
                 .iter()
                 .copied()
@@ -3090,6 +3541,57 @@ impl BackendState {
             if touchpad.dwtp.paired_trackpoint == Some(removed_fd) {
                 touchpad.dwtp.paired_trackpoint = None;
             }
+        }
+    }
+
+    unsafe fn open_lid_on_keyboard(
+        &mut self,
+        time_usec: u64,
+        ctx: *mut LibinputContext,
+        out: &mut VecDeque<LibinputEvent>,
+    ) {
+        if !self.lid_closed {
+            return;
+        }
+        let Some(lid) = self
+            .devices
+            .values_mut()
+            .find(|tracked| (*tracked.lib_device).switch_codes.contains(&0))
+        else {
+            self.lid_closed = false;
+            return;
+        };
+
+        if lid.lid_write_open {
+            use std::os::fd::AsRawFd;
+            let events = [
+                InputEvent::new(EventType::SWITCH.0, 0, 0),
+                InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0),
+            ];
+            let _ = libc::write(
+                lid.device.as_raw_fd(),
+                events.as_ptr().cast(),
+                std::mem::size_of_val(&events),
+            );
+        }
+        // The kernel event generated by the write above, or the later
+        // physical open event on an unreliable switch, acknowledges this
+        // synthetic transition and must not be delivered a second time.
+        lid.ignored_initial_switches.insert(0);
+        let notify_client = self.lid_client_closed;
+        self.lid_closed = false;
+        self.lid_client_closed = false;
+        if notify_client {
+            out.push_back(LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_SWITCH_TOGGLE,
+                payload: EventPayload::SwitchToggle(SwitchEvent {
+                    time_usec,
+                    switch: 1,
+                    state: 0,
+                }),
+                context: ctx,
+                device: lid.lib_device,
+            });
         }
     }
 
@@ -3330,7 +3832,8 @@ impl BackendState {
             || tag_pointing_stick;
         let use_evdev_fallback = !has_class_tag;
         let is_keyboard = tag_keyboard
-            || (use_evdev_fallback && keys.is_some_and(|k| k.iter().any(|key| key.0 < 0x100)));
+            || ((use_evdev_fallback || tag_key)
+                && keys.is_some_and(|k| k.iter().any(|key| key.0 < 0x100)));
         // DWT only pairs ordinary typewriter keyboards. A node exposing a
         // handful of media or receiver keys must not suppress its touchpad.
         let is_typewriter_keyboard = is_keyboard
@@ -3352,6 +3855,9 @@ impl BackendState {
                 && a.contains(AbsoluteAxisCode::ABS_MT_POSITION_Y)
         });
         let is_touchpad = tag_touchpad
+            || (!has_pen
+                && props.contains(evdev::PropType::BUTTONPAD)
+                && (has_abs_xy || has_mt_xy))
             || (use_evdev_fallback
                 && !has_pen
                 && (props.contains(evdev::PropType::POINTER)
@@ -3427,6 +3933,15 @@ impl BackendState {
         (*lib_dev).hold_default_enabled = (*lib_dev).has_gesture;
         (*lib_dev).mt_slot_count = if has_mt_slot { mt_slot_count } else { 0 };
         (*lib_dev).has_switch = has_switch;
+        (*lib_dev).switch_codes = device
+            .supported_switches()
+            .map(|switches| {
+                switches
+                    .iter()
+                    .filter_map(|switch| matches!(switch.0, 0 | 1 | 10).then_some(switch.0))
+                    .collect()
+            })
+            .unwrap_or_default();
         (*lib_dev).has_tablet = has_tablet;
         (*lib_dev).has_tablet_pad = has_tablet_pad;
         (*lib_dev).abs_x_range = abs_x_range_raw;
@@ -3500,6 +4015,46 @@ impl BackendState {
         for message in &applied_quirks.messages {
             crate::emit_debug_log(ctx, message);
         }
+        let input_prop_enabled = |name: &str, kernel_enabled: bool| {
+            if applied_quirks
+                .disabled_input_props
+                .iter()
+                .any(|property| property == name)
+            {
+                false
+            } else if applied_quirks
+                .enabled_input_props
+                .iter()
+                .any(|property| property == name)
+            {
+                true
+            } else {
+                kernel_enabled
+            }
+        };
+        let effective_buttonpad = input_prop_enabled(
+            "INPUT_PROP_BUTTONPAD",
+            props.contains(evdev::PropType::BUTTONPAD),
+        );
+        let effective_semi_mt = input_prop_enabled(
+            "INPUT_PROP_SEMI_MT",
+            props.contains(evdev::PropType::SEMI_MT),
+        );
+        (*lib_dev).has_gesture = is_touchpad && !effective_semi_mt;
+        (*lib_dev).hold_enabled = (*lib_dev).has_gesture;
+        (*lib_dev).hold_default_enabled = (*lib_dev).has_gesture;
+        if applied_quirks.model_hp_zbook_studio_g3 {
+            mt_slot_count = mt_slot_count.min(2);
+            (*lib_dev).mt_slot_count = mt_slot_count;
+        }
+        if applied_quirks.model_hp_pavilion_dm4_touchpad {
+            mt_slot_count = 1;
+            (*lib_dev).mt_slot_count = 1;
+        }
+        if applied_quirks.model_tablet_mode_switch_unreliable {
+            (*lib_dev).switch_codes.retain(|code| *code != 1);
+            (*lib_dev).has_switch = !(*lib_dev).switch_codes.is_empty();
+        }
         if applied_quirks.model_dell_canvas_totem {
             has_touch = false;
             has_tablet = true;
@@ -3511,14 +4066,37 @@ impl BackendState {
         (*lib_dev).accel_available =
             (is_touchpad || has_relative_motion || has_tablet) && !has_tablet_pad;
         (*lib_dev).event_codes = event_codes;
-        let mut left_handed_available = is_pointer;
+        (*lib_dev).rotation_available = applied_quirks.model_trackball;
+        // Tablet rotation is configurable by default when libwacom metadata
+        // is unavailable. With libwacom enabled, recognized non-reversible
+        // tablets opt out below, matching upstream's feature-dependent rule.
+        let mut left_handed_available = is_pointer || has_tablet;
+        if has_tablet && cfg!(feature = "libwacom") {
+            let database = libwacom_database_new();
+            if !database.is_null() {
+                let wacom = libwacom_new_from_usbid(
+                    database,
+                    libc::c_int::from(input_id.vendor()),
+                    libc::c_int::from(input_id.product()),
+                    std::ptr::null_mut(),
+                );
+                if !wacom.is_null() {
+                    left_handed_available = libwacom_is_reversible(wacom) != 0;
+                    libwacom_destroy(wacom);
+                }
+                libwacom_database_destroy(database);
+            }
+        }
         if is_touchpad && applied_quirks.model_apple_touchpad_onebutton {
             left_handed_available = false;
         }
         (*lib_dev).left_handed_available = left_handed_available;
+        (*lib_dev).tap_finger_count = if is_touchpad { 3 } else { 0 };
+        (*lib_dev).tap_drag_enabled = is_touchpad;
         if has_tablet_pad {
             let mut pad_button_codes = Vec::new();
             let mut pad_left_handed_available = true;
+            let mut pad_num_modes = 1;
             let database = libwacom_database_new();
             if !database.is_null() {
                 let wacom = libwacom_new_from_usbid(
@@ -3529,6 +4107,15 @@ impl BackendState {
                 );
                 if !wacom.is_null() {
                     pad_left_handed_available = libwacom_is_reversible(wacom) != 0;
+                    pad_num_modes = [
+                        libwacom_get_ring_num_modes(wacom),
+                        libwacom_get_ring2_num_modes(wacom),
+                        libwacom_get_strips_num_modes(wacom),
+                    ]
+                    .into_iter()
+                    .max()
+                    .unwrap_or(1)
+                    .max(1) as u32;
                     for index in 0..libwacom_get_num_buttons(wacom).max(0) {
                         let code = libwacom_get_button_evdev_code(
                             wacom,
@@ -3573,11 +4160,7 @@ impl BackendState {
                     user_data: std::ptr::null_mut(),
                     device: lib_dev,
                     index: 0,
-                    num_modes: if input_id.vendor() == 0x056a && input_id.product() == 0x034e {
-                        4
-                    } else {
-                        1
-                    },
+                    num_modes: pad_num_modes,
                     current_mode: 0,
                     num_buttons: (*lib_dev).tablet_pad_button_codes.len() as u32,
                     num_dials: (*lib_dev).tablet_pad_num_dials,
@@ -3588,7 +4171,10 @@ impl BackendState {
         let has_left_button = (*lib_dev).event_codes.contains(&KeyCode::BTN_LEFT.0);
         let has_right_button = (*lib_dev).event_codes.contains(&KeyCode::BTN_RIGHT.0);
         let has_middle_button = (*lib_dev).event_codes.contains(&KeyCode::BTN_MIDDLE.0);
-        let is_clickpad = props.contains(evdev::PropType::BUTTONPAD);
+        (*lib_dev).tap_default_enabled = is_touchpad && !has_left_button;
+        (*lib_dev).tap_enabled = (*lib_dev).tap_default_enabled;
+        let is_clickpad =
+            effective_buttonpad || (is_touchpad && has_left_button && !has_right_button);
         let mut click_methods = 0;
         if is_clickpad {
             click_methods |= 1;
@@ -3598,6 +4184,9 @@ impl BackendState {
         }
         if applied_quirks.model_apple_touchpad_onebutton {
             click_methods |= 2;
+        }
+        if applied_quirks.model_apple_touchpad_onebutton {
+            click_methods = 2;
         }
         let clickfinger_is_default = applied_quirks.model_apple_touchpad
             || applied_quirks.model_apple_touchpad_onebutton
@@ -3614,7 +4203,9 @@ impl BackendState {
         (*lib_dev).click_method = click_default_method;
         (*lib_dev).click_default_method = click_default_method;
         let (middle_emulation_available, middle_emulation_default) = if is_touchpad {
-            if is_clickpad {
+            if applied_quirks.model_apple_touchpad_onebutton {
+                (false, false)
+            } else if is_clickpad {
                 (true, false)
             } else if has_left_button && has_right_button {
                 if has_middle_button && applied_quirks.model_alps_serial_touchpad {
@@ -3750,11 +4341,50 @@ impl BackendState {
         // INPUT_PROP_PRESSUREPAD (0x07) and a non-zero ABS_MT_PRESSURE
         // resolution mean the axis is contact/touch detection data rather
         // than the raw palm-pressure signal used by libinput's palm logic.
-        let has_raw_mt_pressure = device.get_absinfo().ok().is_some_and(|axes| {
-            axes.into_iter().any(|(axis, info)| {
-                axis == AbsoluteAxisCode::ABS_MT_PRESSURE && info.resolution() == 0
+        let pressurepad_property = props.contains(evdev::PropType(0x07))
+            || applied_quirks
+                .enabled_input_props
+                .iter()
+                .any(|property| property == "INPUT_PROP_PRESSUREPAD");
+        let has_raw_mt_pressure = !applied_quirks.disable_abs_mt_pressure
+            && device.get_absinfo().ok().is_some_and(|axes| {
+                axes.into_iter().any(|(axis, info)| {
+                    axis == AbsoluteAxisCode::ABS_MT_PRESSURE && info.resolution() == 0
+                })
             })
-        }) && !props.contains(evdev::PropType(0x07));
+            && !pressurepad_property;
+        let exposes_mt_pressure = !applied_quirks.disable_abs_mt_pressure
+            && abs.is_some_and(|axes| axes.contains(AbsoluteAxisCode::ABS_MT_PRESSURE));
+        let default_touch_pressure_range = is_touchpad
+            .then(|| {
+                let axes = device.get_absinfo().ok()?.collect::<Vec<_>>();
+                [
+                    AbsoluteAxisCode::ABS_MT_PRESSURE,
+                    AbsoluteAxisCode::ABS_PRESSURE,
+                ]
+                .into_iter()
+                .filter(|axis| {
+                    if *axis == AbsoluteAxisCode::ABS_MT_PRESSURE {
+                        has_raw_mt_pressure
+                    } else {
+                        !applied_quirks.disable_abs_pressure
+                            && !exposes_mt_pressure
+                            && (!has_mt_slot || props.contains(evdev::PropType::SEMI_MT))
+                    }
+                })
+                .find_map(|pressure_axis| {
+                    axes.iter().find_map(|(axis, info)| {
+                        (*axis == pressure_axis).then(|| {
+                            let span = f64::from(info.maximum() - info.minimum());
+                            (
+                                info.minimum() + (span * 0.12) as i32,
+                                info.minimum() + (span * 0.10) as i32,
+                            )
+                        })
+                    })
+                })
+            })
+            .flatten();
         let palm_pressure_threshold = (palm_detection_enabled && has_raw_mt_pressure)
             .then_some(applied_quirks.palm_pressure_threshold.unwrap_or(130))
             .filter(|threshold| *threshold != 0);
@@ -3881,13 +4511,80 @@ impl BackendState {
             external_touchpad,
             palm_pressure_threshold,
             palm_size_threshold,
+            applied_quirks
+                .pressure_range
+                .or(default_touch_pressure_range),
+            applied_quirks
+                .touch_size_range
+                .filter(|_| mt_size_major_resolution.is_some()),
             is_clickpad,
             is_topbuttonpad,
             tag_pointing_stick,
             input_id.vendor(),
             input_id.product(),
-            input_id.bus_type().0,
         );
+        td.pointing_stick_internal = tag_pointing_stick
+            && !matches!(
+                applied_quirks.pointing_stick_integration,
+                Some(crate::quirks::KeyboardIntegration::External)
+            )
+            && !matches!(input_id.bus_type().0, 0x03 | 0x05);
+        td.is_semi_mt = effective_semi_mt;
+        td.trackpoint_multiplier = applied_quirks.trackpoint_multiplier.unwrap_or(1.0);
+        td.invert_horizontal_scrolling = applied_quirks.model_invert_horizontal_scrolling;
+        td.debounce_disabled = applied_quirks.model_bouncing_keys;
+        td.tablet_mode_no_suspend = applied_quirks.model_tablet_mode_no_suspend;
+        td.touchpad_visible_marker = applied_quirks.model_touchpad_visible_marker;
+        td.touchpad_phantom_clicks = applied_quirks.model_touchpad_phantom_clicks;
+        td.thumb_pressure_threshold = applied_quirks.thumb_pressure_threshold.map(f64::from);
+        td.thumb_size_threshold = applied_quirks.thumb_size_threshold.map(f64::from);
+        td.thumb_detection_enabled =
+            is_clickpad && (*lib_dev).height_mm.is_some_and(|height| height >= 50.0);
+        if palm_detection_enabled && !applied_quirks.model_apple_touchpad {
+            if let (Some(width), Some((minimum, maximum))) = (
+                (*lib_dev).width_mm,
+                (*lib_dev).abs_x_range.or(td.abs_x_range),
+            ) {
+                if width >= 70.0 {
+                    let edge_mm = 8.0_f64.min(width * 0.08);
+                    let edge_units = f64::from(maximum - minimum) * edge_mm / width;
+                    td.palm_left_edge = Some(f64::from(minimum) + edge_units);
+                    td.palm_right_edge = Some(f64::from(maximum) - edge_units);
+                }
+            }
+            if !is_topbuttonpad {
+                if let (Some(height), Some((minimum, maximum))) = (
+                    (*lib_dev).height_mm,
+                    (*lib_dev).abs_y_range.or(td.abs_y_range),
+                ) {
+                    if height > 55.0 {
+                        td.palm_upper_edge =
+                            Some(f64::from(minimum) + f64::from(maximum - minimum) * 0.05);
+                    }
+                }
+            }
+        }
+        if applied_quirks.model_hp_zbook_studio_g3 {
+            td.mt_slots.truncate(2);
+        }
+        if applied_quirks.model_hp_pavilion_dm4_touchpad {
+            td.mt_slots.truncate(1);
+        }
+        if applied_quirks.disable_abs_mt_pressure {
+            td.has_mt_pressure = false;
+            td.touch_pressure_range = None;
+            for slot in &mut td.mt_slots {
+                slot.pressure = 0.0;
+            }
+        }
+        if applied_quirks.disable_abs_distance {
+            td.tablet_has_distance = false;
+        }
+        if applied_quirks.disable_abs_mt_tool_type {
+            for slot in &mut td.mt_slots {
+                slot.tool_type = 0;
+            }
+        }
         let udev_fuzz = |primary: &str, fallback: &str| {
             crate::udev::property_value(raw_udev_device, primary)
                 .or_else(|| crate::udev::property_value(raw_udev_device, fallback))
@@ -3900,6 +4597,10 @@ impl BackendState {
         if let Some(fuzz) = udev_fuzz("LIBINPUT_FUZZ_36", "LIBINPUT_FUZZ_01") {
             td.mt_y_fuzz = fuzz;
         }
+        // libinput retains the original fuzz as its motion hysteresis but
+        // clears it from evdev so the kernel does not filter the same axis a
+        // second time. Keep that observable evdev behavior ABI-compatible.
+        clear_kernel_abs_fuzz(&td.device);
         if applied_quirks.disable_hi_res_wheel_vertical {
             td.supports_hi_res_vertical = false;
         }
@@ -3911,6 +4612,8 @@ impl BackendState {
         }
         td.wheel_is_virtual = applied_quirks.is_virtual;
         td.is_lenovo_scrollpoint = applied_quirks.model_lenovo_scrollpoint;
+        td.lid_write_open = (*lib_dev).switch_codes.contains(&0)
+            && applied_quirks.lid_switch_reliability.as_deref() != Some("reliable");
 
         out.push(LibinputEvent {
             event_type: LibinputEventType::LIBINPUT_EVENT_DEVICE_ADDED,
@@ -3918,6 +4621,43 @@ impl BackendState {
             context: ctx,
             device: lib_dev,
         });
+        if let Ok(active_switches) = td.device.get_switch_state() {
+            for code in (*lib_dev).switch_codes.iter().copied() {
+                if code == 0 && applied_quirks.lid_switch_reliability.as_deref() != Some("reliable")
+                {
+                    if active_switches.contains(evdev::SwitchCode(code)) {
+                        td.ignored_initial_switches.insert(code);
+                        self.lid_closed = true;
+                    }
+                    continue;
+                }
+                if active_switches.contains(evdev::SwitchCode(code)) {
+                    match code {
+                        0 => self.lid_closed = true,
+                        1 => self.tablet_mode = true,
+                        _ => {}
+                    }
+                    if code == 0 {
+                        self.lid_client_closed = true;
+                    }
+                    out.push(LibinputEvent {
+                        event_type: LibinputEventType::LIBINPUT_EVENT_SWITCH_TOGGLE,
+                        payload: EventPayload::SwitchToggle(SwitchEvent {
+                            time_usec: systime_to_usec(SystemTime::now()),
+                            switch: match code {
+                                0 => 1,
+                                1 => 2,
+                                10 => 3,
+                                _ => continue,
+                            },
+                            state: 1,
+                        }),
+                        context: ctx,
+                        device: lib_dev,
+                    });
+                }
+            }
+        }
         if td.tablet_tool_type == 8 && td.tablet_proximity_pending == Some(true) {
             let mut initial_events = VecDeque::new();
             Self::process_tablet_tool_event(
@@ -4001,18 +4741,27 @@ impl BackendState {
         };
         let time_usec = systime_to_usec(SystemTime::now());
         for key in tracked.held_keys.drain(..) {
+            let seat_key_count = release_seat_key(device);
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_KEYBOARD_KEY,
                 payload: EventPayload::KeyboardKey(KeyboardKeyEvent {
                     time_usec,
                     key: key.code as u32,
                     state: 0,
+                    seat_key_count,
                 }),
                 context: ctx,
                 device,
             });
         }
+        let active_click = tracked
+            .active_click_button
+            .take()
+            .map(|button| (button, tracked.active_click_device.take().unwrap_or(device)));
         for button in tracked.held_buttons.drain(..) {
+            if active_click.is_some_and(|(active_button, _)| active_button == button) {
+                continue;
+            }
             let seat_button_count = release_seat_button(device);
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
@@ -4026,8 +4775,7 @@ impl BackendState {
                 device,
             });
         }
-        if let Some(button) = tracked.active_click_button.take() {
-            let event_device = tracked.active_click_device.take().unwrap_or(device);
+        if let Some((button, event_device)) = active_click {
             let seat_button_count = release_seat_button(event_device);
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
@@ -4414,7 +5162,33 @@ impl BackendState {
                     break;
                 }
 
+                let wakes_lid = self.lid_closed
+                    && self
+                        .devices
+                        .get(&fd)
+                        .is_some_and(|tracked| tracked.is_keyboard)
+                    && batch
+                        .iter()
+                        .any(|event| event.event_type() == EventType::KEY && event.value() != 2);
+                if wakes_lid {
+                    let time_usec = batch
+                        .iter()
+                        .find(|event| event.event_type() == EventType::KEY)
+                        .map(|event| systime_to_usec(event.timestamp()))
+                        .unwrap_or_else(|| systime_to_usec(SystemTime::now()));
+                    self.open_lid_on_keyboard(time_usec, ctx, out);
+                }
+
                 let mut followups = Vec::new();
+                let inhibited = self.devices.get(&fd).is_some_and(|tracked| {
+                    (self.lid_closed && tracked.is_touchpad)
+                        || (self.tablet_mode
+                            && (tracked.is_touchpad
+                                || (tracked.is_keyboard && tracked.keyboard_internal)
+                                || tracked.is_pointing_stick)
+                            && !tracked.tablet_mode_no_suspend)
+                });
+                let mut inhibited_events = VecDeque::new();
                 if let Some(td) = self.devices.get_mut(&fd) {
                     Self::process_device_batch(
                         fd,
@@ -4422,7 +5196,11 @@ impl BackendState {
                         pointing_stick_device,
                         ctx,
                         td,
-                        out,
+                        if inhibited {
+                            &mut inhibited_events
+                        } else {
+                            out
+                        },
                         &mut followups,
                     );
                 }
@@ -4445,6 +5223,66 @@ impl BackendState {
                             at,
                             time_usec,
                         } => self.apply_dwtp_activity(source_fd, at, time_usec, ctx, out),
+                        DwtFollowup::TrackpointButton {
+                            device,
+                            button,
+                            down,
+                            time_usec,
+                        } => {
+                            self.apply_trackpoint_button(device, button, down, time_usec, ctx, out)
+                        }
+                        DwtFollowup::SwitchToggle {
+                            device,
+                            switch,
+                            state,
+                            time_usec,
+                        } => {
+                            let changed = match switch {
+                                1 => {
+                                    let changed = self.lid_closed != state;
+                                    self.lid_closed = state;
+                                    self.lid_client_closed = state;
+                                    changed
+                                }
+                                2 => {
+                                    let changed = self.tablet_mode != state;
+                                    self.tablet_mode = state;
+                                    changed
+                                }
+                                _ => true,
+                            };
+                            if changed && state && matches!(switch, 1 | 2) {
+                                let targets: Vec<*mut LibinputDevice> = self
+                                    .devices
+                                    .values()
+                                    .filter(|tracked| {
+                                        tracked.is_touchpad
+                                            || (switch == 2
+                                                && ((tracked.is_keyboard
+                                                    && tracked.keyboard_internal)
+                                                    || tracked.is_pointing_stick))
+                                    })
+                                    .filter(|tracked| {
+                                        switch != 2 || !tracked.tablet_mode_no_suspend
+                                    })
+                                    .map(|tracked| tracked.lib_device)
+                                    .collect();
+                                for target in targets {
+                                    self.stop_scroll_for_device(ctx, target, out);
+                                    self.release_active_inputs(ctx, target, out);
+                                }
+                            }
+                            out.push_back(LibinputEvent {
+                                event_type: LibinputEventType::LIBINPUT_EVENT_SWITCH_TOGGLE,
+                                payload: EventPayload::SwitchToggle(SwitchEvent {
+                                    time_usec,
+                                    switch,
+                                    state: u32::from(state),
+                                }),
+                                context: ctx,
+                                device,
+                            });
+                        }
                     }
                 }
             }
@@ -4950,6 +5788,11 @@ impl BackendState {
         out: &mut VecDeque<LibinputEvent>,
     ) -> libc::c_int {
         self.suspended = false;
+        // Switch state may change while device fds are closed. Rebuild the
+        // aggregate inhibition state from the freshly opened switch nodes.
+        self.lid_closed = false;
+        self.lid_client_closed = false;
+        self.tablet_mode = false;
         if (*ctx).backend_kind == BackendKind::Udev {
             let mut events = Vec::new();
             self.scan_and_open(ctx, &mut events);
@@ -5029,6 +5872,48 @@ impl BackendState {
         for event in batch {
             let ts_usec = systime_to_usec(event.timestamp());
 
+            if event.event_type() == EventType::SYNCHRONIZATION && event.code() == 0 {
+                let event_time = event
+                    .timestamp()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or(Duration::ZERO);
+                let lag = monotonic_now()
+                    .and_then(|now| now.checked_sub(event_time))
+                    .unwrap_or(Duration::ZERO);
+                if lag >= Duration::from_millis(20) {
+                    td.lagging_frame_count = td.lagging_frame_count.saturating_add(1);
+                } else {
+                    td.lagging_frame_count = 0;
+                }
+                if td.lagging_frame_count == 20 {
+                    crate::emit_error_log(ctx, "event processing lagging behind by 20ms or more");
+                }
+                if td.is_touchpad && cfg_tap && lag >= Duration::from_millis(100) {
+                    crate::emit_error_log(ctx, "scheduled expiry is in the past");
+                }
+            }
+
+            if event.event_type() == EventType::SWITCH {
+                if event.value() == 0 && td.ignored_initial_switches.remove(&event.code()) {
+                    continue;
+                }
+                let switch = match event.code() {
+                    0 => 1,
+                    1 => 2,
+                    10 => 3,
+                    _ => continue,
+                };
+                if (*lib_dev).switch_codes.contains(&event.code()) {
+                    followups.push(DwtFollowup::SwitchToggle {
+                        device: lib_dev,
+                        switch,
+                        state: event.value() != 0,
+                        time_usec: ts_usec,
+                    });
+                }
+                continue;
+            }
+
             if is_tablet_pad {
                 Self::process_tablet_pad_event(event, ts_usec, lib_dev, ctx, td, out);
                 continue;
@@ -5043,7 +5928,11 @@ impl BackendState {
             // relative pointer axes and ordinary keyboard keys. Route the
             // key range through the keyboard engine without stealing the
             // device's BTN_* events from pointer handling.
-            if is_kbd && is_ptr && event.event_type() == EventType::KEY && event.code() < 0x100 {
+            if is_kbd
+                && is_ptr
+                && event.event_type() == EventType::KEY
+                && !is_evdev_button_code(event.code())
+            {
                 Self::process_keyboard_event(event, ts_usec, lib_dev, ctx, td, out);
                 if matches!(event.value(), 0 | 1) {
                     followups.push(DwtFollowup::Keyboard {
@@ -5109,6 +5998,7 @@ impl BackendState {
                     cfg_nat,
                     cfg_accel,
                     touch_arbitrated,
+                    followups,
                 );
             }
         }
@@ -5418,6 +6308,74 @@ impl BackendState {
                 }
             }
         }
+    }
+
+    unsafe fn apply_trackpoint_button(
+        &mut self,
+        device: *mut LibinputDevice,
+        button: u16,
+        down: bool,
+        time_usec: u64,
+        ctx: *mut LibinputContext,
+        out: &mut VecDeque<LibinputEvent>,
+    ) {
+        let Some(trackpoint) = self
+            .devices
+            .values_mut()
+            .find(|tracked| tracked.lib_device == device)
+        else {
+            return;
+        };
+        let scroll_button = button == KeyCode::BTN_MIDDLE.0
+            && (*device).scroll_method == 4
+            && (*device).scroll_button == u32::from(KeyCode::BTN_MIDDLE.0);
+        if !scroll_button {
+            Self::emit_pointer_button(time_usec, device, ctx, trackpoint, button, down, out);
+            return;
+        }
+        if down {
+            if trackpoint.scroll_button_down {
+                return;
+            }
+            trackpoint.scroll_button_down = true;
+            trackpoint.scroll_button_press_time = Some(Instant::now());
+            trackpoint.scroll_button_moved = false;
+            trackpoint.scroll_button_axes = 0;
+            trackpoint.scroll_button_accum_x = 0;
+            trackpoint.scroll_button_accum_y = 0;
+            return;
+        }
+        if !trackpoint.scroll_button_down {
+            return;
+        }
+        trackpoint.scroll_button_down = false;
+        trackpoint.scroll_button_press_time = None;
+        if trackpoint.scroll_button_moved || trackpoint.scroll_button_axes != 0 {
+            Self::emit_button_scroll_stops(time_usec, device, ctx, trackpoint, out);
+        } else {
+            Self::emit_logical_pointer_button(
+                time_usec,
+                device,
+                ctx,
+                trackpoint,
+                KeyCode::BTN_MIDDLE.0,
+                true,
+                out,
+            );
+            Self::emit_logical_pointer_button(
+                time_usec,
+                device,
+                ctx,
+                trackpoint,
+                KeyCode::BTN_MIDDLE.0,
+                false,
+                out,
+            );
+        }
+        trackpoint.scroll_button_moved = false;
+        trackpoint.scroll_button_axes = 0;
+        trackpoint.scroll_button_accum_x = 0;
+        trackpoint.scroll_button_accum_y = 0;
     }
 
     unsafe fn expire_dwt_timeouts(&mut self) {
@@ -6421,26 +7379,36 @@ impl BackendState {
             // Key down: repeat tracking. DWT is applied after the source
             // batch releases its mutable device borrow, so it can update the
             // correctly paired touchpad rather than a global timestamp.
+            if td.held_keys.iter().any(|key| key.code == code) {
+                return;
+            }
             td.held_keys.push(HeldKey { code });
+            let seat_key_count = press_seat_key(lib_dev);
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_KEYBOARD_KEY,
                 payload: EventPayload::KeyboardKey(KeyboardKeyEvent {
                     time_usec: ts_usec,
                     key: code as u32,
                     state: 1, // LIBINPUT_KEY_STATE_PRESSED
+                    seat_key_count,
                 }),
                 context: ctx,
                 device: lib_dev,
             });
         } else if value == 0 {
             // Key up: remove from repeat tracking
+            if !td.held_keys.iter().any(|key| key.code == code) {
+                return;
+            }
             td.held_keys.retain(|k| k.code != code);
+            let seat_key_count = release_seat_key(lib_dev);
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_KEYBOARD_KEY,
                 payload: EventPayload::KeyboardKey(KeyboardKeyEvent {
                     time_usec: ts_usec,
                     key: code as u32,
                     state: 0, // LIBINPUT_KEY_STATE_RELEASED
+                    seat_key_count,
                 }),
                 context: ctx,
                 device: lib_dev,
@@ -6591,10 +7559,26 @@ impl BackendState {
                 }
 
                 if td.pending_rel_x != 0 || td.pending_rel_y != 0 {
-                    let dx = td.pending_rel_x as f64;
-                    let dy = td.pending_rel_y as f64;
+                    let mut dx = td.pending_rel_x as f64 * td.trackpoint_multiplier;
+                    let mut dy = td.pending_rel_y as f64 * td.trackpoint_multiplier;
                     td.pending_rel_x = 0;
                     td.pending_rel_y = 0;
+                    if (*lib_dev).rotation_angle != 0 {
+                        let radians = f64::from((*lib_dev).rotation_angle).to_radians();
+                        let (sin, cos) = radians.sin_cos();
+                        let rotated_x = dx * cos - dy * sin;
+                        let rotated_y = dx * sin + dy * cos;
+                        dx = if rotated_x.abs() < f64::EPSILON * 8.0 {
+                            0.0
+                        } else {
+                            rotated_x
+                        };
+                        dy = if rotated_y.abs() < f64::EPSILON * 8.0 {
+                            0.0
+                        } else {
+                            rotated_y
+                        };
+                    }
                     out.push_back(LibinputEvent {
                         event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_MOTION,
                         payload: EventPayload::PointerMotion(PointerMotionEvent {
@@ -6654,7 +7638,13 @@ impl BackendState {
                         1.0,
                     ),
                 ] {
-                    let direction = direction * natural_direction;
+                    let horizontal_quirk_direction = if axis == 1 && td.invert_horizontal_scrolling
+                    {
+                        -1.0
+                    } else {
+                        1.0
+                    };
+                    let direction = direction * natural_direction * horizontal_quirk_direction;
                     let filtered_high_res = td.filter_hi_res_wheel(axis, high_res);
                     let (supports_hi_res, warned_missing_hi_res) = if axis == 0 {
                         (
@@ -6903,30 +7893,12 @@ impl BackendState {
                         if down {
                             return;
                         }
-                        let pressed_count = press_seat_button(lib_dev);
-                        out.push_back(LibinputEvent {
-                            event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
-                            payload: EventPayload::PointerButton(PointerButtonEvent {
-                                time_usec: ts_usec,
-                                button: u32::from(code),
-                                state: 1,
-                                seat_button_count: pressed_count,
-                            }),
-                            context: ctx,
-                            device: lib_dev,
-                        });
-                        let released_count = release_seat_button(lib_dev);
-                        out.push_back(LibinputEvent {
-                            event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
-                            payload: EventPayload::PointerButton(PointerButtonEvent {
-                                time_usec: ts_usec,
-                                button: u32::from(code),
-                                state: 0,
-                                seat_button_count: released_count,
-                            }),
-                            context: ctx,
-                            device: lib_dev,
-                        });
+                        Self::emit_logical_pointer_button(
+                            ts_usec, lib_dev, ctx, td, code, true, out,
+                        );
+                        Self::emit_logical_pointer_button(
+                            ts_usec, lib_dev, ctx, td, code, false, out,
+                        );
                         return;
                     }
                 }
@@ -6993,32 +7965,12 @@ impl BackendState {
                                 if td.scroll_button_moved || td.scroll_button_axes != 0 {
                                     Self::emit_button_scroll_stops(ts_usec, lib_dev, ctx, td, out);
                                 } else {
-                                    let pressed_count = press_seat_button(lib_dev);
-                                    out.push_back(LibinputEvent {
-                                        event_type:
-                                            LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
-                                        payload: EventPayload::PointerButton(PointerButtonEvent {
-                                            time_usec: ts_usec,
-                                            button: u32::from(code),
-                                            state: 1,
-                                            seat_button_count: pressed_count,
-                                        }),
-                                        context: ctx,
-                                        device: lib_dev,
-                                    });
-                                    let released_count = release_seat_button(lib_dev);
-                                    out.push_back(LibinputEvent {
-                                        event_type:
-                                            LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
-                                        payload: EventPayload::PointerButton(PointerButtonEvent {
-                                            time_usec: ts_usec,
-                                            button: u32::from(code),
-                                            state: 0,
-                                            seat_button_count: released_count,
-                                        }),
-                                        context: ctx,
-                                        device: lib_dev,
-                                    });
+                                    Self::emit_logical_pointer_button(
+                                        ts_usec, lib_dev, ctx, td, code, true, out,
+                                    );
+                                    Self::emit_logical_pointer_button(
+                                        ts_usec, lib_dev, ctx, td, code, false, out,
+                                    );
                                 }
                                 td.scroll_button_moved = false;
                                 td.scroll_button_axes = 0;
@@ -7034,30 +7986,12 @@ impl BackendState {
                         if td.scroll_button_moved {
                             Self::emit_button_scroll_stops(ts_usec, lib_dev, ctx, td, out);
                         } else {
-                            let pressed_count = press_seat_button(lib_dev);
-                            out.push_back(LibinputEvent {
-                                event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
-                                payload: EventPayload::PointerButton(PointerButtonEvent {
-                                    time_usec: ts_usec,
-                                    button: u32::from(code),
-                                    state: 1,
-                                    seat_button_count: pressed_count,
-                                }),
-                                context: ctx,
-                                device: lib_dev,
-                            });
-                            let released_count = release_seat_button(lib_dev);
-                            out.push_back(LibinputEvent {
-                                event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
-                                payload: EventPayload::PointerButton(PointerButtonEvent {
-                                    time_usec: ts_usec,
-                                    button: u32::from(code),
-                                    state: 0,
-                                    seat_button_count: released_count,
-                                }),
-                                context: ctx,
-                                device: lib_dev,
-                            });
+                            Self::emit_logical_pointer_button(
+                                ts_usec, lib_dev, ctx, td, code, true, out,
+                            );
+                            Self::emit_logical_pointer_button(
+                                ts_usec, lib_dev, ctx, td, code, false, out,
+                            );
                         }
                         td.scroll_button_moved = false;
                         td.scroll_button_axes = 0;
@@ -7091,6 +8025,10 @@ impl BackendState {
         down: bool,
         out: &mut VecDeque<LibinputEvent>,
     ) {
+        if td.debounce_disabled {
+            Self::emit_pointer_button(ts_usec, lib_dev, ctx, td, code, down, out);
+            return;
+        }
         let now = Instant::now();
         let timeout = Duration::from_millis(25);
         let activate_bypass = !td.debounce_bypass
@@ -7200,24 +8138,34 @@ impl BackendState {
         {
             td.left_handed_applied = (*lib_dev).left_handed;
         }
-        let code = if td.left_handed_applied && code == KeyCode::BTN_LEFT.0 {
-            KeyCode::BTN_RIGHT.0
-        } else if td.left_handed_applied && code == KeyCode::BTN_RIGHT.0 {
-            KeyCode::BTN_LEFT.0
+        let code = map_left_handed_button(code, td.left_handed_applied, (*lib_dev).click_method);
+        Self::emit_logical_pointer_button(ts_usec, lib_dev, ctx, td, code, down, out);
+    }
+
+    unsafe fn emit_logical_pointer_button(
+        ts_usec: u64,
+        lib_dev: *mut LibinputDevice,
+        ctx: *mut LibinputContext,
+        td: &mut TrackedDevice,
+        code: u16,
+        down: bool,
+        out: &mut VecDeque<LibinputEvent>,
+    ) {
+        if !transition_button_state(&mut td.held_buttons, code, down) {
+            return;
+        }
+        let ts_usec = if ts_usec / 1_000 <= td.last_button_time_usec / 1_000 {
+            td.last_button_time_usec
+                .saturating_div(1_000)
+                .saturating_add(1)
+                .saturating_mul(1_000)
         } else {
-            code
+            ts_usec
         };
+        td.last_button_time_usec = ts_usec;
         let (state, seat_button_count) = if down {
-            if td.held_buttons.contains(&code) {
-                return;
-            }
-            td.held_buttons.push(code);
             (1, press_seat_button(lib_dev))
         } else {
-            if !td.held_buttons.contains(&code) {
-                return;
-            }
-            td.held_buttons.retain(|button| *button != code);
             let count = release_seat_button(lib_dev);
             if td.held_buttons.is_empty() {
                 td.left_handed_applied = (*lib_dev).left_handed;
@@ -7324,10 +8272,25 @@ impl BackendState {
         out: &mut VecDeque<LibinputEvent>,
     ) {
         if ev.event_type() == EventType::ABSOLUTE {
-            if ev.code() == AbsoluteAxisCode::ABS_X.0 {
-                td.last_x = Some(ev.value());
-            } else if ev.code() == AbsoluteAxisCode::ABS_Y.0 {
-                td.last_y = Some(ev.value());
+            match ev.code() {
+                code if code == AbsoluteAxisCode::ABS_X.0 => td.last_x = Some(ev.value()),
+                code if code == AbsoluteAxisCode::ABS_Y.0 => td.last_y = Some(ev.value()),
+                code if code == AbsoluteAxisCode::ABS_MT_SLOT.0 => {
+                    td.current_slot =
+                        (ev.value().max(0) as usize).min(td.mt_slots.len().saturating_sub(1));
+                }
+                code if code == AbsoluteAxisCode::ABS_MT_TRACKING_ID.0 => {
+                    let slot = &mut td.mt_slots[td.current_slot];
+                    slot.active = ev.value() >= 0;
+                    slot.tracking_id = ev.value();
+                }
+                code if code == AbsoluteAxisCode::ABS_MT_POSITION_X.0 => {
+                    td.mt_slots[td.current_slot].x = f64::from(ev.value());
+                }
+                code if code == AbsoluteAxisCode::ABS_MT_POSITION_Y.0 => {
+                    td.mt_slots[td.current_slot].y = f64::from(ev.value());
+                }
+                _ => {}
             }
             return;
         }
@@ -7340,22 +8303,47 @@ impl BackendState {
             let Some(event_device) = pointing_stick_device else {
                 return;
             };
-            let (Some(x), Some(y), Some((xmin, xmax)), Some((ymin, ymax))) =
-                (td.last_x, td.last_y, td.abs_x_range, td.abs_y_range)
-            else {
+            let (Some((xmin, xmax)), Some((ymin, ymax))) = (td.abs_x_range, td.abs_y_range) else {
                 return;
             };
             let top_button_bottom = ymin + (ymax - ymin) / 5;
-            if y > top_button_bottom {
-                return;
-            }
             let third = (xmax - xmin) / 3;
-            let button = if x >= xmin + third * 2 {
-                KeyCode::BTN_RIGHT.0
-            } else if x >= xmin + third {
+            let mut left_contact = false;
+            let mut middle_contact = false;
+            let mut right_contact = false;
+            for slot in td
+                .mt_slots
+                .iter()
+                .filter(|slot| slot.active && slot.y <= f64::from(top_button_bottom))
+            {
+                if slot.x >= f64::from(xmin + third * 2) {
+                    right_contact = true;
+                } else if slot.x >= f64::from(xmin + third) {
+                    middle_contact = true;
+                } else {
+                    left_contact = true;
+                }
+            }
+            let button = if (left_contact && right_contact) || middle_contact {
                 KeyCode::BTN_MIDDLE.0
-            } else {
+            } else if right_contact {
+                KeyCode::BTN_RIGHT.0
+            } else if left_contact {
                 KeyCode::BTN_LEFT.0
+            } else {
+                let (Some(x), Some(y)) = (td.last_x, td.last_y) else {
+                    return;
+                };
+                if y > top_button_bottom {
+                    return;
+                }
+                if x >= xmin + third * 2 {
+                    KeyCode::BTN_RIGHT.0
+                } else if x >= xmin + third {
+                    KeyCode::BTN_MIDDLE.0
+                } else {
+                    KeyCode::BTN_LEFT.0
+                }
             };
             td.active_click_button = Some(button);
             td.active_click_device = Some(event_device);
@@ -7400,6 +8388,7 @@ impl BackendState {
         cfg_nat: bool,
         cfg_accel: f32,
         touch_arbitrated: bool,
+        followups: &mut Vec<DwtFollowup>,
     ) {
         if touch_arbitrated {
             td.touch_arbitration_suppressed = true;
@@ -7443,7 +8432,8 @@ impl BackendState {
                     td.finger_scroll_constraint.reset();
                 }
 
-                if (*lib_dev).middle_emulation
+                if !td.is_clickpad
+                    && (*lib_dev).middle_emulation
                     && (*lib_dev).scroll_method != 4
                     && (code == KeyCode::BTN_LEFT.0
                         || code == KeyCode::BTN_RIGHT.0
@@ -7472,6 +8462,11 @@ impl BackendState {
                         slot.dirty = true;
                         if value != 0 {
                             slot.tracking_id = 0;
+                            slot.pressure = td.global_touch_pressure;
+                            slot.pressure_suppressed = td
+                                .touch_pressure_range
+                                .is_some_and(|(down, _)| slot.pressure < down);
+                            slot.size_suppressed = td.touch_size_range.is_some();
                             slot.button_area_classification_pending = true;
                             slot.button_area_excluded = false;
                             slot.edge_classification_pending = true;
@@ -7486,9 +8481,14 @@ impl BackendState {
                             slot.dwt_released_this_frame = false;
                             slot.dwt_palm = None;
                             slot.dwt_palm_started_usec = None;
-                            slot.palm_suppressed = touch_arbitration_suppressed;
+                            slot.palm_suppressed = slot.pressure_suppressed
+                                || slot.size_suppressed
+                                || slot.thumb_suppressed
+                                || touch_arbitration_suppressed;
                             TrackedDevice::mark_dwt_palm(slot, new_touch_palm, ts_usec);
                         } else {
+                            slot.pressure_suppressed = false;
+                            slot.size_suppressed = false;
                             slot.button_area_classification_pending = false;
                             slot.edge_classification_pending = false;
                             slot.generic_palm = None;
@@ -7654,9 +8654,19 @@ impl BackendState {
                         td.touch_fingers = 0;
                         td.tap_fingers = 0;
                     }
+                } else if code == KeyCode::BTN_TOOL_FINGER.0 {
+                    if td.is_semi_mt {
+                        td.touch_fingers = u32::from(value != 0);
+                        td.tap_fingers = td.tap_fingers.max(td.touch_fingers);
+                        td.mt_contact_count_changed = true;
+                    }
                 } else if code == KeyCode::BTN_TOOL_DOUBLETAP.0 {
                     td.touch_fingers = if value != 0 { 2 } else { 1 };
                     td.tap_fingers = td.tap_fingers.max(td.touch_fingers);
+                    if !td.has_mt && value != 0 {
+                        td.hold_started_at = None;
+                        td.hold_blocked = true;
+                    }
                     td.mt_contact_count_changed = true;
                 } else if code == KeyCode::BTN_TOOL_TRIPLETAP.0 {
                     td.touch_fingers = if value != 0 { 3 } else { 2 };
@@ -7668,10 +8678,54 @@ impl BackendState {
                     td.mt_contact_count_changed = true;
                 } else {
                     // Physical click with finger-count remapping
-                    let mut mapped = code;
+                    if value != 0
+                        && ((KeyCode::BTN_LEFT.0..=KeyCode::BTN_TASK.0).contains(&code)
+                            || (KeyCode::BTN_0.0..=KeyCode::BTN_9.0).contains(&code))
+                    {
+                        td.hold_started_at = None;
+                        td.hold_blocked = true;
+                    }
+                    let mut mapped = match code {
+                        value if value == KeyCode::BTN_0.0 => KeyCode::BTN_LEFT.0,
+                        value if value == KeyCode::BTN_1.0 => KeyCode::BTN_RIGHT.0,
+                        value if value == KeyCode::BTN_2.0 => KeyCode::BTN_MIDDLE.0,
+                        _ => code,
+                    };
                     let mut event_device = lib_dev;
+                    if (KeyCode::BTN_0.0..=KeyCode::BTN_2.0).contains(&code) {
+                        let Some(pointing_stick) = pointing_stick_device else {
+                            return;
+                        };
+                        followups.push(DwtFollowup::TrackpointButton {
+                            device: pointing_stick,
+                            button: mapped,
+                            down: value != 0,
+                            time_usec: ts_usec,
+                        });
+                        return;
+                    }
                     if code == KeyCode::BTN_LEFT.0 {
                         if value != 0 {
+                            // A physical click takes ownership of the button
+                            // lifecycle. End a pending tap/tap-drag first so
+                            // the synthetic click cannot remain held behind
+                            // the clickpad's mapped press.
+                            if let Some(button) = td.tap_button_down.take() {
+                                td.tap_release_since = None;
+                                td.tap_drag_active = false;
+                                let released_count = release_seat_button(lib_dev);
+                                out.push_back(LibinputEvent {
+                                    event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
+                                    payload: EventPayload::PointerButton(PointerButtonEvent {
+                                        time_usec: ts_usec,
+                                        button: button as u32,
+                                        state: 0,
+                                        seat_button_count: released_count,
+                                    }),
+                                    context: ctx,
+                                    device: lib_dev,
+                                });
+                            }
                             // If a release was lost (for example while another
                             // client held an EVIOCGRAB), preserve the existing
                             // logical press and suppress the duplicate press.
@@ -7680,26 +8734,136 @@ impl BackendState {
                             }
                             let button_areas = (*lib_dev).click_method == 1;
                             let clickfinger = (*lib_dev).click_method == 2;
-                            let click_position = td.last_x.zip(td.last_y).or_else(|| {
-                                td.mt_slots
-                                    .iter()
-                                    .find(|slot| slot.active && !slot.palm_suppressed)
-                                    .map(|slot| (slot.x.round() as i32, slot.y.round() as i32))
+                            if td.is_clickpad
+                                && (button_areas || td.touchpad_phantom_clicks)
+                                && !td.mt_slots.iter().any(|slot| slot.active)
+                            {
+                                return;
+                            }
+                            let clickfinger_fingers = clickfinger.then(|| {
+                                td.clickfinger_finger_count(
+                                    (*lib_dev).abs_x_resolution,
+                                    (*lib_dev).abs_y_resolution,
+                                    (*lib_dev).abs_x_range.or(td.abs_x_range),
+                                    (*lib_dev).abs_y_range.or(td.abs_y_range),
+                                    (*lib_dev).width_mm,
+                                    (*lib_dev).height_mm,
+                                )
                             });
-                            let (in_right_button_area, in_top_button_area) =
-                                match (click_position, td.abs_x_range, td.abs_y_range) {
-                                    (Some((x, y)), Some((xmin, xmax)), Some((ymin, ymax))) => {
-                                        let right_edge = xmin + (xmax - xmin) * 2 / 3;
-                                        let button_top = ymin + (ymax - ymin) * 4 / 5;
-                                        let top_button_bottom = ymin + (ymax - ymin) / 5;
-                                        (
-                                            button_areas && x >= right_edge && y >= button_top,
-                                            td.is_topbuttonpad && y <= top_button_bottom,
-                                        )
+                            if clickfinger_fingers.is_some_and(|fingers| fingers >= 4) {
+                                td.click_sequence_suppressed = true;
+                                return;
+                            }
+                            // On MT clickpads ABS_X/Y may lag behind the
+                            // current slot or retain the previous contact's
+                            // coordinates. The active MT contact is the
+                            // authoritative click-area position; legacy
+                            // single-touch pads fall back to ABS_X/Y.
+                            let click_position = td
+                                .mt_slots
+                                .iter()
+                                .find(|slot| slot.active && (button_areas || !slot.palm_suppressed))
+                                .map(|slot| (slot.x.round() as i32, slot.y.round() as i32))
+                                .or_else(|| td.last_x.zip(td.last_y));
+                            let latched_top_button = td
+                                .mt_slots
+                                .iter()
+                                .find(|slot| slot.active && (button_areas || !slot.palm_suppressed))
+                                .filter(|slot| slot.top_button_contact)
+                                .map(|slot| {
+                                    if slot.top_button_left_at.is_some_and(|left_at| {
+                                        left_at.elapsed() >= Duration::from_millis(300)
+                                    }) {
+                                        KeyCode::BTN_LEFT.0
+                                    } else {
+                                        slot.top_button_code
                                     }
-                                    _ => (false, false),
-                                };
-                            if in_top_button_area {
+                                });
+                            if td.is_clickpad {
+                                if let Some(slot) = td.mt_slots.iter_mut().find(|slot| {
+                                    slot.active && (button_areas || !slot.palm_suppressed)
+                                }) {
+                                    slot.click_pinned = true;
+                                    slot.click_pin_x = slot.x;
+                                    slot.click_pin_y = slot.y;
+                                }
+                                td.gesture_last_centroid = td.click_drag_centroid();
+                                td.pinch_base_centroid = td.gesture_last_centroid;
+                            }
+                            let middle_emulation = (*lib_dev).middle_emulation;
+                            let (
+                                in_left_button_area,
+                                in_middle_button_area,
+                                in_right_button_area,
+                                in_top_button_area,
+                            ) = match (click_position, td.abs_x_range, td.abs_y_range) {
+                                (Some((x, y)), Some((xmin, xmax)), Some((ymin, ymax))) => {
+                                    let left_edge = if middle_emulation {
+                                        xmin + (xmax - xmin) / 2
+                                    } else if td.touchpad_visible_marker {
+                                        let half_width = (*lib_dev)
+                                            .abs_x_resolution
+                                            .map(|resolution| {
+                                                (resolution as f64 * 5.0).round() as i32
+                                            })
+                                            .or_else(|| {
+                                                (*lib_dev).width_mm.map(|width| {
+                                                    ((xmax - xmin) as f64 * 5.0 / width).round()
+                                                        as i32
+                                                })
+                                            })
+                                            .unwrap_or((xmax - xmin) / 8);
+                                        xmin + (xmax - xmin) / 2 - half_width
+                                    } else {
+                                        xmin + (xmax - xmin) * 3 / 8
+                                    };
+                                    let right_edge = if middle_emulation {
+                                        left_edge
+                                    } else if td.touchpad_visible_marker {
+                                        xmin + xmax - left_edge
+                                    } else {
+                                        xmin + (xmax - xmin) * 5 / 8
+                                    };
+                                    let button_height = (*lib_dev)
+                                        .abs_y_resolution
+                                        .map(|resolution| (resolution as f64 * 10.0).round() as i32)
+                                        .or_else(|| {
+                                            (*lib_dev).height_mm.map(|height| {
+                                                ((ymax - ymin) as f64 * 10.0 / height).round()
+                                                    as i32
+                                            })
+                                        })
+                                        .map(|height| height.min((ymax - ymin) * 15 / 100))
+                                        .unwrap_or((ymax - ymin) * 15 / 100);
+                                    let button_top = ymax - button_height;
+                                    let top_button_bottom = ymin + (ymax - ymin) / 5;
+                                    (
+                                        button_areas && x < left_edge && y >= button_top,
+                                        button_areas
+                                            && !middle_emulation
+                                            && x >= left_edge
+                                            && x < right_edge
+                                            && y >= button_top,
+                                        button_areas && x >= right_edge && y >= button_top,
+                                        td.is_topbuttonpad && y <= top_button_bottom,
+                                    )
+                                }
+                                _ => (false, false, false, false),
+                            };
+                            if let Some(button) = latched_top_button {
+                                mapped = button;
+                                if button != KeyCode::BTN_LEFT.0
+                                    || td.mt_slots.iter().any(|slot| {
+                                        slot.active
+                                            && slot.top_button_contact
+                                            && slot.top_button_left_at.is_none()
+                                    })
+                                {
+                                    if let Some(pointing_stick) = pointing_stick_device {
+                                        event_device = pointing_stick;
+                                    }
+                                }
+                            } else if in_top_button_area {
                                 if let (Some((x, _)), Some((xmin, xmax))) =
                                     (click_position, td.abs_x_range)
                                 {
@@ -7715,19 +8879,44 @@ impl BackendState {
                                 if let Some(pointing_stick) = pointing_stick_device {
                                     event_device = pointing_stick;
                                 }
-                            } else if in_right_button_area {
+                            } else if button_areas && middle_emulation {
+                                let (Some((xmin, xmax)), Some((ymin, ymax))) =
+                                    (td.abs_x_range, td.abs_y_range)
+                                else {
+                                    return;
+                                };
+                                let split = xmin + (xmax - xmin) / 2;
+                                let button_top = ymin + (ymax - ymin) * 4 / 5;
+                                let mut left_contact = false;
+                                let mut right_contact = false;
+                                for slot in td.mt_slots.iter().filter(|slot| slot.active) {
+                                    if slot.y.round() as i32 >= button_top {
+                                        if (slot.x.round() as i32) < split {
+                                            left_contact = true;
+                                        } else {
+                                            right_contact = true;
+                                        }
+                                    }
+                                }
+                                mapped = if left_contact && right_contact {
+                                    KeyCode::BTN_MIDDLE.0
+                                } else if in_right_button_area {
+                                    KeyCode::BTN_RIGHT.0
+                                } else {
+                                    KeyCode::BTN_LEFT.0
+                                };
+                            } else if in_middle_button_area {
+                                mapped = KeyCode::BTN_MIDDLE.0;
+                            } else if in_right_button_area
+                                || (in_left_button_area && (*lib_dev).left_handed)
+                            {
                                 mapped = KeyCode::BTN_RIGHT.0;
                             }
+                            if in_right_button_area && (*lib_dev).left_handed {
+                                mapped = KeyCode::BTN_LEFT.0;
+                            }
                             if clickfinger {
-                                let clickfinger_fingers = td.clickfinger_finger_count(
-                                    (*lib_dev).abs_x_resolution,
-                                    (*lib_dev).abs_y_resolution,
-                                    (*lib_dev).abs_x_range.or(td.abs_x_range),
-                                    (*lib_dev).abs_y_range.or(td.abs_y_range),
-                                    (*lib_dev).width_mm,
-                                    (*lib_dev).height_mm,
-                                );
-                                mapped = match clickfinger_fingers {
+                                mapped = match clickfinger_fingers.unwrap_or(1) {
                                     2 if (*lib_dev).clickfinger_button_map == 1 => {
                                         KeyCode::BTN_MIDDLE.0
                                     }
@@ -7742,6 +8931,9 @@ impl BackendState {
                             td.active_click_button = Some(mapped);
                             td.active_click_device = Some(event_device);
                         } else {
+                            if td.click_sequence_suppressed {
+                                return;
+                            }
                             let Some(active) = td.active_click_button.take() else {
                                 return;
                             };
@@ -7754,22 +8946,33 @@ impl BackendState {
                           || c == KeyCode::BTN_RIGHT.0
                           || c == KeyCode::BTN_MIDDLE.0
                     ) {
-                        let seat_button_count = if value != 0 {
-                            press_seat_button(event_device)
+                        // Route touchpad buttons through the same exactly-once
+                        // lifecycle used by relative devices. Besides keeping
+                        // the seat count balanced, this recovers when an
+                        // EVIOCGRAB hides a release: the repeated press is
+                        // ignored and the next release closes the original
+                        // logical press.
+                        if event_device == lib_dev {
+                            Self::emit_logical_pointer_button(
+                                ts_usec,
+                                event_device,
+                                ctx,
+                                td,
+                                mapped,
+                                value != 0,
+                                out,
+                            );
                         } else {
-                            release_seat_button(event_device)
-                        };
-                        out.push_back(LibinputEvent {
-                            event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
-                            payload: EventPayload::PointerButton(PointerButtonEvent {
-                                time_usec: ts_usec,
-                                button: mapped as u32,
-                                state: value as u32,
-                                seat_button_count,
-                            }),
-                            context: ctx,
-                            device: event_device,
-                        });
+                            Self::emit_pointer_button(
+                                ts_usec,
+                                event_device,
+                                ctx,
+                                td,
+                                mapped,
+                                value != 0,
+                                out,
+                            );
+                        }
                     }
                 }
             }
@@ -7840,6 +9043,9 @@ impl BackendState {
                             mt_slot.button_area_initial_x = 0.0;
                             mt_slot.button_area_initial_y = 0.0;
                             mt_slot.button_area_down_usec = 0;
+                            mt_slot.top_button_contact = false;
+                            mt_slot.top_button_code = KeyCode::BTN_LEFT.0;
+                            mt_slot.top_button_left_at = None;
                             mt_slot.gesture_initial_x = 0.0;
                             mt_slot.gesture_initial_y = 0.0;
                             mt_slot.gesture_rebase_pending = true;
@@ -7854,12 +9060,26 @@ impl BackendState {
                             mt_slot.edge_started_at = None;
                             mt_slot.edge_axis = 0;
                             mt_slot.generic_palm = None;
+                            mt_slot.thumb_suppressed = false;
+                            mt_slot.palm_initial_x = 0.0;
+                            mt_slot.palm_initial_y = 0.0;
+                            mt_slot.palm_started_usec = 0;
+                            mt_slot.movement_samples = 0;
                             mt_slot.dwt_released_this_frame = false;
-                            mt_slot.pressure = 0.0;
-                            mt_slot.touch_major = 0.0;
-                            mt_slot.touch_minor = 0.0;
-                            mt_slot.palm_suppressed =
-                                mt_slot.tool_type == 2 || td.touch_arbitration_suppressed;
+                            if !td.has_mt_pressure {
+                                mt_slot.pressure = td.global_touch_pressure;
+                            }
+                            mt_slot.pressure_suppressed = td
+                                .touch_pressure_range
+                                .is_some_and(|(down, _)| mt_slot.pressure < down);
+                            mt_slot.size_suppressed = td.touch_size_range.is_some();
+                            mt_slot.direct_palm_cancelled =
+                                (*lib_dev).has_touch && mt_slot.tool_type == 2;
+                            mt_slot.palm_suppressed = mt_slot.direct_palm_cancelled
+                                || mt_slot.pressure_suppressed
+                                || mt_slot.size_suppressed
+                                || mt_slot.tool_type == 2
+                                || td.touch_arbitration_suppressed;
                             TrackedDevice::mark_dwt_palm(mt_slot, new_touch_palm, ts_usec);
                             mt_slot.cancel_pending = false;
                         } else {
@@ -7868,6 +9088,9 @@ impl BackendState {
                             mt_slot.button_area_initial_x = 0.0;
                             mt_slot.button_area_initial_y = 0.0;
                             mt_slot.button_area_down_usec = 0;
+                            mt_slot.top_button_contact = false;
+                            mt_slot.top_button_code = KeyCode::BTN_LEFT.0;
+                            mt_slot.top_button_left_at = None;
                             mt_slot.gesture_initial_x = 0.0;
                             mt_slot.gesture_initial_y = 0.0;
                             mt_slot.gesture_rebase_pending = false;
@@ -7876,9 +9099,11 @@ impl BackendState {
                             if val < 0 {
                                 mt_slot.began_this_frame = false;
                                 mt_slot.generic_palm = None;
+                                mt_slot.thumb_suppressed = false;
                                 mt_slot.dwt_released_this_frame = false;
                                 mt_slot.dwt_palm = None;
                                 mt_slot.dwt_palm_started_usec = None;
+                                mt_slot.click_pinned = false;
                             }
                         }
                         mt_slot.dirty = true;
@@ -7893,6 +9118,10 @@ impl BackendState {
                         if !mt_slot.reported
                             || (mt_slot.x - val as f64).abs() > f64::from(td.mt_x_fuzz)
                         {
+                            if mt_slot.active && !mt_slot.began_this_frame {
+                                mt_slot.movement_samples =
+                                    mt_slot.movement_samples.saturating_add(1);
+                            }
                             mt_slot.x = val as f64;
                             mt_slot.dirty = true;
                         }
@@ -7905,6 +9134,10 @@ impl BackendState {
                         if !mt_slot.reported
                             || (mt_slot.y - val as f64).abs() > f64::from(td.mt_y_fuzz)
                         {
+                            if mt_slot.active && !mt_slot.began_this_frame {
+                                mt_slot.movement_samples =
+                                    mt_slot.movement_samples.saturating_add(1);
+                            }
                             mt_slot.y = val as f64;
                             mt_slot.dirty = true;
                         }
@@ -7920,6 +9153,28 @@ impl BackendState {
                     if slot < td.mt_slots.len() {
                         let mt_slot = &mut td.mt_slots[slot];
                         mt_slot.pressure = val as f64;
+                        if let Some((down, up)) = td.touch_pressure_range {
+                            let was_suppressed = mt_slot.pressure_suppressed;
+                            if mt_slot.pressure_suppressed {
+                                mt_slot.pressure_suppressed = mt_slot.pressure < down;
+                            } else {
+                                mt_slot.pressure_suppressed = mt_slot.pressure < up;
+                            }
+                            if mt_slot.pressure_suppressed {
+                                mt_slot.palm_suppressed = true;
+                            } else if was_suppressed {
+                                mt_slot.palm_suppressed = mt_slot.direct_palm_cancelled
+                                    || mt_slot.generic_palm.is_some()
+                                    || mt_slot.thumb_suppressed
+                                    || mt_slot.dwt_palm.is_some()
+                                    || mt_slot.size_suppressed
+                                    || mt_slot.tool_type == 2
+                                    || td.touch_arbitration_suppressed;
+                            }
+                            if mt_slot.pressure_suppressed != was_suppressed {
+                                td.mt_contact_count_changed = true;
+                            }
+                        }
                         mt_slot.dirty = true;
                     }
                 } else if code == AbsoluteAxisCode::ABS_MT_TOUCH_MAJOR.0 {
@@ -7927,6 +9182,24 @@ impl BackendState {
                     if slot < td.mt_slots.len() {
                         let mt_slot = &mut td.mt_slots[slot];
                         mt_slot.touch_major = val as f64;
+                        if let Some((down, up)) = td.touch_size_range {
+                            let was_suppressed = mt_slot.size_suppressed;
+                            let size = mt_slot.touch_major.max(mt_slot.touch_minor);
+                            mt_slot.size_suppressed = size < if was_suppressed { down } else { up };
+                            if mt_slot.size_suppressed {
+                                mt_slot.palm_suppressed = true;
+                            } else if was_suppressed {
+                                mt_slot.palm_suppressed = mt_slot.direct_palm_cancelled
+                                    || mt_slot.generic_palm.is_some()
+                                    || mt_slot.thumb_suppressed
+                                    || mt_slot.dwt_palm.is_some()
+                                    || mt_slot.pressure_suppressed
+                                    || mt_slot.tool_type == 2
+                                    || td.touch_arbitration_suppressed;
+                            }
+                            td.mt_contact_count_changed |=
+                                mt_slot.size_suppressed != was_suppressed;
+                        }
                         mt_slot.dirty = true;
                     }
                 } else if code == AbsoluteAxisCode::ABS_MT_TOUCH_MINOR.0 {
@@ -7934,24 +9207,95 @@ impl BackendState {
                     if slot < td.mt_slots.len() {
                         let mt_slot = &mut td.mt_slots[slot];
                         mt_slot.touch_minor = val as f64;
+                        if let Some((down, up)) = td.touch_size_range {
+                            let was_suppressed = mt_slot.size_suppressed;
+                            let size = mt_slot.touch_major.max(mt_slot.touch_minor);
+                            mt_slot.size_suppressed = size < if was_suppressed { down } else { up };
+                            if mt_slot.size_suppressed {
+                                mt_slot.palm_suppressed = true;
+                            } else if was_suppressed {
+                                mt_slot.palm_suppressed = mt_slot.direct_palm_cancelled
+                                    || mt_slot.generic_palm.is_some()
+                                    || mt_slot.thumb_suppressed
+                                    || mt_slot.dwt_palm.is_some()
+                                    || mt_slot.pressure_suppressed
+                                    || mt_slot.tool_type == 2
+                                    || td.touch_arbitration_suppressed;
+                            }
+                            td.mt_contact_count_changed |=
+                                mt_slot.size_suppressed != was_suppressed;
+                        }
                         mt_slot.dirty = true;
                     }
                 } else if code == AbsoluteAxisCode::ABS_MT_TOOL_TYPE.0 {
                     let slot = td.current_slot;
                     if slot < td.mt_slots.len() {
                         let mt_slot = &mut td.mt_slots[slot];
+                        let was_suppressed = mt_slot.palm_suppressed;
                         mt_slot.tool_type = val;
                         if val == 2 {
                             mt_slot.cancel_pending |= mt_slot.active && mt_slot.reported;
+                            mt_slot.direct_palm_cancelled |= (*lib_dev).has_touch;
                             mt_slot.palm_suppressed = true;
-                            mt_slot.dirty = true;
+                        } else if mt_slot.direct_palm_cancelled {
+                            // A direct-touch contact that became a palm is
+                            // cancelled for the remainder of that physical
+                            // contact, even if the kernel later reports it as
+                            // a finger again. Touchpad palm suppression stays
+                            // reversible and follows the branch below.
+                            mt_slot.palm_suppressed = true;
+                        } else {
+                            // MT_TOOL_PALM is reversible while the contact is
+                            // down. Restore the finger unless another palm or
+                            // arbitration reason still owns the suppression.
+                            mt_slot.palm_suppressed = mt_slot.generic_palm.is_some()
+                                || mt_slot.thumb_suppressed
+                                || mt_slot.dwt_palm.is_some()
+                                || mt_slot.pressure_suppressed
+                                || mt_slot.size_suppressed
+                                || td.touch_arbitration_suppressed;
                         }
+                        if mt_slot.palm_suppressed != was_suppressed {
+                            td.mt_contact_count_changed = true;
+                        }
+                        mt_slot.dirty = true;
                     }
                 } else if code == AbsoluteAxisCode::ABS_PRESSURE.0 {
-                    if !td.has_mt {
-                        let mt_slot = &mut td.mt_slots[0];
-                        mt_slot.pressure = val as f64;
-                        mt_slot.dirty = true;
+                    td.global_touch_pressure = val as f64;
+                    // MT devices with per-slot pressure use that axis as the
+                    // contact authority. Their legacy ABS_PRESSURE value is
+                    // an aggregate and applying it to every slot would turn
+                    // neighboring hover contacts into touches.
+                    if !td.has_mt || !td.has_mt_pressure {
+                        let slots = if td.has_mt {
+                            &mut td.mt_slots[..]
+                        } else {
+                            &mut td.mt_slots[..1]
+                        };
+                        for mt_slot in slots.iter_mut().filter(|slot| slot.active || !td.has_mt) {
+                            mt_slot.pressure = val as f64;
+                            if let Some((down, up)) = td.touch_pressure_range {
+                                let was_suppressed = mt_slot.pressure_suppressed;
+                                if mt_slot.pressure_suppressed {
+                                    mt_slot.pressure_suppressed = mt_slot.pressure < down;
+                                } else {
+                                    mt_slot.pressure_suppressed = mt_slot.pressure < up;
+                                }
+                                if mt_slot.pressure_suppressed {
+                                    mt_slot.palm_suppressed = true;
+                                } else if was_suppressed {
+                                    mt_slot.palm_suppressed = mt_slot.generic_palm.is_some()
+                                        || mt_slot.thumb_suppressed
+                                        || mt_slot.dwt_palm.is_some()
+                                        || mt_slot.size_suppressed
+                                        || td.touch_arbitration_suppressed;
+                                }
+                                if mt_slot.pressure_suppressed != was_suppressed {
+                                    td.mt_contact_count_changed = true;
+                                }
+                            }
+                            mt_slot.dirty = true;
+                        }
                     }
                 }
                 // ---- Single-touch ABS_X/Y ----
@@ -8008,7 +9352,7 @@ impl BackendState {
                 // resting palm ignored but lets a freshly-started contact
                 // resume pointer motion, matching upstream's nuanced rule.
                 td.release_expired_dwt_palms();
-                td.refresh_generic_palms();
+                td.refresh_generic_palms(ts_usec);
 
                 if (*lib_dev).has_touch {
                     if td.protocol_a {
@@ -8121,6 +9465,7 @@ impl BackendState {
                             release_touch_seat_slot(ctx, seat_slot);
                             if !slot.active {
                                 slot.palm_suppressed = false;
+                                slot.direct_palm_cancelled = false;
                             }
                             slot.dirty = false;
                             emitted = true;
@@ -8141,6 +9486,7 @@ impl BackendState {
                         if slot.palm_suppressed {
                             if !slot.active {
                                 slot.palm_suppressed = false;
+                                slot.direct_palm_cancelled = false;
                             }
                             slot.dirty = false;
                             continue;
@@ -8239,6 +9585,22 @@ impl BackendState {
                 }
 
                 if td.mt_contact_count_changed && !td.gesture_contact_rebase_ready() {
+                    let eligible_contacts = td
+                        .mt_slots
+                        .iter()
+                        .filter(|slot| slot.active && !slot.palm_suppressed)
+                        .count();
+                    if td.finger_scroll_axes != 0 && eligible_contacts != 2 {
+                        Self::emit_finger_axis(
+                            ts_usec,
+                            lib_dev,
+                            ctx,
+                            td.finger_scroll_axes,
+                            [0.0; 2],
+                            out,
+                        );
+                        td.finger_scroll_axes = 0;
+                    }
                     // A synchronized evdev state may report a new tracking
                     // ID in a frame before the corresponding position. Do
                     // not derive motion or gesture direction from that mixed
@@ -8269,6 +9631,29 @@ impl BackendState {
                 let x_range = (*lib_dev).abs_x_range.or(td.abs_x_range);
                 let y_range = (*lib_dev).abs_y_range.or(td.abs_y_range);
                 let edge_enabled = (*lib_dev).scroll_method == 2;
+                let mut contact_unpinned = false;
+                for slot in &mut td.mt_slots {
+                    if !slot.active || !slot.click_pinned {
+                        continue;
+                    }
+                    let moved_mm = touchpad_delta_mm(
+                        slot.x - slot.click_pin_x,
+                        (*lib_dev).abs_x_resolution,
+                        x_range,
+                        (*lib_dev).width_mm,
+                    )
+                    .hypot(touchpad_delta_mm(
+                        slot.y - slot.click_pin_y,
+                        (*lib_dev).abs_y_resolution,
+                        y_range,
+                        (*lib_dev).height_mm,
+                    ));
+                    if moved_mm > 1.5 {
+                        slot.click_pinned = false;
+                        contact_unpinned = true;
+                    }
+                }
+                td.mt_contact_count_changed |= contact_unpinned;
                 td.classify_edge_contacts(
                     edge_enabled,
                     button_areas,
@@ -8287,7 +9672,23 @@ impl BackendState {
                         (*lib_dev).abs_y_resolution,
                         (*lib_dev).height_mm,
                     );
-                    td.classify_gesture_contacts(button_areas, button_top, ts_usec);
+                    let top_button_bottom = td
+                        .is_topbuttonpad
+                        .then(|| {
+                            TrackedDevice::top_button_area_bottom(
+                                y_range,
+                                (*lib_dev).abs_y_resolution,
+                                (*lib_dev).height_mm,
+                            )
+                        })
+                        .flatten();
+                    td.classify_gesture_contacts(
+                        button_areas,
+                        button_top,
+                        top_button_bottom,
+                        x_range,
+                        ts_usec,
+                    );
                     td.reset_gesture_contact_initials(button_areas);
                     let edge_gesture_contacts_before =
                         td.gesture_tracked_contact_count(button_areas);
@@ -8308,7 +9709,35 @@ impl BackendState {
                     Self::emit_edge_scroll_frame(ts_usec, lib_dev, ctx, edge_frame, cfg_nat, out);
                     let n_fingers = td.gesture_finger_count(button_areas);
                     let eligible_tracked_contacts = td.gesture_tracked_contact_count(button_areas);
+                    if td.pinch_active && n_fingers != td.pinch_fingers as usize {
+                        td.pinch_active = false;
+                        let cancelled = n_fingers > td.pinch_fingers as usize;
+                        out.push_back(LibinputEvent {
+                            event_type: LibinputEventType::LIBINPUT_EVENT_GESTURE_PINCH_END,
+                            payload: EventPayload::GesturePinchEnd(GestureEvent {
+                                time_usec: ts_usec,
+                                finger_count: td.pinch_fingers,
+                                dx: 0.0,
+                                dy: 0.0,
+                                scale: 1.0,
+                                angle: 0.0,
+                                cancelled,
+                            }),
+                            context: ctx,
+                            device: lib_dev,
+                        });
+                    }
                     td.finger_scroll_constraint.reset();
+                    if td.click_sequence_suppressed {
+                        if td.active_slot_count() == 0 {
+                            td.click_sequence_suppressed = false;
+                        }
+                        td.current_dx = 0;
+                        td.current_dy = 0;
+                        td.remainder_x = 0.0;
+                        td.remainder_y = 0.0;
+                        return;
+                    }
                     if td.touch_active {
                         td.tap_fingers = td.tap_fingers.max(n_fingers as u32);
                     }
@@ -8370,25 +9799,30 @@ impl BackendState {
                         || eligible_tracked_contacts == 0)
                         && td.finger_scroll_axes != 0
                     {
-                        for event_type in [
-                            LibinputEventType::LIBINPUT_EVENT_POINTER_SCROLL_FINGER,
-                            LibinputEventType::LIBINPUT_EVENT_POINTER_AXIS,
-                        ] {
-                            out.push_back(LibinputEvent {
-                                event_type,
-                                payload: EventPayload::PointerAxis(PointerAxisEvent::with_axes(
-                                    ts_usec,
-                                    td.finger_scroll_axes,
-                                    [0.0; 2],
-                                    [0; 2],
-                                    [0.0; 2],
-                                    2,
-                                )),
-                                context: ctx,
-                                device: lib_dev,
-                            });
+                        if !td.drag_3fg_resume_scroll_active {
+                            for event_type in [
+                                LibinputEventType::LIBINPUT_EVENT_POINTER_SCROLL_FINGER,
+                                LibinputEventType::LIBINPUT_EVENT_POINTER_AXIS,
+                            ] {
+                                out.push_back(LibinputEvent {
+                                    event_type,
+                                    payload: EventPayload::PointerAxis(
+                                        PointerAxisEvent::with_axes(
+                                            ts_usec,
+                                            td.finger_scroll_axes,
+                                            [0.0; 2],
+                                            [0; 2],
+                                            [0.0; 2],
+                                            2,
+                                        ),
+                                    ),
+                                    context: ctx,
+                                    device: lib_dev,
+                                });
+                            }
                         }
                         td.finger_scroll_axes = 0;
+                        td.drag_3fg_resume_scroll_active = false;
                     }
                     if td.swipe_active && n_fingers < 3 {
                         td.swipe_active = false;
@@ -8428,9 +9862,20 @@ impl BackendState {
                     (*lib_dev).abs_y_resolution,
                     (*lib_dev).height_mm,
                 );
+                let top_button_bottom = td
+                    .is_topbuttonpad
+                    .then(|| {
+                        TrackedDevice::top_button_area_bottom(
+                            y_range,
+                            (*lib_dev).abs_y_resolution,
+                            (*lib_dev).height_mm,
+                        )
+                    })
+                    .flatten();
                 if td.update_button_area_contacts(
                     button_areas,
                     button_top,
+                    top_button_bottom,
                     (*lib_dev).abs_x_resolution,
                     (*lib_dev).abs_y_resolution,
                     x_range,
@@ -8522,7 +9967,11 @@ impl BackendState {
                 }
 
                 if td.has_mt {
-                    let centroid = td.gesture_centroid(button_areas);
+                    let centroid = if td.active_click_button.is_some() {
+                        td.click_drag_centroid()
+                    } else {
+                        td.gesture_centroid(button_areas)
+                    };
                     if let (Some((x, y)), Some((last_x, last_y))) =
                         (centroid, td.gesture_last_centroid)
                     {
@@ -8540,6 +9989,87 @@ impl BackendState {
                 }
                 let has_movement = td.current_dx != 0 || td.current_dy != 0;
                 let n_fingers = td.gesture_finger_count(button_areas);
+
+                if td.click_sequence_suppressed {
+                    if td.active_slot_count() == 0 {
+                        td.click_sequence_suppressed = false;
+                    }
+                    td.current_dx = 0;
+                    td.current_dy = 0;
+                    td.remainder_x = 0.0;
+                    td.remainder_y = 0.0;
+                    td.finger_scroll_constraint.reset();
+                    return;
+                }
+
+                if td.active_click_button.is_some() {
+                    if has_movement {
+                        let scale = 0.18_f32;
+                        let total_x = td.current_dx as f32 * scale * cfg_accel + td.remainder_x;
+                        let total_y = td.current_dy as f32 * scale * cfg_accel + td.remainder_y;
+                        let emit_x = total_x.round() as i32;
+                        let emit_y = total_y.round() as i32;
+                        td.remainder_x = total_x - emit_x as f32;
+                        td.remainder_y = total_y - emit_y as f32;
+                        if emit_x != 0 || emit_y != 0 {
+                            out.push_back(LibinputEvent {
+                                event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_MOTION,
+                                payload: EventPayload::PointerMotion(PointerMotionEvent {
+                                    time_usec: ts_usec,
+                                    dx: f64::from(emit_x),
+                                    dy: f64::from(emit_y),
+                                    dx_unaccel: f64::from(td.current_dx as f32 * scale),
+                                    dy_unaccel: f64::from(td.current_dy as f32 * scale),
+                                }),
+                                context: ctx,
+                                device: lib_dev,
+                            });
+                        }
+                    }
+                    td.current_dx = 0;
+                    td.current_dy = 0;
+                    return;
+                }
+
+                let jump_distance_mm = touchpad_delta_mm(
+                    f64::from(td.current_dx),
+                    (*lib_dev).abs_x_resolution,
+                    x_range,
+                    (*lib_dev).width_mm,
+                )
+                .hypot(touchpad_delta_mm(
+                    f64::from(td.current_dy),
+                    (*lib_dev).abs_y_resolution,
+                    y_range,
+                    (*lib_dev).height_mm,
+                ));
+                if n_fingers == 1 && jump_distance_mm > 7.0 {
+                    // A one-frame displacement this large is a sensor slot
+                    // discontinuity, not plausible finger motion. Rebase at
+                    // the new position so the following small deltas remain
+                    // usable instead of propagating the jump. It is still
+                    // movement, so it must cancel the tap candidate rather
+                    // than generate a false click when the contact lifts.
+                    td.tap_emitted = true;
+                    td.current_dx = 0;
+                    td.current_dy = 0;
+                    td.remainder_x = 0.0;
+                    td.remainder_y = 0.0;
+                    td.finger_scroll_constraint.reset();
+                    return;
+                }
+
+                // BTN_TOOL_DOUBLETAP on a single-touch device describes an
+                // untrackable second contact. It cannot safely produce
+                // pointer motion from the one coordinate stream.
+                if !td.has_mt && td.touch_fingers >= 2 {
+                    td.current_dx = 0;
+                    td.current_dy = 0;
+                    td.remainder_x = 0.0;
+                    td.remainder_y = 0.0;
+                    td.finger_scroll_constraint.reset();
+                    return;
+                }
 
                 // A single-touch device has no MT slot path to exclude a
                 // typing/trackpoint palm from its accumulated absolute
@@ -8567,6 +10097,7 @@ impl BackendState {
                 {
                     td.drag_3fg_release_since = None;
                     td.drag_3fg_button_down = false;
+                    td.drag_3fg_resume_scroll_active = n_fingers == 2;
                     let seat_button_count = release_seat_button(lib_dev);
                     out.push_back(LibinputEvent {
                         event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
@@ -8767,10 +10298,9 @@ impl BackendState {
 
                 if n_fingers <= 1 {
                     let inactive_button_area_contact = button_areas
-                        && td
-                            .mt_slots
-                            .iter()
-                            .any(|slot| slot.active && slot.button_area_excluded);
+                        && td.mt_slots.iter().any(|slot| {
+                            slot.active && slot.button_area_excluded && !slot.click_pinned
+                        });
                     if !inactive_button_area_contact {
                         let total_x =
                             (td.current_dx as f32 * hw_scale) * cfg_accel + td.remainder_x;
@@ -8966,5 +10496,49 @@ mod tests {
             &active_slot(EdgeScrollState::Active),
             false
         ));
+    }
+
+    #[test]
+    fn button_lifecycle_recovers_from_a_lost_release() {
+        let mut held = Vec::new();
+
+        assert!(transition_button_state(&mut held, 0x110, true));
+        assert!(!transition_button_state(&mut held, 0x110, true));
+        assert_eq!(held, [0x110]);
+        assert!(transition_button_state(&mut held, 0x110, false));
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn button_lifecycle_rejects_unmatched_releases_and_balances_buttons() {
+        let mut held = Vec::new();
+
+        assert!(!transition_button_state(&mut held, 0x110, false));
+        assert!(transition_button_state(&mut held, 0x110, true));
+        assert!(transition_button_state(&mut held, 0x111, true));
+        assert!(!transition_button_state(&mut held, 0x111, true));
+        assert!(transition_button_state(&mut held, 0x110, false));
+        assert!(transition_button_state(&mut held, 0x111, false));
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn left_handed_mapping_preserves_clickfinger_logical_buttons() {
+        assert_eq!(
+            map_left_handed_button(KeyCode::BTN_LEFT.0, true, 2),
+            KeyCode::BTN_LEFT.0
+        );
+        assert_eq!(
+            map_left_handed_button(KeyCode::BTN_RIGHT.0, true, 2),
+            KeyCode::BTN_RIGHT.0
+        );
+        assert_eq!(
+            map_left_handed_button(KeyCode::BTN_LEFT.0, true, 1),
+            KeyCode::BTN_RIGHT.0
+        );
+        assert_eq!(
+            map_left_handed_button(KeyCode::BTN_RIGHT.0, true, 0),
+            KeyCode::BTN_LEFT.0
+        );
     }
 }

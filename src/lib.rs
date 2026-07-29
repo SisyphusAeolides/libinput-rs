@@ -7,9 +7,12 @@
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
 mod backend;
+pub mod evdev;
 mod ffi_types;
 mod quirks;
 mod udev;
+#[doc(hidden)]
+pub mod udev_callout;
 
 use crate::ffi_types::{
     BackendKind, EventPayload, LibinputContext, LibinputDevice, LibinputDeviceGroup, LibinputEvent,
@@ -20,7 +23,7 @@ use crate::ffi_types::{
 use std::ffi::CStr;
 use std::os::unix::io::RawFd;
 
-unsafe extern "C" {
+extern "C" {
     fn input_emit_log(
         handler: *mut libc::c_void,
         context: *mut libc::c_void,
@@ -689,11 +692,7 @@ pub unsafe extern "C" fn libinput_event_keyboard_get_seat_key_count(
         return 0;
     }
     if let EventPayload::KeyboardKey(e) = &(*event).payload {
-        if e.state >= 1 {
-            1
-        } else {
-            0
-        }
+        e.seat_key_count
     } else {
         0
     }
@@ -1244,11 +1243,7 @@ pub unsafe extern "C" fn libinput_device_config_tap_get_finger_count(
     if dev.is_null() {
         return 0;
     }
-    if (*dev).has_touch || (*dev).has_pointer {
-        3
-    } else {
-        0
-    }
+    (*dev).tap_finger_count
 }
 
 #[no_mangle]
@@ -1258,6 +1253,12 @@ pub unsafe extern "C" fn libinput_device_config_tap_set_enabled(
 ) -> u32 {
     if dev.is_null() {
         return 1;
+    }
+    if enabled > 1 {
+        return 2;
+    }
+    if (*dev).tap_finger_count == 0 {
+        return if enabled == 0 { 0 } else { 1 };
     }
     (*dev).tap_enabled = enabled != 0;
     0
@@ -1273,54 +1274,78 @@ pub unsafe extern "C" fn libinput_device_config_tap_get_enabled(dev: *const Libi
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_tap_get_default_enabled(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    0
+    if dev.is_null() {
+        return 0;
+    }
+    (*dev).tap_default_enabled as u32
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_tap_set_drag_enabled(
     dev: *mut LibinputDevice,
-    _e: u32,
+    enabled: u32,
 ) -> u32 {
     if dev.is_null() {
-        1
-    } else {
-        0
+        return 1;
     }
+    if enabled > 1 {
+        return 2;
+    }
+    if (*dev).tap_finger_count == 0 {
+        return if enabled == 0 { 0 } else { 1 };
+    }
+    (*dev).tap_drag_enabled = enabled != 0;
+    0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_tap_get_drag_enabled(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    1
+    if dev.is_null() {
+        return 0;
+    }
+    (*dev).tap_drag_enabled as u32
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_tap_get_default_drag_enabled(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    1
+    if dev.is_null() {
+        return 0;
+    }
+    ((*dev).tap_finger_count != 0) as u32
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_tap_set_drag_lock_enabled(
     dev: *mut LibinputDevice,
-    _e: u32,
+    enabled: u32,
 ) -> u32 {
     if dev.is_null() {
-        1
-    } else {
-        0
+        return 1;
     }
+    if enabled > 2 {
+        return 2;
+    }
+    if (*dev).tap_finger_count == 0 {
+        return if enabled == 0 { 0 } else { 1 };
+    }
+    (*dev).tap_drag_lock_enabled = if enabled == 1 { 1 } else { enabled };
+    0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_tap_get_drag_lock_enabled(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    0
+    if dev.is_null() {
+        return 0;
+    }
+    (*dev).tap_drag_lock_enabled
 }
 
 /// Button map: 0 = LRM (default), 1 = LMR
@@ -1330,6 +1355,12 @@ pub unsafe extern "C" fn libinput_device_config_tap_set_button_map(
     map: u32,
 ) -> u32 {
     if dev.is_null() {
+        return 1;
+    }
+    if map > 1 {
+        return 2;
+    }
+    if (*dev).tap_finger_count == 0 {
         return 1;
     }
     (*dev).tap_button_map = map;
@@ -2208,6 +2239,7 @@ pub unsafe extern "C" fn libinput_device_set_seat_logical_name(
                 user_data: std::ptr::null_mut(),
                 context: ctx,
                 button_count: std::sync::atomic::AtomicU32::new(0),
+                key_count: std::sync::atomic::AtomicU32::new(0),
             }));
             (*ctx).seats.push(seat);
             seat
@@ -2324,9 +2356,9 @@ pub unsafe extern "C" fn libinput_seat_get_user_data(
 #[no_mangle]
 pub unsafe extern "C" fn libinput_config_status_to_str(status: u32) -> *const libc::c_char {
     match status {
-        0 => c"success".as_ptr(),
-        1 => c"unsupported".as_ptr(),
-        2 => c"invalid".as_ptr(),
+        0 => b"success\0".as_ptr().cast(),
+        1 => b"unsupported\0".as_ptr().cast(),
+        2 => b"invalid\0".as_ptr().cast(),
         _ => std::ptr::null(),
     }
 }
@@ -2491,25 +2523,36 @@ pub unsafe extern "C" fn libinput_device_config_rotation_is_available(
     if dev.is_null() {
         return 0;
     }
-    (*dev).has_touch as libc::c_int
+    (*dev).rotation_available as libc::c_int
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_rotation_set_angle(
     dev: *mut LibinputDevice,
-    _degrees_cw: u32,
+    degrees_cw: u32,
 ) -> u32 {
     if dev.is_null() {
         return 1;
     }
+    if degrees_cw >= 360 {
+        return 2;
+    }
+    if !(*dev).rotation_available && degrees_cw != 0 {
+        return 1;
+    }
+    (*dev).rotation_angle = degrees_cw;
     0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_config_rotation_get_angle(
-    _dev: *const LibinputDevice,
+    dev: *const LibinputDevice,
 ) -> u32 {
-    0
+    if dev.is_null() {
+        0
+    } else {
+        (*dev).rotation_angle
+    }
 }
 
 #[no_mangle]
@@ -2696,7 +2739,10 @@ pub unsafe extern "C" fn libinput_device_keyboard_has_key(
     dev: *const LibinputDevice,
     key: u32,
 ) -> libc::c_int {
-    if dev.is_null() || !(*dev).has_keyboard || key > u16::MAX as u32 {
+    if dev.is_null() || !(*dev).has_keyboard {
+        return -1;
+    }
+    if key > u16::MAX as u32 {
         return 0;
     }
     (*dev).event_codes.contains(&(key as u16)) as libc::c_int
@@ -2727,12 +2773,21 @@ pub unsafe extern "C" fn libinput_device_pointer_has_button(
 #[no_mangle]
 pub unsafe extern "C" fn libinput_device_switch_has_switch(
     dev: *const LibinputDevice,
-    _sw: u32,
+    sw: u32,
 ) -> libc::c_int {
     if dev.is_null() {
         return 0;
     }
-    (*dev).has_switch as libc::c_int
+    if !(*dev).has_switch {
+        return 0;
+    }
+    let kernel_code = match sw {
+        1 => 0,
+        2 => 1,
+        3 => 10,
+        _ => return 0,
+    };
+    (*dev).switch_codes.contains(&kernel_code) as libc::c_int
 }
 
 #[no_mangle]

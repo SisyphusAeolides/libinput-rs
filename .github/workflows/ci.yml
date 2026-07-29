@@ -10,6 +10,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  msrv:
+    name: Rust 1.75
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+
+      - name: Install Rust 1.75
+        uses: dtolnay/rust-toolchain@1.75.0
+        with:
+          components: clippy
+
+      - name: Check minimum supported Rust version
+        run: cargo check --locked --workspace
+
+      - name: Lint with minimum supported Rust version
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Test with minimum supported Rust version
+        run: cargo test --locked --workspace
+
   rust-rpm:
     name: Rust and RPM
     runs-on: ubuntu-latest
@@ -38,9 +62,6 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
-      - name: Test restricted discovery
-        run: cargo test --locked --package libinput-rs-evdev
-
       - name: Test portable libinput implementation
         run: cargo test --locked --package libinput-rs
 
@@ -68,18 +89,8 @@ jobs:
       - name: Check package metadata
         run: cargo metadata --locked --offline --no-deps >/dev/null
 
-      - name: Package compatibility crate
-        run: cargo package --locked --no-verify --package libinput-rs-evdev
-
-      - name: Inspect compatibility crate contents
-        run: |
-          ! cargo package --locked --list --package libinput-rs-evdev \
-            | grep -Eq '/(vendor|\.cargo|rpmbuild)'
-
-      - name: Check main crate publication manifest
-        run: |
-          ! grep -q '^publish = false' Cargo.toml compat/evdev/Cargo.toml
-          grep -Eq '^evdev = \{ package = "libinput-rs-evdev", version = "0\.1\.0", path = "compat/evdev" \}$' Cargo.toml
+      - name: Check single-crate publication manifest
+        run: make crate-package-check main-crate-package-check
 
       - name: Verify ABI isolation
         run: |
@@ -107,30 +118,23 @@ jobs:
       - name: Locate binary RPMs
         run: |
           runtime=$(find "$RPM_TOPDIR/RPMS" -name 'libinput-rs-[0-9]*.rpm' -print -quit)
-          devel=$(find "$RPM_TOPDIR/RPMS" -name 'libinput-rs-devel-[0-9]*.rpm' -print -quit)
           test -n "$runtime"
-          test -n "$devel"
           echo "RPM_RUNTIME=$runtime" >> "$GITHUB_ENV"
-          echo "RPM_DEVEL=$devel" >> "$GITHUB_ENV"
 
       - name: Inspect RPM metadata
         run: |
-          for package in "$RPM_RUNTIME" "$RPM_DEVEL"; do
-            rpm -qpl "$package"
-            rpm -qp --provides "$package"
-            rpm -qp --obsoletes "$package"
-          done
+          rpm -qpl "$RPM_RUNTIME"
+          rpm -qp --provides "$RPM_RUNTIME"
+          rpm -qp --obsoletes "$RPM_RUNTIME"
 
       - name: Upload binary RPMs
         uses: actions/upload-artifact@v4
         with:
           name: libinput-rs-rpms
-          path: |
-            ${{ env.RPM_RUNTIME }}
-            ${{ env.RPM_DEVEL }}
+          path: ${{ env.RPM_RUNTIME }}
 
       - name: Verify RPM payloads
-        run: make rpm-devel-check RPM_RUNTIME="$RPM_RUNTIME" RPM_DEVEL="$RPM_DEVEL"
+        run: make rpm-package-check RPM_RUNTIME="$RPM_RUNTIME"
 
   rpm-lint:
     name: RPM lint

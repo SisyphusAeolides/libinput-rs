@@ -194,6 +194,7 @@ pub struct KeyboardKeyEvent {
     pub time_usec: u64,
     pub key: u32,
     pub state: u32,
+    pub seat_key_count: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -612,6 +613,7 @@ pub struct LibinputSeat {
     pub user_data: *mut libc::c_void,
     pub context: *mut LibinputContext,
     pub button_count: AtomicU32,
+    pub key_count: AtomicU32,
 }
 
 // ---------------------------------------------------------------------------
@@ -654,6 +656,7 @@ pub struct LibinputDevice {
     pub has_touch: bool,
     pub has_gesture: bool,
     pub has_switch: bool,
+    pub switch_codes: Vec<u16>,
     pub has_tablet: bool,
     pub has_tablet_pad: bool,
     pub tablet_pad_button_codes: Vec<u16>,
@@ -675,11 +678,17 @@ pub struct LibinputDevice {
     pub abs_y_resolution: Option<i32>,
     pub send_events_modes: u32,
     pub send_events_mode: u32,
+    pub tap_finger_count: i32,
     pub tap_enabled: bool,
+    pub tap_default_enabled: bool,
+    pub tap_drag_enabled: bool,
+    pub tap_drag_lock_enabled: u32,
     pub tap_button_map: u32, // 0=LRM 1=LMR
     pub natural_scroll: bool,
     pub accel_speed: f64,
     pub accel_profile: u32,
+    pub rotation_available: bool,
+    pub rotation_angle: u32,
     pub left_handed: bool,
     pub left_handed_available: bool,
     pub scroll_methods: u32,
@@ -751,6 +760,7 @@ impl LibinputDevice {
             has_touch: false,
             has_gesture: false,
             has_switch: false,
+            switch_codes: Vec::new(),
             has_tablet: false,
             has_tablet_pad: false,
             tablet_pad_button_codes: Vec::new(),
@@ -772,11 +782,17 @@ impl LibinputDevice {
             abs_y_resolution: None,
             send_events_modes: 1,
             send_events_mode: 0,
+            tap_finger_count: 0,
             tap_enabled: false,
+            tap_default_enabled: false,
+            tap_drag_enabled: false,
+            tap_drag_lock_enabled: 0,
             tap_button_map: 0,
             natural_scroll: false,
             accel_speed: 0.0,
             accel_profile: 2,
+            rotation_available: false,
+            rotation_angle: 0,
             left_handed: false,
             left_handed_available: false,
             scroll_methods: 0,
@@ -907,6 +923,7 @@ impl LibinputContext {
             user_data: std::ptr::null_mut(),
             context: std::ptr::null_mut(),
             button_count: AtomicU32::new(0),
+            key_count: AtomicU32::new(0),
         }));
         let backend = BackendState::new();
         let inotify_fd = backend.inotify_fd();

@@ -33,7 +33,11 @@ usage() {
 		'' \
 		'Build a temporary libinput 1.31.3 public-ABI test suite, mark tests that' \
 		'require upstream-private gesture-hold configuration as not applicable,' \
-		'and run the remaining suite serially against libinput-rs.'
+		'and run the remaining suite against libinput-rs.' \
+		'' \
+		'This suite creates many synthetic input devices. Run it from SSH or a' \
+		'text console with no active graphical session, and explicitly set' \
+		'LIBINPUT_RS_ALLOW_UINPUT_TESTS=1.'
 }
 
 if [[ ${1:-} == '--help' ]]; then
@@ -50,10 +54,12 @@ upstream_source=$(realpath "$1")
 template_build=$(realpath "$2")
 shift 2
 
+suite_jobs=${LIBINPUT_RS_SUITE_JOBS:-1}
+[[ $suite_jobs =~ ^[1-9][0-9]*$ ]] || die 'LIBINPUT_RS_SUITE_JOBS must be a positive integer'
 for argument in "$@"; do
 	case "$argument" in
 		--jobs|--jobs=*)
-			die 'the public-ABI suite is always serialized; omit --jobs'
+			die 'set LIBINPUT_RS_SUITE_JOBS instead of passing --jobs directly'
 			;;
 	esac
 done
@@ -62,9 +68,26 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 candidate=${LIBINPUT_RS_LIBRARY:-"$repo_root/target/release/libinput.so"}
 candidate=$(realpath "$candidate")
 
-for command in awk flock git grep meson mktemp ninja patch pgrep readelf realpath rm rsync sed sha256sum sort wc; do
+for command in awk flock git grep ldd loginctl meson mktemp ninja patch pgrep readelf realpath rm rsync sed sha256sum sort wc; do
 	command -v "$command" >/dev/null || die "required command not found: $command"
 done
+
+[[ ${LIBINPUT_RS_ALLOW_UINPUT_TESTS:-} == 1 ]] ||
+	die 'refusing to create synthetic input devices; set LIBINPUT_RS_ALLOW_UINPUT_TESTS=1 from a text console or SSH session'
+
+active_graphical_sessions=()
+while read -r session_id _; do
+	[[ -n ${session_id:-} ]] || continue
+	active=$(loginctl show-session "$session_id" -p Active --value 2>/dev/null || true)
+	type=$(loginctl show-session "$session_id" -p Type --value 2>/dev/null || true)
+	if [[ $active == yes && ( $type == wayland || $type == x11 ) ]]; then
+		active_graphical_sessions+=("$session_id:$type")
+	fi
+done < <(loginctl list-sessions --no-legend 2>/dev/null || true)
+
+if (( ${#active_graphical_sessions[@]} > 0 )); then
+	die "refusing to disrupt active graphical session(s): ${active_graphical_sessions[*]}"
+fi
 
 [[ -r "$candidate" ]] || die "candidate library is not readable: $candidate"
 [[ -r "$upstream_source/meson.build" ]] || die "not an upstream source directory: $upstream_source"
@@ -267,18 +290,39 @@ printf '%s\n' \
 	>&2
 
 CC=cc CXX=c++ meson setup "$build_copy" "$source_copy" "${meson_options[@]}"
-ninja -C "$build_copy" libinput-test-suite
+ninja -C "$build_copy" \
+	libinput-test-suite \
+	libinput-fuzz-extract \
+	libinput-fuzz-to-zero
 runner="$build_copy/libinput-test-suite"
 [[ -x "$runner" ]] || die "upstream test runner was not built: $runner"
+
+# Meson emits a legacy $ORIGIN DT_RPATH for the runner. That path takes
+# precedence over LD_LIBRARY_PATH, so point its build-tree SONAME link at the
+# candidate and verify resolution before executing any test.
+rm -f -- "$build_copy/libinput.so.10"
+ln -s "$candidate" "$build_copy/libinput.so.10"
+resolved_library=$(ldd "$runner" | awk '$1 == "libinput.so.10" { print $3 }')
+[[ -n "$resolved_library" ]] || die 'the upstream runner does not resolve libinput.so.10'
+resolved_library=$(realpath "$resolved_library")
+[[ "$resolved_library" == "$candidate" ]] ||
+	die "the upstream runner resolved $resolved_library instead of $candidate"
 
 ln -s "$candidate" "$library_dir/libinput.so.10"
 suite_is_running && die 'an upstream libinput test suite started while this runner was building'
 
-printf '%s\n' "running public-ABI upstream suite serially against $candidate" >&2
-suite_quirks_dir=${LIBINPUT_RS_PUBLIC_ABI_QUIRKS_DIR:-/usr/share/libinput}
+printf '%s\n' \
+	"running public-ABI upstream suite with $suite_jobs worker(s) against $candidate" \
+	>&2
+suite_quirks_dir=${LIBINPUT_RS_PUBLIC_ABI_QUIRKS_DIR:-$source_copy/quirks}
 suite_libinput_quirks_dir=${LIBINPUT_QUIRKS_DIR:-$suite_quirks_dir}
 suite_libinput_quirks_override="${suite_libinput_quirks_dir}"
-sudo -n env \
+privilege_prefix=()
+if (( EUID != 0 )); then
+	command -v sudo >/dev/null || die 'sudo is required when the suite is not run as root'
+	privilege_prefix=(sudo -n)
+fi
+"${privilege_prefix[@]}" env \
 		LD_LIBRARY_PATH="$library_dir" \
 		"LIBINPUT_QUIRKS_DIR=$suite_libinput_quirks_override" \
-		"$runner" --jobs 1 "$@"
+		"$runner" --jobs "$suite_jobs" "$@"

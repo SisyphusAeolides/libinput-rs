@@ -1,4 +1,4 @@
-.TH LIBINPUT-RS 8 "July 2026" "libinput-rs 0.2.1" "System Administration"
+.TH LIBINPUT-RS 8 "July 2026" "libinput-rs 0.3.0" "System Administration"
 .SH NAME
 libinput-rs \- libinput ABI replacement and touchpad companion
 .SH SYNOPSIS
@@ -6,16 +6,14 @@ libinput-rs \- libinput ABI replacement and touchpad companion
 .SH DESCRIPTION
 The
 .B libinput-rs
-runtime package installs a drop-in implementation of
+package installs a drop-in implementation of
 .IR libinput.so.10
 in the system library directory. Display managers, compositors, and other
 libinput clients use it after the dynamic linker cache is refreshed and the
 clients are restarted.
 .PP
-The
-.B libinput-rs-devel
-package installs the public header, unversioned linker name, and pkg-config
-metadata that replace the distribution's libinput development package.
+The same package installs the public header, unversioned linker name, and
+pkg-config metadata that replace the distribution's development package.
 .PP
 The
 .B libinput-rs
@@ -49,13 +47,13 @@ Replacement shared library on 64-bit Fedora systems.
 Runtime SONAME link.
 .TP
 .I /usr/lib64/libinput.so
-Development linker name supplied by libinput-rs-devel.
+Development linker name supplied by libinput-rs.
 .TP
 .I /usr/include/libinput.h
-C development header supplied by libinput-rs-devel.
+C development header supplied by libinput-rs.
 .TP
 .I /usr/lib64/pkgconfig/libinput.pc
-pkg-config metadata supplied by libinput-rs-devel on 64-bit Fedora systems.
+pkg-config metadata supplied by libinput-rs on 64-bit Fedora systems.
 .TP
 .I /etc/libinput-rs/config.json
 Companion-daemon configuration.
@@ -66,11 +64,11 @@ Companion service unit.
 .I /usr/lib/systemd/system-preset/90-libinput-rs.preset
 Vendor preset enabling the companion service on first installation.
 .SH INSTALLATION
-Perform replacement testing from a text console or SSH session. Install both
-replacement packages in one DNF transaction:
+Perform replacement testing from a text console or SSH session. Install the
+single replacement package:
 .PP
 .nf
-sudo dnf install libinput-rs libinput-rs-devel --allowerasing
+sudo dnf install libinput-rs --allowerasing
 sudo ldconfig
 sudo systemctl reboot
 .fi

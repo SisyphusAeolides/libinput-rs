@@ -2,13 +2,16 @@
 %global libinput_replace_before 1.32.0
 
 Name:           libinput-rs
-Version:        0.2.2
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        Rust drop-in replacement for libinput
 
 Provides:       libinput = %{libinput_compat_version}
 Provides:       libinput%{?_isa} = %{libinput_compat_version}
+Provides:       libinput-devel = %{libinput_compat_version}
+Provides:       libinput-devel%{?_isa} = %{libinput_compat_version}
 Obsoletes:      libinput < %{libinput_replace_before}
+Obsoletes:      libinput-devel < %{libinput_replace_before}
 
 License:        MIT AND Unicode-3.0
 URL:            https://github.com/SisyphusAeolides/libinput-rs
@@ -34,31 +37,27 @@ Requires:       systemd
 
 %description
 libinput-rs installs a Rust implementation of the libinput.so.10 ABI in the
-system library path. It also includes a fail-open touchpad companion daemon
-that is enabled by vendor preset on first installation.
-
-%package devel
-Summary:        Development files for the libinput-rs replacement
-Requires:       %{name}%{?_isa} = %{version}-%{release}
-Requires:       pkgconfig(libudev)
-Provides:       libinput-devel = %{libinput_compat_version}
-Provides:       libinput-devel%{?_isa} = %{libinput_compat_version}
-Obsoletes:      libinput-devel < %{libinput_replace_before}
-
-%description devel
-Headers, linker name, and pkg-config metadata for developing software against
-the libinput-rs implementation of the libinput ABI.
+system library path. The single package also includes the C development files
+and fail-open touchpad companion daemon, which is enabled by vendor preset on
+first installation.
 
 %prep
 %autosetup
 
 %build
 %set_build_flags
-CARGO_NET_OFFLINE=true CARGO_PROFILE_RELEASE_DEBUG=2 cargo build --frozen --release --bin libinput-rs %{cargo_features}
+CARGO_NET_OFFLINE=true CARGO_PROFILE_RELEASE_DEBUG=2 cargo build --frozen --release --bins %{cargo_features}
 CARGO_NET_OFFLINE=true CARGO_PROFILE_RELEASE_DEBUG=2 CARGO_FEATURES="%{cargo_features}" RPM_LD_FLAGS="%{build_ldflags}" ./build-shared.sh
 
 %install
 install -Dm755 target/release/libinput-rs %{buildroot}%{_bindir}/libinput-rs
+install -Dm755 target/release/libinput-device-group %{buildroot}%{_prefix}/lib/udev/libinput-device-group
+install -Dm755 target/release/libinput-fuzz-extract %{buildroot}%{_prefix}/lib/udev/libinput-fuzz-extract
+install -Dm755 target/release/libinput-fuzz-to-zero %{buildroot}%{_prefix}/lib/udev/libinput-fuzz-to-zero
+install -Dm644 packaging/80-libinput-device-groups.rules %{buildroot}%{_udevrulesdir}/80-libinput-device-groups.rules
+install -Dm644 packaging/90-libinput-fuzz-override.rules %{buildroot}%{_udevrulesdir}/90-libinput-fuzz-override.rules
+install -d %{buildroot}%{_datadir}/libinput
+install -m644 quirks/*.quirks %{buildroot}%{_datadir}/libinput/
 install -Dm644 src/config.json %{buildroot}%{_sysconfdir}/libinput-rs/config.json
 install -Dm644 systemd/libinput-rs.service %{buildroot}%{_unitdir}/libinput-rs.service
 install -Dm644 systemd/90-libinput-rs.preset %{buildroot}%{_presetdir}/90-libinput-rs.preset
@@ -100,20 +99,31 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 %license %{_licensedir}/%{name}/third-party
 %doc README.md
 %{_bindir}/libinput-rs
+%{_prefix}/lib/udev/libinput-device-group
+%{_prefix}/lib/udev/libinput-fuzz-extract
+%{_prefix}/lib/udev/libinput-fuzz-to-zero
+%{_udevrulesdir}/80-libinput-device-groups.rules
+%{_udevrulesdir}/90-libinput-fuzz-override.rules
+%{_datadir}/libinput/*.quirks
 %config(noreplace) %{_sysconfdir}/libinput-rs/config.json
 %{_unitdir}/libinput-rs.service
 %{_presetdir}/90-libinput-rs.preset
 %{_libdir}/libinput.so.10.13.0
 %{_libdir}/libinput.so.10
-%{_mandir}/man8/libinput-rs.8*
-
-%files devel
-%license LICENSE
 %{_libdir}/libinput.so
 %{_includedir}/libinput.h
 %{_libdir}/pkgconfig/libinput.pc
+%{_mandir}/man8/libinput-rs.8*
 
 %changelog
+* Tue Jul 28 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.3.0-1
+- Consolidate runtime, development files, and companion into one RPM
+- Embed permission-independent evdev discovery in the single source crate
+- Balance all touchpad button lifecycles and recover from lost releases
+- Restore udev integration and the hardware-quirks database in the replacement RPM
+- Prevent the upstream synthetic-device suite from running on graphical seats
+- Verify button invariants with Rust, Fortran, Idris 2, and Agda
+
 * Mon Jul 27 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.2.2-1
 - Prevent the companion daemon from consuming its own virtual pointer events
 - Preserve active touchpad gestures when disable-while-typing becomes active
