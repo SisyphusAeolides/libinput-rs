@@ -1,0 +1,23 @@
+.TH LIBINPUT-RS-CHWD 8 "July 2026" "libinput-rs 0.3.1"
+.SH NAME
+libinput-rs-chwd \- inspect deterministic input hardware profiles
+.SH SYNOPSIS
+.B libinput-rs-chwd
+.BR --auto | --list-profiles | --identify
+.I /dev/input/eventN
+.SH DESCRIPTION
+.B libinput-rs-chwd
+scans DMI, udev, sysfs, and evdev evidence and prints the profile that the
+libinput-rs backend would apply. Statistical scoring ranks only profiles whose
+hard match predicates already succeeded; it cannot create device capabilities
+or authorize an otherwise unmatched device.
+.SH OPTIONS
+.TP
+.B --auto
+Print planned profile selection for every readable event node.
+.TP
+.B --list-profiles
+List built-in profile identifiers and priorities.
+.TP
+.BI --identify " device"
+Print the planned profile for one event node.

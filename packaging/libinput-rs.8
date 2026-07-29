@@ -1,8 +1,9 @@
-.TH LIBINPUT-RS 8 "July 2026" "libinput-rs 0.3.0" "System Administration"
+.TH LIBINPUT-RS 8 "July 2026" "libinput-rs 0.3.1" "System Administration"
 .SH NAME
-libinput-rs \- libinput ABI replacement and touchpad companion
+libinput-rs \- Rust libinput ABI replacement
 .SH SYNOPSIS
 .B libinput-rs
+.RI [ command ]
 .SH DESCRIPTION
 The
 .B libinput-rs
@@ -15,29 +16,18 @@ clients are restarted.
 The same package installs the public header, unversioned linker name, and
 pkg-config metadata that replace the distribution's development package.
 .PP
-The
+The compatibility command
 .B libinput-rs
-service creates a uinput pointer before exclusively grabbing supported physical
-touchpads. Keyboards are observed without an exclusive grab for
-disable-while-typing behavior. If the output device cannot be created or event
-forwarding fails, the process exits and the kernel releases all grabs.
+invokes the installed
+.B libinput
+command-line interface. Input processing itself runs entirely inside the
+shared backend used by the compositor. No resident input companion or exclusive
+device grab is installed. Motion, scrolling, tapping, click mapping, and
+disable-while-typing use the standard libinput device configuration API.
 .PP
-A vendor preset enables the service on first installation so it starts on the
-next boot. An administrator's explicit enable or disable choice is preserved
-on package upgrades. The ABI replacement remains installed when the service is
-disabled.
-.SH CONFIGURATION
-Companion-daemon configuration is read from
-.IR /etc/libinput-rs/config.json .
-Touchpad pointer and two-finger scroll motion are normalized with the kernel-reported
-axis resolution. Devices without usable resolution metadata use a calibrated
-fallback. The
-.B pointer_acceleration
-field keeps the existing user-facing scale. Its live-tested neutral value is
-2.2; larger values are faster and smaller positive values are slower. The
-daemon divides the configured value by the 2.5 normalization reference so an
-existing 2.2 configuration preserves the same effective pointer travel after
-upgrade.
+An enabled, non-resident sleep unit invokes the guarded ELAN recovery command
+after resume on ThinkPad P53 systems. It exits without action on other systems
+and never opens or grabs an input event device.
 .SH FILES
 .TP
 .I /usr/lib64/libinput.so.10.13.0
@@ -55,14 +45,8 @@ C development header supplied by libinput-rs.
 .I /usr/lib64/pkgconfig/libinput.pc
 pkg-config metadata supplied by libinput-rs on 64-bit Fedora systems.
 .TP
-.I /etc/libinput-rs/config.json
-Companion-daemon configuration.
-.TP
-.I /usr/lib/systemd/system/libinput-rs.service
-Companion service unit.
-.TP
-.I /usr/lib/systemd/system-preset/90-libinput-rs.preset
-Vendor preset enabling the companion service on first installation.
+.I /usr/lib/systemd/system/libinput-rs-elan-resume.service
+P53-gated one-shot ELAN recovery after system resume.
 .SH INSTALLATION
 Perform replacement testing from a text console or SSH session. Install the
 single replacement package:
@@ -73,16 +57,10 @@ sudo ldconfig
 sudo systemctl reboot
 .fi
 .PP
-To disable only the companion daemon while retaining the ABI replacement:
-.PP
-.nf
-sudo systemctl disable --now libinput-rs.service
-.fi
 .SH ROLLBACK
 Restore Fedora's runtime and development packages in one transaction:
 .PP
 .nf
-sudo systemctl disable --now libinput-rs.service 2>/dev/null || true
 sudo dnf install libinput libinput-devel --allowerasing
 sudo ldconfig
 sudo systemctl reboot

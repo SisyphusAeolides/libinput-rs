@@ -4,39 +4,11 @@ soname = "libinput.so.10"
 public_symbols = 309
 version_nodes = 25
 
-[gates]
-symbol_versions = true
-soname = true
-deviceless = true
-device = true
-gestures = true
-keyboard = true
-log = true
-misc = true
-pad = true
-path = true
-plugins = true
-pointer = true
-quirks = true
-switch = true
-tablet = true
-tablet_eraser = true
-tablet_left_handed = true
-tablet_proximity = true
-tablet_tip = true
-totem = true
-touch = true
-touchpad = true
-touchpad_buttons = true
-touchpad_dwt = true
-touchpad_palm = true
-touchpad_tap = true
-touchpad_tap_drag = true
-touchpad_tap_palm = true
-trackball = true
-trackpoint = true
-udev = true
-valgrind = true
-display_managers = true
-rpm_transaction = true
+[evidence]
+producer = "scripts/run-upstream-public-abi-suite.sh"
+expected_completed = 23245
+required_result = "PASS"
+required_failures = 0
 
+# Pass/fail fields are deliberately absent. The producer writes a fresh,
+# candidate-hash-bound report after the complete pinned corpus exits cleanly.

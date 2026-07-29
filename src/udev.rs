@@ -64,17 +64,6 @@ impl Drop for UdevDevice {
     }
 }
 
-pub unsafe fn property_equals(device: *mut libc::c_void, key: &str, expected: &str) -> bool {
-    if device.is_null() {
-        return false;
-    }
-    let Ok(key) = CString::new(key) else {
-        return false;
-    };
-    let value = udev_device_get_property_value(device, key.as_ptr());
-    !value.is_null() && CStr::from_ptr(value).to_bytes() == expected.as_bytes()
-}
-
 pub unsafe fn property_value(device: *mut libc::c_void, key: &str) -> Option<String> {
     if device.is_null() {
         return None;

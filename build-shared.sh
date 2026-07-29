@@ -14,12 +14,16 @@ if [[ -n ${RPM_LD_FLAGS:-} ]]; then
 fi
 
 native_libraries=(-ludev)
+if nm -u target/release/libinput.a 2>/dev/null | rg '_gfortran_' >/dev/null; then
+  native_libraries+=(-lgfortran)
+fi
 if [[ ${CARGO_FEATURES:-} == *libwacom* ]]; then
   native_libraries+=(-lwacom)
 fi
 
 cc -shared \
   "${link_flags[@]}" \
+  -Wl,-z,defs \
   -Wl,--whole-archive target/release/libinput.a -Wl,--no-whole-archive \
   -Wl,--version-script=libinput.map \
   -Wl,-soname,libinput.so.10 \

@@ -57,11 +57,28 @@ udev_rules_dir="$udev_dir/rules.d"
 [[ -L "$runtime_link" && "$(readlink "$runtime_link")" == "libinput.so.10.13.0" ]]
 [[ -L "$development_link" && "$(readlink "$development_link")" == "libinput.so.10" ]]
 [[ -f "$header" && -f "$pc_file" ]]
+[[ -x "$stage/usr/bin/libinput" ]]
+[[ -x "$stage/usr/bin/libinput-rs-chwd" ]]
+[[ -L "$stage/usr/bin/libinput-rs" && "$(readlink "$stage/usr/bin/libinput-rs")" == "libinput" ]]
+[[ ! -e "$stage/usr/lib/systemd/system/libinput-rs.service" ]]
+[[ ! -e "$stage/usr/lib/systemd/system-preset/90-libinput-rs.preset" ]]
+[[ -f "$stage/usr/lib/systemd/system/libinput-rs-elan-resume.service" ]]
+[[ -f "$stage/usr/lib/systemd/system-preset/91-libinput-rs-elan.preset" ]]
+rg -F 'ExecStop=/usr/bin/libinput elan-recover --all --affected-only --quiet' \
+    "$stage/usr/lib/systemd/system/libinput-rs-elan-resume.service"
+[[ ! -e "$stage/etc/libinput-rs/config.json" ]]
+[[ -L "$stage/usr/libexec/libinput/libinput-debug-events" ]]
+[[ -L "$stage/usr/libexec/libinput/libinput-list-devices" ]]
+[[ "$(readlink "$stage/usr/libexec/libinput/libinput-debug-events")" == "../../bin/libinput" ]]
+[[ "$(readlink "$stage/usr/libexec/libinput/libinput-list-devices")" == "../../bin/libinput" ]]
 for helper in libinput-device-group libinput-fuzz-extract libinput-fuzz-to-zero; do
     [[ -x "$udev_dir/$helper" ]]
 done
 [[ -f "$udev_rules_dir/80-libinput-device-groups.rules" ]]
 [[ -f "$udev_rules_dir/90-libinput-fuzz-override.rules" ]]
+[[ -f "$udev_rules_dir/90-libinput-rs-elantech-crc.rules" ]]
+rg -F 'ATTR{firmware_id}=="PNP: LEN0408 PNP0f13"' \
+    "$udev_rules_dir/90-libinput-rs-elantech-crc.rules"
 [[ -f "$stage/usr/share/libinput/10-generic-keyboard.quirks" ]]
 [[ -f "$stage/usr/share/libinput/30-vendor-elantech.quirks" ]]
 
@@ -86,15 +103,30 @@ for installed_path in \
     "$libdir/libinput.so" \
     "$includedir/libinput.h" \
     "$libdir/pkgconfig/libinput.pc" \
+    /usr/bin/libinput \
+    /usr/bin/libinput-rs \
+    /usr/bin/libinput-rs-chwd \
+    /usr/libexec/libinput/libinput-debug-events \
+    /usr/libexec/libinput/libinput-list-devices \
     /usr/lib/udev/libinput-device-group \
     /usr/lib/udev/libinput-fuzz-extract \
     /usr/lib/udev/libinput-fuzz-to-zero \
     /usr/lib/udev/rules.d/80-libinput-device-groups.rules \
     /usr/lib/udev/rules.d/90-libinput-fuzz-override.rules \
+    /usr/lib/udev/rules.d/90-libinput-rs-elantech-crc.rules \
+    /usr/lib/systemd/system/libinput-rs-elan-resume.service \
+    /usr/lib/systemd/system-preset/91-libinput-rs-elan.preset \
     /usr/share/libinput/10-generic-keyboard.quirks \
     /usr/share/libinput/30-vendor-elantech.quirks; do
     rpm -qpl "$package" | rg -Fx "$installed_path"
 done
+
+"$stage/usr/bin/libinput" --version | rg '^libinput 1\.31\.3 \(libinput-rs\)$'
+"$stage/usr/bin/libinput" --help | rg 'list-devices'
+"$stage/usr/bin/libinput" elan-recover --help | rg '^Usage: libinput elan-recover'
+"$stage/usr/bin/libinput-rs-chwd" --list-profiles | rg '^thinkpad-p53-elan'
+"$stage/usr/libexec/libinput/libinput-debug-events" --help | rg '^Usage: libinput debug-events'
+"$stage/usr/libexec/libinput/libinput-list-devices" --help | rg '^Usage: libinput list-devices'
 
 pkg_config=(
     env

@@ -7,9 +7,17 @@
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
 mod backend;
+pub mod capforge;
+pub mod chwd_input;
+#[doc(hidden)]
+pub mod elan_recover;
 pub mod evdev;
+mod evtrans;
 mod ffi_types;
+mod hwdetect;
+mod motion;
 mod quirks;
+mod tpad;
 mod udev;
 #[doc(hidden)]
 pub mod udev_callout;
@@ -54,7 +62,25 @@ unsafe fn populate_events(ctx: *mut LibinputContext) {
     if let Ok(mut backend) = ctx_ref.backend.lock() {
         backend.drain_into_queue(ctx, &mut tmp);
     }
-    ctx_ref.event_queue.extend(tmp);
+    enqueue_events(ctx, tmp);
+}
+
+unsafe fn enqueue_event(ctx: *mut LibinputContext, event: LibinputEvent) {
+    if !event.device.is_null()
+        && event.event_type != LibinputEventType::LIBINPUT_EVENT_DEVICE_REMOVED
+    {
+        libinput_device_ref(event.device);
+    }
+    (*ctx).event_queue.push_back(event);
+}
+
+unsafe fn enqueue_events(
+    ctx: *mut LibinputContext,
+    events: impl IntoIterator<Item = LibinputEvent>,
+) {
+    for event in events {
+        enqueue_event(ctx, event);
+    }
 }
 
 pub(crate) unsafe fn emit_debug_log(ctx: *mut LibinputContext, message: &str) {
@@ -192,12 +218,13 @@ pub unsafe extern "C" fn libinput_udev_assign_seat(
         (*(*ctx).seat).physical_name = cname;
     }
     (*ctx).seat_assigned = true;
+    (*ctx).plugins_loaded = true;
     let mut tmp: Vec<LibinputEvent> = Vec::new();
     if let Ok(mut backend) = (*ctx).backend.lock() {
         backend.scan_and_open(ctx, &mut tmp);
     }
     for ev in tmp {
-        (*ctx).event_queue.push_back(ev);
+        enqueue_event(ctx, ev);
     }
     0
 }
@@ -222,6 +249,7 @@ pub unsafe extern "C" fn libinput_path_add_device(
         return std::ptr::null_mut();
     }
     let devnode = path.to_string_lossy().into_owned();
+    (*ctx).plugins_loaded = true;
     let p = std::path::PathBuf::from(&devnode);
     use std::os::unix::fs::FileTypeExt;
     if !p
@@ -237,7 +265,7 @@ pub unsafe extern "C" fn libinput_path_add_device(
         backend.try_open(ctx, &p, &mut tmp);
     }
     for ev in tmp {
-        (*ctx).event_queue.push_back(ev);
+        enqueue_event(ctx, ev);
     }
     if (*ctx).devices.len() == old_len + 1 {
         if let Ok(mut backend) = (*ctx).backend.lock() {
@@ -270,7 +298,7 @@ pub unsafe extern "C" fn libinput_path_remove_device(dev: *mut LibinputDevice) {
     };
     if removed {
         (*ctx).devices.retain(|candidate| *candidate != dev);
-        (*ctx).event_queue.extend(events);
+        enqueue_events(ctx, events);
         libinput_device_unref(dev);
     }
 }
@@ -329,7 +357,8 @@ pub unsafe extern "C" fn libinput_next_event_type(ctx: *mut LibinputContext) -> 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_destroy(event: *mut LibinputEvent) {
     if !event.is_null() {
-        drop(Box::from_raw(event));
+        let mut event = Box::from_raw(event);
+        event.release_queued_device_ref();
     }
 }
 
@@ -988,7 +1017,7 @@ pub unsafe extern "C" fn libinput_event_gesture_get_dx_unaccelerated(
         return 0.0;
     }
     match &(*event).payload {
-        EventPayload::GestureSwipeUpdate(e) | EventPayload::GesturePinchUpdate(e) => e.dx / 1.2,
+        EventPayload::GestureSwipeUpdate(e) | EventPayload::GesturePinchUpdate(e) => e.dx_unaccel,
         _ => 0.0,
     }
 }
@@ -1001,7 +1030,7 @@ pub unsafe extern "C" fn libinput_event_gesture_get_dy_unaccelerated(
         return 0.0;
     }
     match &(*event).payload {
-        EventPayload::GestureSwipeUpdate(e) | EventPayload::GesturePinchUpdate(e) => e.dy / 1.2,
+        EventPayload::GestureSwipeUpdate(e) | EventPayload::GesturePinchUpdate(e) => e.dy_unaccel,
         _ => 0.0,
     }
 }
@@ -1438,20 +1467,22 @@ pub unsafe extern "C" fn libinput_config_accel_create(profile: u32) -> *mut libc
     if !matches!(profile, 1 | 2 | 4) {
         return std::ptr::null_mut();
     }
-    Box::into_raw(Box::new(profile)) as *mut libc::c_void
+    Box::into_raw(Box::new(crate::ffi_types::AccelConfig::new(profile))) as *mut libc::c_void
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_config_accel_destroy(accel_config: *mut libc::c_void) {
     if !accel_config.is_null() {
-        drop(Box::from_raw(accel_config as *mut u32));
+        drop(Box::from_raw(
+            accel_config as *mut crate::ffi_types::AccelConfig,
+        ));
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_config_accel_set_points(
     accel_config: *mut libc::c_void,
-    _accel_type: u32,
+    accel_type: u32,
     step: f64,
     npoints: libc::size_t,
     points: *const f64,
@@ -1460,17 +1491,28 @@ pub unsafe extern "C" fn libinput_config_accel_set_points(
         || points.is_null()
         || !step.is_finite()
         || step <= 0.0
-        || step >= 1e10
-        || npoints == 0
+        || step > 10_000.0
+        || !(2..=64).contains(&npoints)
     {
+        return 2;
+    }
+    let config = &mut *(accel_config as *mut crate::ffi_types::AccelConfig);
+    if config.profile != 4 || !matches!(accel_type, 0..=2) {
         return 2;
     }
     let points = std::slice::from_raw_parts(points, npoints);
     if points
         .iter()
-        .any(|point| !point.is_finite() || *point < 0.0 || *point >= 1e10)
+        .any(|point| !point.is_finite() || *point < 0.0 || *point > 10_000.0)
     {
         return 2;
+    }
+    let curve = crate::ffi_types::AccelCurve::new(step, points.to_vec());
+    match accel_type {
+        0 => config.fallback = Some(curve),
+        1 => config.motion = Some(curve),
+        2 => config.scroll = Some(curve),
+        _ => unreachable!(),
     }
     0
 }
@@ -1486,12 +1528,14 @@ pub unsafe extern "C" fn libinput_device_config_accel_apply(
     if !(*dev).accel_available {
         return 1;
     }
-    let profile = *(accel_config as *const u32);
+    let config = &*(accel_config as *const crate::ffi_types::AccelConfig);
+    let profile = config.profile;
     if profile & libinput_device_config_accel_get_profiles(dev) == 0 {
         return 1;
     }
     (*dev).accel_profile = profile;
     (*dev).accel_speed = 0.0;
+    (*dev).accel_custom = (profile == 4).then(|| config.clone());
     0
 }
 
@@ -1569,6 +1613,11 @@ pub unsafe extern "C" fn libinput_device_config_accel_set_profile(
         return 1;
     }
     (*dev).accel_profile = profile;
+    (*dev).accel_custom = if profile == 4 {
+        Some(crate::ffi_types::AccelConfig::new(profile))
+    } else {
+        None
+    };
     0
 }
 
@@ -1728,7 +1777,7 @@ pub unsafe extern "C" fn libinput_device_config_scroll_set_method(
         if let Ok(mut backend) = (*ctx).backend.try_lock() {
             backend.stop_scroll_for_device(ctx, dev, &mut events);
         }
-        (*ctx).event_queue.extend(events);
+        enqueue_events(ctx, events);
     }
     (*dev).scroll_method = method;
     0
@@ -2238,8 +2287,8 @@ pub unsafe extern "C" fn libinput_device_set_seat_logical_name(
                 refcount: std::sync::atomic::AtomicI32::new(1),
                 user_data: std::ptr::null_mut(),
                 context: ctx,
-                button_count: std::sync::atomic::AtomicU32::new(0),
-                key_count: std::sync::atomic::AtomicU32::new(0),
+                button_counts: std::sync::Mutex::new(crate::evtrans::empty_seat_code_counts()),
+                key_counts: std::sync::Mutex::new(crate::evtrans::empty_seat_code_counts()),
             }));
             (*ctx).seats.push(seat);
             seat
@@ -2266,10 +2315,15 @@ pub unsafe extern "C" fn libinput_device_set_seat_logical_name(
     }
     (*ctx).devices.retain(|candidate| *candidate != dev);
     libinput_device_unref(dev);
-    (*replacement).seat = new_seat;
-    (*ctx).event_queue.extend(removed);
-    (*ctx).event_queue.extend(added);
-    (*replacement).abi.seat = new_seat;
+    let old_seat = (*replacement).seat;
+    if old_seat != new_seat {
+        libinput_seat_ref(new_seat.cast());
+        (*replacement).seat = new_seat;
+        (*replacement).abi.seat = new_seat;
+        libinput_seat_unref(old_seat.cast());
+    }
+    enqueue_events(ctx, removed);
+    enqueue_events(ctx, added);
     (*ctx).signal_fd();
     0
 }
@@ -2316,17 +2370,20 @@ pub unsafe extern "C" fn libinput_seat_ref(seat: *mut libc::c_void) -> *mut libc
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_seat_unref(seat: *mut libc::c_void) -> *mut libc::c_void {
-    if !seat.is_null() {
-        let seat = seat as *mut LibinputSeat;
-        if (*seat)
-            .refcount
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
-            == 1
-        {
-            drop(Box::from_raw(seat));
-        }
+    if seat.is_null() {
+        return std::ptr::null_mut();
     }
-    std::ptr::null_mut()
+    let seat = seat as *mut LibinputSeat;
+    if (*seat)
+        .refcount
+        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+        == 1
+    {
+        drop(Box::from_raw(seat));
+        std::ptr::null_mut()
+    } else {
+        seat.cast()
+    }
 }
 
 #[no_mangle]
@@ -2598,14 +2655,16 @@ pub unsafe extern "C" fn libinput_device_config_send_events_set_mode(
     let previous = (*dev).send_events_mode;
     let next = if mode & 1 != 0 { 1 } else { mode };
     (*dev).send_events_mode = next;
-    if previous != 1 && next == 1 {
+    if previous != next && matches!(next, 1 | 2) {
         let ctx = (*dev).context;
         if !ctx.is_null() {
             let mut events = std::collections::VecDeque::new();
             if let Ok(mut backend) = (*ctx).backend.lock() {
-                backend.release_active_inputs(ctx, dev, &mut events);
+                if next == 1 || backend.has_external_mouse() {
+                    backend.release_active_inputs(ctx, dev, &mut events);
+                }
             }
-            (*ctx).event_queue.extend(events);
+            enqueue_events(ctx, events);
         }
     }
     0
@@ -2749,11 +2808,14 @@ pub unsafe extern "C" fn libinput_device_keyboard_has_key(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_device_led_update(dev: *mut LibinputDevice, _leds: u32) -> u32 {
-    if dev.is_null() {
-        return 1;
+pub unsafe extern "C" fn libinput_device_led_update(dev: *mut LibinputDevice, leds: u32) {
+    if dev.is_null() || (*dev).context.is_null() {
+        return;
     }
-    0
+    let ctx = (*dev).context;
+    if let Ok(mut backend) = (*ctx).backend.lock() {
+        backend.update_leds(dev, leds);
+    }
 }
 
 #[no_mangle]
@@ -3650,20 +3712,59 @@ pub unsafe extern "C" fn libinput_event_tablet_tool_size_minor_has_changed(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_plugin_system_append_default_paths(_ctx: *mut LibinputContext) {}
+pub unsafe extern "C" fn libinput_plugin_system_append_default_paths(ctx: *mut LibinputContext) {
+    if ctx.is_null() || (*ctx).plugins_loaded {
+        return;
+    }
+    for path in ["/etc/libinput/plugins", "/usr/lib64/libinput/plugins"] {
+        let path = std::ffi::CString::new(path).expect("static plugin path");
+        if !(*ctx)
+            .plugin_paths
+            .iter()
+            .any(|candidate| candidate.as_bytes() == path.as_bytes())
+        {
+            (*ctx).plugin_paths.push(path);
+        }
+    }
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_plugin_system_append_path(
-    _ctx: *mut LibinputContext,
-    _path: *const libc::c_char,
+    ctx: *mut LibinputContext,
+    path: *const libc::c_char,
 ) {
+    if ctx.is_null() || path.is_null() || (*ctx).plugins_loaded {
+        return;
+    }
+    let path = CStr::from_ptr(path);
+    if path.to_bytes().is_empty()
+        || (*ctx)
+            .plugin_paths
+            .iter()
+            .any(|candidate| candidate.as_bytes() == path.to_bytes())
+    {
+        return;
+    }
+    if let Ok(path) = std::ffi::CString::new(path.to_bytes()) {
+        (*ctx).plugin_paths.push(path);
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_plugin_system_load_plugins(
-    _ctx: *mut LibinputContext,
-    _flags: libc::c_uint,
+    ctx: *mut LibinputContext,
+    flags: libc::c_uint,
 ) -> libc::c_int {
+    if ctx.is_null() || flags != 0 {
+        return -libc::EINVAL;
+    }
+    if (*ctx).plugins_loaded {
+        return 0;
+    }
+    // Built-in stages are always active, but this build has no Lua plugin
+    // loader. Match an upstream build configured without plugin support:
+    // freeze the plugin system and report ENOSYS instead of claiming success.
+    (*ctx).plugins_loaded = true;
     -libc::ENOSYS
 }
 
@@ -3768,16 +3869,17 @@ pub unsafe extern "C" fn libinput_tablet_pad_mode_group_unref(
     if group.is_null() {
         return std::ptr::null_mut();
     }
-    let group_ref = &*group.cast::<LibinputTabletPadModeGroup>();
-    let current = group_ref
+    let group = group.cast::<LibinputTabletPadModeGroup>();
+    if (*group)
         .refcount
-        .load(std::sync::atomic::Ordering::Relaxed);
-    if current > 1 {
-        group_ref
-            .refcount
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+        == 1
+    {
+        drop(Box::from_raw(group));
+        std::ptr::null_mut()
+    } else {
+        group.cast()
     }
-    group
 }
 
 #[no_mangle]
@@ -4120,6 +4222,10 @@ pub unsafe extern "C" fn libinput_tablet_tool_unref(tool: *mut libc::c_void) -> 
         .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
         == 1
     {
+        if !(*tablet_tool).device.is_null() {
+            libinput_device_unref((*tablet_tool).device);
+            (*tablet_tool).device = std::ptr::null_mut();
+        }
         drop(Box::from_raw(tablet_tool));
         std::ptr::null_mut()
     } else {
@@ -4140,7 +4246,7 @@ pub unsafe extern "C" fn libinput_suspend(ctx: *mut LibinputContext) {
     if let Ok(mut backend) = (*ctx).backend.lock() {
         backend.suspend(ctx, &mut events);
     }
-    (*ctx).event_queue.extend(events);
+    enqueue_events(ctx, events);
 }
 
 #[no_mangle]
@@ -4154,7 +4260,7 @@ pub unsafe extern "C" fn libinput_resume(ctx: *mut LibinputContext) -> libc::c_i
     } else {
         return -1;
     };
-    (*ctx).event_queue.extend(events);
+    enqueue_events(ctx, events);
     if !(*ctx).event_queue.is_empty() {
         (*ctx).signal_fd();
     }
@@ -4223,6 +4329,235 @@ mod tests {
         unsafe {
             libinput_suspend(std::ptr::null_mut());
             assert_eq!(libinput_resume(std::ptr::null_mut()), -1);
+        }
+    }
+
+    #[test]
+    fn shared_device_groups_preserve_identity_and_user_data() {
+        unsafe {
+            let first = Box::new(LibinputDevice::new(
+                "first",
+                "/dev/input/event0",
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ));
+            let group = first.group;
+            let mut second = Box::new(LibinputDevice::new(
+                "second",
+                "/dev/input/event1",
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ));
+            second.share_group(group);
+
+            assert_eq!(second.group, group);
+            assert_eq!(second.abi.group, group);
+            assert_eq!(
+                (*group).refcount.load(std::sync::atomic::Ordering::Relaxed),
+                2
+            );
+            let marker = 0x5ausize as *mut libc::c_void;
+            libinput_device_group_set_user_data(group.cast(), marker);
+            assert_eq!(
+                libinput_device_group_get_user_data(second.group.cast()),
+                marker
+            );
+
+            drop(second);
+            assert_eq!(
+                (*group).refcount.load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+            drop(first);
+        }
+    }
+
+    #[test]
+    fn custom_acceleration_validates_and_copies_curves() {
+        unsafe {
+            assert!(libinput_config_accel_create(0).is_null());
+            let config = libinput_config_accel_create(4);
+            assert!(!config.is_null());
+
+            let one_point = [1.0];
+            assert_eq!(
+                libinput_config_accel_set_points(config, 1, 1.0, 1, one_point.as_ptr()),
+                2
+            );
+            let points = [0.0, 2.0, 6.0];
+            assert_eq!(
+                libinput_config_accel_set_points(config, 1, 1.0, points.len(), points.as_ptr()),
+                0
+            );
+            let scroll_points = [0.0, 3.0, 9.0];
+            assert_eq!(
+                libinput_config_accel_set_points(
+                    config,
+                    2,
+                    1.0,
+                    scroll_points.len(),
+                    scroll_points.as_ptr(),
+                ),
+                0
+            );
+
+            let mut device = Box::new(LibinputDevice::new(
+                "pointer",
+                "/dev/input/event0",
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ));
+            device.accel_available = true;
+            assert_eq!(libinput_device_config_accel_apply(&mut *device, config), 0);
+            libinput_config_accel_destroy(config);
+
+            let custom = device.accel_custom.as_mut().expect("custom config copied");
+            let curve = custom.curve_mut(1).expect("motion curve copied");
+            assert_eq!(curve.points, points);
+            assert!((curve.factor(7.0, 0.0, 7_000) - 2.0).abs() < 1e-9);
+            let scroll_curve = custom.curve_mut(2).expect("scroll curve copied");
+            assert_eq!(scroll_curve.points, scroll_points);
+            assert!((scroll_curve.factor(7.0, 0.0, 7_000) - 3.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn custom_acceleration_uses_fallback_and_extrapolates() {
+        let mut config = crate::ffi_types::AccelConfig::new(4);
+        config.fallback = Some(crate::ffi_types::AccelCurve::new(1.0, vec![0.0, 1.0]));
+        let curve = config.curve_mut(1).expect("fallback curve");
+        assert!((curve.factor(14.0, 0.0, 7_000) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn plugin_paths_are_ordered_unique_and_frozen_after_load() {
+        unsafe {
+            let ctx = libinput_path_create_context(&INTERFACE, std::ptr::null_mut());
+            let custom = std::ffi::CString::new("/tmp/plugins").unwrap();
+            libinput_plugin_system_append_path(ctx, custom.as_ptr());
+            libinput_plugin_system_append_path(ctx, custom.as_ptr());
+            libinput_plugin_system_append_default_paths(ctx);
+            assert_eq!((*ctx).plugin_paths.len(), 3);
+            assert_eq!((&(*ctx).plugin_paths)[0].as_bytes(), b"/tmp/plugins");
+            assert_eq!(libinput_plugin_system_load_plugins(ctx, 0), -libc::ENOSYS);
+            libinput_plugin_system_append_path(
+                ctx,
+                std::ffi::CString::new("/ignored").unwrap().as_ptr(),
+            );
+            assert_eq!((*ctx).plugin_paths.len(), 3);
+            assert_eq!(libinput_plugin_system_load_plugins(ctx, 0), 0);
+            libinput_unref(ctx);
+        }
+    }
+
+    #[test]
+    fn queued_events_retain_devices_until_event_destroy() {
+        unsafe {
+            let ctx = libinput_path_create_context(&INTERFACE, std::ptr::null_mut());
+            let device = Box::into_raw(Box::new(LibinputDevice::new(
+                "keyboard",
+                "/dev/input/event0",
+                std::ptr::null_mut(),
+                ctx,
+            )));
+            enqueue_event(
+                ctx,
+                LibinputEvent {
+                    event_type: LibinputEventType::LIBINPUT_EVENT_KEYBOARD_KEY,
+                    payload: EventPayload::KeyboardKey(crate::ffi_types::KeyboardKeyEvent {
+                        time_usec: 1,
+                        key: 30,
+                        state: 1,
+                        seat_key_count: 1,
+                    }),
+                    context: ctx,
+                    device,
+                },
+            );
+            assert_eq!(
+                (*device).refcount.load(std::sync::atomic::Ordering::SeqCst),
+                2
+            );
+            let event = libinput_get_event(ctx);
+            assert_eq!(libinput_event_get_device(event), device);
+            libinput_event_destroy(event);
+            assert_eq!(
+                (*device).refcount.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert!(libinput_device_unref(device).is_null());
+            libinput_unref(ctx);
+        }
+    }
+
+    #[test]
+    fn ref_and_unref_return_the_upstream_object_lifecycle() {
+        unsafe {
+            let seat = Box::into_raw(Box::new(LibinputSeat {
+                physical_name: std::ffi::CString::new("seat0").unwrap(),
+                logical_name: std::ffi::CString::new("default").unwrap(),
+                refcount: std::sync::atomic::AtomicI32::new(1),
+                user_data: std::ptr::null_mut(),
+                context: std::ptr::null_mut(),
+                button_counts: std::sync::Mutex::new(crate::evtrans::empty_seat_code_counts()),
+                key_counts: std::sync::Mutex::new(crate::evtrans::empty_seat_code_counts()),
+            }));
+            assert_eq!(libinput_seat_ref(seat.cast()), seat.cast());
+            assert_eq!(libinput_seat_unref(seat.cast()), seat.cast());
+            assert!(libinput_seat_unref(seat.cast()).is_null());
+
+            let group = Box::into_raw(Box::new(LibinputTabletPadModeGroup {
+                refcount: std::sync::atomic::AtomicI32::new(1),
+                user_data: std::ptr::null_mut(),
+                device: std::ptr::null_mut(),
+                index: 0,
+                num_modes: 1,
+                current_mode: 0,
+                num_buttons: 0,
+                num_dials: 0,
+                num_rings: 0,
+                num_strips: 0,
+            }));
+            assert_eq!(
+                libinput_tablet_pad_mode_group_ref(group.cast()),
+                group.cast()
+            );
+            assert_eq!(
+                libinput_tablet_pad_mode_group_unref(group.cast()),
+                group.cast()
+            );
+            assert!(libinput_tablet_pad_mode_group_unref(group.cast()).is_null());
+        }
+    }
+
+    #[test]
+    fn devices_retain_their_seat_until_device_destruction() {
+        unsafe {
+            let seat = Box::into_raw(Box::new(LibinputSeat {
+                physical_name: std::ffi::CString::new("seat0").unwrap(),
+                logical_name: std::ffi::CString::new("default").unwrap(),
+                refcount: std::sync::atomic::AtomicI32::new(1),
+                user_data: std::ptr::null_mut(),
+                context: std::ptr::null_mut(),
+                button_counts: std::sync::Mutex::new(crate::evtrans::empty_seat_code_counts()),
+                key_counts: std::sync::Mutex::new(crate::evtrans::empty_seat_code_counts()),
+            }));
+            let device = Box::into_raw(Box::new(LibinputDevice::new(
+                "keyboard",
+                "/dev/input/event0",
+                seat,
+                std::ptr::null_mut(),
+            )));
+            assert_eq!(
+                (*seat).refcount.load(std::sync::atomic::Ordering::SeqCst),
+                2
+            );
+            assert!(libinput_device_unref(device).is_null());
+            assert_eq!(
+                (*seat).refcount.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert!(libinput_seat_unref(seat.cast()).is_null());
         }
     }
 }

@@ -1,7 +1,5 @@
 PREFIX ?= /usr
 LIBDIR ?= $(PREFIX)/lib64
-UNITDIR ?= $(PREFIX)/lib/systemd/system
-PRESETDIR ?= $(PREFIX)/lib/systemd/system-preset
 DESTDIR ?=
 FC = gfortran
 REFERENCE_LIBINPUT ?= /usr/lib64/libinput.so.10
@@ -27,24 +25,32 @@ check: packaging-check
 	cargo fmt --all -- --check
 
 packaging-check:
-	grep -Eq '^Before=.*display-manager|^DefaultDependencies=no|^Restart=always' systemd/libinput-rs.service
-	grep -qx 'enable libinput-rs.service' systemd/90-libinput-rs.preset
 	grep -Eq '^Provides: *libinput( |%)' libinput-rs.spec
 	grep -Eq '^Obsoletes: *libinput ' libinput-rs.spec
 	grep -Eq '^Provides: *libinput-devel( |%)' libinput-rs.spec
 	grep -Eq '^Obsoletes: *libinput-devel ' libinput-rs.spec
 	! grep -q '^%package devel' libinput-rs.spec
 	! grep -q '^%files devel' libinput-rs.spec
-	grep -q '%{_presetdir}/90-libinput-rs.preset' libinput-rs.spec
+	! test -e systemd/libinput-rs.service
+	! test -e systemd/90-libinput-rs.preset
+	test -f systemd/libinput-rs-elan-resume.service
+	test -f systemd/91-libinput-rs-elan.preset
 	grep -q '%{_libdir}/libinput.so.10.13.0' libinput-rs.spec
 	grep -q '%{_libdir}/libinput.so.10' libinput-rs.spec
 	grep -q '%{_includedir}/libinput.h' libinput-rs.spec
 	grep -q '%{_libdir}/pkgconfig/libinput.pc' libinput-rs.spec
 	grep -q '%{_prefix}/lib/udev/libinput-fuzz-to-zero' libinput-rs.spec
 	grep -q '%{_udevrulesdir}/90-libinput-fuzz-override.rules' libinput-rs.spec
+	grep -q '%{_udevrulesdir}/90-libinput-rs-elantech-crc.rules' libinput-rs.spec
+	grep -q '%{_unitdir}/libinput-rs-elan-resume.service' libinput-rs.spec
+	grep -q '%{_presetdir}/91-libinput-rs-elan.preset' libinput-rs.spec
 	grep -q '%{_datadir}/libinput/\*.quirks' libinput-rs.spec
+	grep -q '%{_bindir}/libinput' libinput-rs.spec
+	grep -q '%{_bindir}/libinput-rs-chwd' libinput-rs.spec
+	grep -q '%{_libexecdir}/libinput/libinput-debug-events' libinput-rs.spec
 	grep -Eq '^install .*%\{_libdir\}/libinput\.so\.10' libinput-rs.spec
-	! grep -Eq '^BuildRequires: *(Agda|idris2|gcc-gfortran)' libinput-rs.spec
+	! grep -Eq '^BuildRequires: *(Agda|idris2)' libinput-rs.spec
+	grep -Eq '^BuildRequires: *gcc-gfortran' libinput-rs.spec
 	grep -Fq 'default = []' Cargo.toml
 	grep -Fq 'libwacom = []' Cargo.toml
 	grep -Fq '#[cfg(feature = "libwacom")]' src/backend.rs
@@ -98,10 +104,14 @@ proofs:
 	cd proofs/agda && agda FailOpen.agda
 	cd proofs/agda && agda ResourceLifecycle.agda
 	cd proofs/agda && agda RestrictedDiscovery.agda
+	cd proofs/agda && agda --safe HwDetect.agda
+	cd proofs/agda && agda --safe ProfileSelection.agda
 	cd proofs/idris && idris2 --check ButtonLifecycle.idr
 	cd proofs/idris && idris2 --check FailOpen.idr
 	cd proofs/idris && idris2 --check ResourceLifecycle.idr
 	cd proofs/idris && idris2 --check RestrictedDiscovery.idr
+	cd proofs/idris && idris2 --check HwSpec.idr
+	cd proofs/idris && idris2 --check ProfileSelection.idr
 	mkdir -p proofs/fortran/build
 	$(FC) -std=f2018 -Wall -Wextra -Werror -fcheck=all \
 		-J proofs/fortran/build -o proofs/fortran/build/fail-open \
@@ -127,17 +137,22 @@ proofs-strict:
 	$(MAKE) proofs FC="$(FC)"
 
 install: all
-	install -Dm755 target/release/libinput-rs $(DESTDIR)$(PREFIX)/bin/libinput-rs
+	install -Dm755 target/release/libinput $(DESTDIR)$(PREFIX)/bin/libinput
+	ln -sf libinput $(DESTDIR)$(PREFIX)/bin/libinput-rs
+	install -Dm755 target/release/libinput-rs-chwd $(DESTDIR)$(PREFIX)/bin/libinput-rs-chwd
+	install -d $(DESTDIR)$(PREFIX)/libexec/libinput
+	ln -sf ../../bin/libinput $(DESTDIR)$(PREFIX)/libexec/libinput/libinput-debug-events
+	ln -sf ../../bin/libinput $(DESTDIR)$(PREFIX)/libexec/libinput/libinput-list-devices
 	install -Dm755 target/release/libinput-device-group $(DESTDIR)$(PREFIX)/lib/udev/libinput-device-group
 	install -Dm755 target/release/libinput-fuzz-extract $(DESTDIR)$(PREFIX)/lib/udev/libinput-fuzz-extract
 	install -Dm755 target/release/libinput-fuzz-to-zero $(DESTDIR)$(PREFIX)/lib/udev/libinput-fuzz-to-zero
 	install -Dm644 packaging/80-libinput-device-groups.rules $(DESTDIR)$(PREFIX)/lib/udev/rules.d/80-libinput-device-groups.rules
 	install -Dm644 packaging/90-libinput-fuzz-override.rules $(DESTDIR)$(PREFIX)/lib/udev/rules.d/90-libinput-fuzz-override.rules
+	install -Dm644 packaging/90-libinput-rs-elantech-crc.rules $(DESTDIR)$(PREFIX)/lib/udev/rules.d/90-libinput-rs-elantech-crc.rules
+	install -Dm644 systemd/libinput-rs-elan-resume.service $(DESTDIR)$(PREFIX)/lib/systemd/system/libinput-rs-elan-resume.service
+	install -Dm644 systemd/91-libinput-rs-elan.preset $(DESTDIR)$(PREFIX)/lib/systemd/system-preset/91-libinput-rs-elan.preset
 	install -d $(DESTDIR)$(PREFIX)/share/libinput
 	install -m644 quirks/*.quirks $(DESTDIR)$(PREFIX)/share/libinput/
-	install -Dm644 src/config.json $(DESTDIR)/etc/libinput-rs/config.json
-	install -Dm644 systemd/libinput-rs.service $(DESTDIR)$(UNITDIR)/libinput-rs.service
-	install -Dm644 systemd/90-libinput-rs.preset $(DESTDIR)$(PRESETDIR)/90-libinput-rs.preset
 	install -Dm755 target/release/libinput.so $(DESTDIR)$(LIBDIR)/libinput.so.10.13.0
 	ln -sf libinput.so.10.13.0 $(DESTDIR)$(LIBDIR)/libinput.so.10
 	ln -sf libinput.so.10 $(DESTDIR)$(LIBDIR)/libinput.so
@@ -145,3 +160,8 @@ install: all
 	install -d $(DESTDIR)$(LIBDIR)/pkgconfig
 	sed 's|@LIBDIR@|$(LIBDIR)|g' packaging/libinput-rs.pc.in > $(DESTDIR)$(LIBDIR)/pkgconfig/libinput.pc
 	install -Dm644 packaging/libinput-rs.8 $(DESTDIR)$(PREFIX)/share/man/man8/libinput-rs.8
+	install -Dm644 packaging/libinput-rs-chwd.8 $(DESTDIR)$(PREFIX)/share/man/man8/libinput-rs-chwd.8
+	install -Dm644 packaging/libinput.1 $(DESTDIR)$(PREFIX)/share/man/man1/libinput.1
+	ln -sf libinput.1 $(DESTDIR)$(PREFIX)/share/man/man1/libinput-debug-events.1
+	ln -sf libinput.1 $(DESTDIR)$(PREFIX)/share/man/man1/libinput-list-devices.1
+	install -Dm644 packaging/_libinput $(DESTDIR)$(PREFIX)/share/zsh/site-functions/_libinput

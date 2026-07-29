@@ -136,6 +136,70 @@ jobs:
       - name: Verify RPM payloads
         run: make rpm-package-check RPM_RUNTIME="$RPM_RUNTIME"
 
+  upstream-behavior:
+    name: Upstream behavioral parity
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native and test dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          build-essential gfortran git meson ninja-build patch rsync
+          libcheck-dev libevdev-dev libmtdev-dev libudev-dev libwacom-dev
+          python3-libevdev python3-pytest python3-yaml
+
+      - name: Install Rust 1.75
+        uses: dtolnay/rust-toolchain@1.75.0
+
+      - name: Run keyboard and ownership regressions
+        run: |
+          cargo test --locked keyboard_chords_keep_independent_per_code_state
+          cargo test --locked duplicate_keyboards_count_the_same_key_per_device
+          cargo test --locked simultaneous_mouse_buttons_are_independent
+          cargo test --locked mixed_nodes_keep_keyboard_and_button_ranges_separate
+          cargo test --locked upstream_speed_curves_preserve_default_and_nonzero_minimum
+          cargo test --locked tap_button_map_changes_two_and_three_finger_buttons
+          cargo test --locked queued_events_retain_devices_until_event_destroy
+
+      - name: Build replacement library
+        run: make shared
+
+      - name: Check out pinned upstream test corpus
+        run: |
+          git init "$RUNNER_TEMP/libinput-upstream"
+          git -C "$RUNNER_TEMP/libinput-upstream" remote add origin https://gitlab.freedesktop.org/libinput/libinput.git
+          git -C "$RUNNER_TEMP/libinput-upstream" fetch --depth=1 origin 26191d396d74d505541d6311f0b4ae68d791b890
+          git -C "$RUNNER_TEMP/libinput-upstream" checkout --detach FETCH_HEAD
+          meson setup "$RUNNER_TEMP/libinput-upstream-build" "$RUNNER_TEMP/libinput-upstream" \
+            -Dtests=true -Ddocumentation=false -Ddebug-gui=false -Dlibwacom=false
+
+      - name: Gate pinned upstream quirk semantics
+        env:
+          LIBINPUT_RS_QUIRKS_CHECK_DIR: ${{ runner.temp }}/libinput-upstream/quirks
+        run: >-
+          cargo test --locked --lib
+          quirks::tests::quirk_database_fields_have_runtime_semantics -- --exact
+
+      - name: Run compositor-facing upstream suite
+        env:
+          LIBINPUT_RS_ALLOW_UINPUT_TESTS: "1"
+          LIBINPUT_RS_SUITE_JOBS: "8"
+          LIBINPUT_RS_PARITY_REPORT: ${{ runner.temp }}/libinput-rs-parity.toml
+        run: |
+          sudo modprobe uinput
+          test -c /dev/uinput
+          scripts/run-upstream-public-abi-suite.sh \
+            "$RUNNER_TEMP/libinput-upstream" \
+            "$RUNNER_TEMP/libinput-upstream-build"
+
+      - name: Upload test-derived parity evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: libinput-rs-parity
+          path: ${{ runner.temp }}/libinput-rs-parity.toml
+
   rpm-lint:
     name: RPM lint
     needs: rust-rpm

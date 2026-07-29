@@ -11,7 +11,14 @@ make proofs-strict
 make shared
 make abi-check
 make crate-package-check
+make packaging-check
 ```
+
+Run the pinned upstream public-ABI behavioral suite from the release test VM
+with `LIBINPUT_RS_PARITY_REPORT` set. An unfiltered release run must report all
+23,245 pinned cases, zero failures, and a passing status. Keep the generated
+candidate-hash-bound report with the CI artifacts; a focused or shortened run
+is not release evidence.
 
 The release version must match in `Cargo.toml`, `Cargo.lock`, and
 `libinput-rs.spec`.
@@ -23,10 +30,9 @@ rpmdev-setuptree
 make srpm
 ```
 
-The resulting file is written below `$HOME/rpmbuild/SRPMS/`. The 0.3.0 RPM
-release installs a vendor preset that enables `libinput-rs.service` on first
-installation; explicit administrator enable and disable choices remain
-preserved during upgrades.
+The resulting file is written below `$HOME/rpmbuild/SRPMS/`. The 0.3.1 RPM
+contains one shared input engine and no resident input companion. Its P53-only
+ELAN resume recovery is a root one-shot that never opens or grabs evdev nodes.
 
 ## Publish to COPR
 
@@ -55,24 +61,25 @@ copr-cli create libinput-rs \
   --chroot rhel-9-x86_64 \
   --chroot rhel-10-x86_64 \
   --description "Rust drop-in replacement for libinput" \
-  --instructions "Install from a text console or SSH-capable system. The companion daemon is enabled automatically on first installation and can be disabled with systemctl disable --now libinput-rs.service."
+  --instructions "Install from a text console or SSH-capable system. The ABI replacement is active after clients restart."
 ```
 
 Submit the source RPM:
 
 ```bash
-copr-cli build libinput-rs "$HOME/rpmbuild/SRPMS/libinput-rs-0.3.0-1.fc45.src.rpm"
+copr-cli build libinput-rs "$HOME/rpmbuild/SRPMS/libinput-rs-0.3.1-1.fc45.src.rpm"
 ```
 
-Formal proof compilers are verified separately in Fedora CI and are not COPR
-build dependencies. Fedora RPMs enable the optional libwacom integration.
-EPEL and RHEL RPMs use the portable fallback and do not require libwacom.
+Agda and Idris 2 are verified separately in Fedora CI and are not COPR build
+dependencies. GNU Fortran is an RPM build dependency for the native capability
+bitmap kernel. Fedora RPMs enable the optional libwacom integration; EPEL and
+RHEL RPMs use the portable fallback and do not require libwacom.
 
-After the build succeeds, verify that the runtime RPM contains
-`/usr/lib/systemd/system-preset/90-libinput-rs.preset`, the three callouts below
-`/usr/lib/udev/`, both libinput udev rule files, and the quirks database below
-`/usr/share/libinput/`. Then test installation, boot-time service activation,
-and rollback from COPR before announcing the repository.
+After the build succeeds, verify that the runtime RPM contains the three
+callouts below `/usr/lib/udev/`, all libinput udev rule files, and the quirks
+database below `/usr/share/libinput/`. Confirm that it contains no resident
+input companion and that the ELAN recovery unit is DMI-gated, then test
+installation and rollback from COPR before announcing the repository.
 
 ## Publish to crates.io
 
@@ -99,6 +106,6 @@ install the single RPM from COPR.
 After both publication paths succeed:
 
 ```bash
-git tag -s v0.3.0 -m "libinput-rs 0.3.0"
-git push origin v0.3.0
+git tag -s v0.3.1 -m "libinput-rs 0.3.1"
+git push origin v0.3.1
 ```

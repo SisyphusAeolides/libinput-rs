@@ -1,0 +1,2 @@
+# Preserve packet integrity on the ThinkPad Elantech v4 PS/2 controller.
+ACTION=="add|change", SUBSYSTEM=="serio", DRIVER=="psmouse", ATTR{firmware_id}=="PNP: LEN0408 PNP0f13", TEST=="crc_enabled", ATTR{crc_enabled}="1"

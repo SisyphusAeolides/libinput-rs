@@ -55,6 +55,7 @@ template_build=$(realpath "$2")
 shift 2
 
 suite_jobs=${LIBINPUT_RS_SUITE_JOBS:-1}
+suite_arguments=("$@")
 [[ $suite_jobs =~ ^[1-9][0-9]*$ ]] || die 'LIBINPUT_RS_SUITE_JOBS must be a positive integer'
 for argument in "$@"; do
 	case "$argument" in
@@ -68,7 +69,7 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 candidate=${LIBINPUT_RS_LIBRARY:-"$repo_root/target/release/libinput.so"}
 candidate=$(realpath "$candidate")
 
-for command in awk flock git grep ldd loginctl meson mktemp ninja patch pgrep readelf realpath rm rsync sed sha256sum sort wc; do
+for command in awk flock git grep ldd loginctl meson mktemp ninja patch pgrep readelf realpath rm rsync sed sha256sum sort tee wc; do
 	command -v "$command" >/dev/null || die "required command not found: $command"
 done
 
@@ -322,7 +323,58 @@ if (( EUID != 0 )); then
 	command -v sudo >/dev/null || die 'sudo is required when the suite is not run as root'
 	privilege_prefix=(sudo -n)
 fi
+raw_report="$workdir/upstream-suite.yaml"
+set +e
 "${privilege_prefix[@]}" env \
 		LD_LIBRARY_PATH="$library_dir" \
 		"LIBINPUT_QUIRKS_DIR=$suite_libinput_quirks_override" \
-		"$runner" --jobs "$suite_jobs" "$@"
+		"$runner" --jobs "$suite_jobs" "${suite_arguments[@]}" 2>&1 | tee "$raw_report"
+runner_status=${PIPESTATUS[0]}
+set -e
+(( runner_status == 0 )) || exit "$runner_status"
+
+summary_value() {
+	local key=$1
+	awk -v key="$key" '
+		{ gsub(/\r/, "") }
+		$1 == "summary:" { in_summary = 1; next }
+		in_summary && $1 == (key ":") { value = $2 }
+		END { print value }
+	' "$raw_report"
+}
+
+completed=$(summary_value completed)
+passed=$(summary_value pass)
+not_applicable=$(summary_value na)
+failed=$(summary_value fail)
+skipped=$(summary_value skip)
+result=$(summary_value status)
+[[ $completed =~ ^[0-9]+$ && $passed =~ ^[0-9]+$ && $not_applicable =~ ^[0-9]+$ ]] ||
+	die 'upstream suite did not emit a complete numeric summary'
+[[ $failed == 0 && $skipped =~ ^[0-9]+$ && $result == PASS ]] ||
+	die "upstream suite summary is not passing: fail=$failed skip=$skipped status=$result"
+(( passed > 0 )) || die 'upstream suite reported no passing tests'
+
+# An unfiltered parity run must cover the exact pinned corpus. This prevents a
+# shortened or accidentally filtered run from creating release evidence.
+if (( ${#suite_arguments[@]} == 0 )); then
+	[[ $completed == 23245 ]] ||
+		die "pinned upstream corpus size changed: expected 23245, completed $completed"
+fi
+
+if [[ -n ${LIBINPUT_RS_PARITY_REPORT:-} ]]; then
+	report_parent=$(dirname -- "$LIBINPUT_RS_PARITY_REPORT")
+	mkdir -p -- "$report_parent"
+	candidate_sha256=$(sha256sum "$candidate" | awk '{print $1}')
+	cat > "$LIBINPUT_RS_PARITY_REPORT" <<EOF
+target_version = "1.31.3"
+target_commit = "$expected_upstream_commit"
+candidate_sha256 = "$candidate_sha256"
+completed = $completed
+pass = $passed
+not_applicable = $not_applicable
+fail = $failed
+skip = $skipped
+result = "$result"
+EOF
+fi

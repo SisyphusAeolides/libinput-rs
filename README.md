@@ -1,12 +1,10 @@
 # libinput-rs
 
-`libinput-rs` is a Rust input project that provides:
-
-- an optional touchpad companion daemon using evdev and uinput;
-- a 100% drop-in replacement implementation of the `libinput.so.10` C ABI.
+`libinput-rs` is a Rust implementation of the `libinput.so.10` C ABI and
+command-line tools.
 
 One RPM replaces both the distribution's `libinput` and `libinput-devel`
-packages. It includes the runtime, development files, and companion daemon;
+packages. It includes the runtime, development files, and diagnostic tools;
 display managers and compositors use the replacement after they restart. The
 same RPM also supplies the device-group and axis-fuzz udev callouts and rules
 normally installed with libinput, so replacing the distribution package does
@@ -20,8 +18,10 @@ Fedora rawhide, EPEL 9, EPEL 10, RHEL 9, and RHEL 10 on x86_64. Fedora RPMs
 enable optional libwacom tablet metadata integration. EPEL and RHEL builds use
 conservative kernel, evdev, and udev fallbacks and do not require libwacom.
 
-Formal Agda, Idris 2, and Fortran models are verified in Fedora CI and are not
-runtime or RPM build dependencies.
+Agda and Idris 2 proofs are verified in Fedora CI and are not runtime or RPM
+build dependencies. GNU Fortran compiles the capability bitmap kernel during
+the RPM build; the packaged library therefore depends on the standard
+libgfortran runtime.
 
 ## Install from COPR
 
@@ -36,29 +36,15 @@ sudo ldconfig
 sudo systemctl reboot
 ```
 
-The RPM ships a vendor preset that enables `libinput-rs.service` on
-first installation. The daemon starts automatically on the next boot. An
-administrator's explicit enable or disable choice is preserved during package
-upgrades.
-
-After boot, verify the service:
-
-```bash
-systemctl is-enabled libinput-rs.service
-systemctl is-active libinput-rs.service
-systemctl status libinput-rs.service
-```
-
-To opt out of the companion daemon without changing the ABI replacement:
-
-```bash
-sudo systemctl disable --now libinput-rs.service
-```
+There is no resident companion service. Resolution-aware motion, scrolling,
+tapping, click mapping, and disable-while-typing run in the shared backend used
+by the compositor. This avoids a second process exclusively grabbing a
+mixed-capability device and prevents two independent input state machines from
+competing.
 
 To restore the distribution's original runtime and development packages:
 
 ```bash
-sudo systemctl disable --now libinput-rs.service 2>/dev/null || true
 sudo dnf install libinput libinput-devel --allowerasing
 sudo ldconfig
 sudo systemctl reboot
@@ -73,27 +59,15 @@ make check
 make test
 ```
 
-The daemon is built at `target/release/libinput-rs`. The ABI library is built
-at `target/release/libinput.so`.
+The command-line tools are built under `target/release/`. The ABI library is
+built at `target/release/libinput.so`.
 
-## Configuration
+### Elantech transport recovery
 
-The daemon reads `/etc/libinput-rs/config.json`:
-
-```json
-{
-  "tap_to_click": true,
-  "natural_scrolling": true,
-  "pointer_acceleration": 2.2,
-  "disable_while_typing": true
-}
-```
-
-### Elantech SMBus stalls
-
-Some systems expose an Elantech touchpad first through PS/2 and then replace
-it with an SMBus companion. If pointer input periodically stops at the kernel
-device layer, keep the stable PS/2 path by adding this kernel argument:
+Elantech v4 controllers may expose a touchpad through PS/2 and SMBus. Keep the
+kernel's automatic transport selection unless the journal specifically shows a
+failed SMBus handoff. On a machine where SMBus probing itself is the failure,
+the PS/2 path can be forced with:
 
 ```bash
 sudo grubby --update-kernel=ALL --args=psmouse.elantech_smbus=0
@@ -103,16 +77,23 @@ sudo reboot
 Confirm the workaround after reboot with
 `cat /sys/module/psmouse/parameters/elantech_smbus`; it should print `0`.
 
-The companion normalizes touchpad movement and two-finger scrolling using the
-kernel-reported axis resolution. When a device omits resolution metadata, it
-uses a live-tested calibrated fallback. `pointer_acceleration` keeps the
-existing user-facing scale: `2.2` is the live-tested neutral value, larger
-values are faster, and smaller positive values are slower.
+ThinkPad P53 systems exposing the affected `LEN0408` Elantech v4 controller
+should not force SMBus off. The RPM installs a narrowly matched udev rule that
+keeps the PS/2 driver's packet CRC validation enabled as a fallback across boot
+and hotplug. This rejects corrupted combined TrackPoint, button, and touchpad
+packets before they reach userspace.
 
-The normalized motion base corresponds to the previous `2.5` reference, so the
-daemon divides the configured value by `2.5` internally. This preserves the
-exact effective pointer travel of existing configurations across the 0.2.1
-upgrade. For the shipped default, `0.45 × (2.2 / 2.5) = 0.18 × 2.2 = 0.396`.
+The P53's I2C controller can also remain enumerated while silently ceasing to
+deliver kernel events. `sudo libinput elan-recover` safely discovers only
+devices already bound to `elan_i2c`, unbinds and rebinds each controller, and
+waits for its evdev nodes to return. The RPM enables a non-resident systemd
+sleep unit that runs this recovery after resume only when DMI identifies a
+ThinkPad P53. It does not open or grab input devices and exits immediately.
+
+The shared backend normalizes touchpad movement with the kernel-reported axis
+resolution while preserving libinput's separate accelerated and unaccelerated
+coordinate channels. Runtime settings use the standard libinput configuration
+API, so existing compositor and desktop preferences continue to apply.
 
 ## Drop-in replacement
 
@@ -124,6 +105,41 @@ The udev backend enumerates `/dev/input/event*` by directory entry and delegates
 the first device open to the compositor's `open_restricted` callback. This keeps
 startup discovery compatible with logind-managed permissions where the
 compositor can list device nodes but cannot open them directly.
+
+Discovery is fused in `src/hwdetect.rs`: a raw post-udev netlink socket,
+inotify, periodic reconciliation, and direct reads of the udev property
+database identify candidates without opening them. After restricted-open
+succeeds, ioctl capabilities and sysfs bitmap fallbacks are combined by the
+Fortran `capforge` kernel. Rust and Fortran share classifier regression vectors.
+`src/evtrans.rs` centralizes mixed KEY/BTN routing, per-code seat counts, and
+exactly-once button transitions while libevdev retains packet framing and
+SYN_DROPPED recovery.
+
+### Quirk and hardware-profile resolution
+
+Each context loads one lexically ordered snapshot of the installed quirks
+tree. A device probe contains its kernel identity and raw udev roles. Matching
+sections produce one immutable applied-quirks object; `AttrEventCode` and
+`AttrInputProp` mutations then feed the only runtime classifier. The resulting
+object is retained by the tracked device and seeds motion, click, palm, thumb,
+tablet, switch, and integration behavior before `DEVICE_ADDED` is queued.
+Unknown required fields fail the parity gate. A local `AttrDeviceClass` hint is
+accepted only when the kernel capability lattice supports that class, so a
+profile cannot fabricate input capabilities.
+
+The chwd-style inspection tool shows the deterministic hardware profile plan:
+
+```bash
+libinput-rs-chwd --auto
+libinput-rs-chwd --list-profiles
+libinput-rs-chwd --identify /dev/input/event6
+```
+
+Hard DMI, identity, udev, and capability predicates take precedence. The
+Fortran k-nearest-neighbor and tiny-MLP scorers rank equally eligible profiles
+and may label an otherwise unmatched device only when their result agrees with
+the deterministic capability class. Statistical scoring never adds a kernel
+capability or overrides a hard profile.
 
 ## Formal safety models
 
@@ -138,6 +154,10 @@ under `proofs/`:
 - Fortran provides independently compiled executable reference models for
   fail-open grabbing, permission-independent discovery, exactly-once descriptor
   closure, udev-only hotplug, and balanced physical-button lifecycles.
+
+`HwDetect.agda` additionally proves the device lifecycle and capability-lattice
+join laws. `HwSpec.idr` makes hardware classification total and keeps ignored
+or unclassifiable devices out of the live registry by type.
 
 Agda, Idris 2, and GNU Fortran are available through DNF on the Fedora CI
 target:

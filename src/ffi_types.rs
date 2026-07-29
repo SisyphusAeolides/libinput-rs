@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -212,6 +212,8 @@ pub struct GestureEvent {
     pub finger_count: i32,
     pub dx: f64,
     pub dy: f64,
+    pub dx_unaccel: f64,
+    pub dy_unaccel: f64,
     pub scale: f64,
     pub angle: f64,
     pub cancelled: bool,
@@ -576,16 +578,37 @@ pub struct LibinputEvent {
     pub device: *mut LibinputDevice,
 }
 
+impl LibinputEvent {
+    /// Release the device reference acquired when this event entered the
+    /// public context queue. Events assembled transiently inside the backend
+    /// have not acquired that reference yet.
+    pub unsafe fn release_queued_device_ref(&mut self) {
+        if self.device.is_null() {
+            return;
+        }
+        crate::libinput_device_unref(self.device);
+        self.device = std::ptr::null_mut();
+    }
+}
+
 impl Drop for LibinputEvent {
     fn drop(&mut self) {
         if let EventPayload::TabletTool(event) = &mut self.payload {
             if !event.tool.is_null() {
                 unsafe {
-                    if (*event.tool).refcount.fetch_sub(1, Ordering::AcqRel) == 1 {
-                        drop(Box::from_raw(event.tool));
-                    }
+                    crate::libinput_tablet_tool_unref(event.tool.cast());
                 }
                 event.tool = std::ptr::null_mut();
+            }
+        }
+        if self.event_type != LibinputEventType::LIBINPUT_EVENT_TABLET_PAD_KEY {
+            if let EventPayload::TabletPad(event) = &mut self.payload {
+                if !event.mode_group.is_null() {
+                    unsafe {
+                        crate::libinput_tablet_pad_mode_group_unref(event.mode_group.cast());
+                    }
+                    event.mode_group = std::ptr::null_mut();
+                }
             }
         }
         if self.event_type != LibinputEventType::LIBINPUT_EVENT_DEVICE_REMOVED
@@ -594,11 +617,8 @@ impl Drop for LibinputEvent {
             return;
         }
         unsafe {
-            if (*self.device).refcount.fetch_sub(1, Ordering::AcqRel) == 1 {
-                drop(Box::from_raw(self.device));
-            }
+            self.release_queued_device_ref();
         }
-        self.device = std::ptr::null_mut();
     }
 }
 
@@ -612,8 +632,8 @@ pub struct LibinputSeat {
     pub refcount: AtomicI32,
     pub user_data: *mut libc::c_void,
     pub context: *mut LibinputContext,
-    pub button_count: AtomicU32,
-    pub key_count: AtomicU32,
+    pub button_counts: Mutex<crate::evtrans::SeatCodeCounts>,
+    pub key_counts: Mutex<crate::evtrans::SeatCodeCounts>,
 }
 
 // ---------------------------------------------------------------------------
@@ -623,6 +643,77 @@ pub struct LibinputSeat {
 pub struct LibinputDeviceGroup {
     pub refcount: AtomicI32,
     pub user_data: *mut libc::c_void,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccelCurve {
+    pub step: f64,
+    pub points: Vec<f64>,
+    pub last_time_usec: u64,
+    pub last_delta_usec: u64,
+}
+
+impl AccelCurve {
+    pub fn new(step: f64, points: Vec<f64>) -> Self {
+        Self {
+            step,
+            points,
+            last_time_usec: 0,
+            last_delta_usec: 7_000,
+        }
+    }
+
+    pub fn factor(&mut self, dx: f64, dy: f64, time_usec: u64) -> f64 {
+        let mut delta_usec = if time_usec > self.last_time_usec {
+            time_usec - self.last_time_usec
+        } else {
+            self.last_delta_usec
+        };
+        if delta_usec > 1_000_000 {
+            delta_usec = 7_000;
+        }
+        self.last_time_usec = time_usec;
+        self.last_delta_usec = delta_usec;
+
+        let speed_in = dx.hypot(dy) / (delta_usec as f64 / 1_000.0);
+        if speed_in == 0.0 {
+            return 1.0;
+        }
+        let index = ((speed_in / self.step) as usize).min(self.points.len() - 2);
+        let x0 = self.step * index as f64;
+        let y0 = self.points[index];
+        let y1 = self.points[index + 1];
+        let speed_out = y0 + (y1 - y0) * ((speed_in - x0) / self.step);
+        speed_out / speed_in
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccelConfig {
+    pub profile: u32,
+    pub fallback: Option<AccelCurve>,
+    pub motion: Option<AccelCurve>,
+    pub scroll: Option<AccelCurve>,
+}
+
+impl AccelConfig {
+    pub fn new(profile: u32) -> Self {
+        Self {
+            profile,
+            fallback: (profile == 4).then(|| AccelCurve::new(1.0, vec![0.0, 1.0])),
+            motion: None,
+            scroll: None,
+        }
+    }
+
+    pub fn curve_mut(&mut self, accel_type: u32) -> Option<&mut AccelCurve> {
+        match accel_type {
+            0 => self.fallback.as_mut(),
+            1 => self.motion.as_mut().or(self.fallback.as_mut()),
+            2 => self.scroll.as_mut().or(self.fallback.as_mut()),
+            _ => None,
+        }
+    }
 }
 
 unsafe impl Send for LibinputDeviceGroup {}
@@ -687,6 +778,7 @@ pub struct LibinputDevice {
     pub natural_scroll: bool,
     pub accel_speed: f64,
     pub accel_profile: u32,
+    pub accel_custom: Option<AccelConfig>,
     pub rotation_available: bool,
     pub rotation_angle: u32,
     pub left_handed: bool,
@@ -745,6 +837,11 @@ impl LibinputDevice {
         seat: *mut LibinputSeat,
         context: *mut LibinputContext,
     ) -> Self {
+        if !seat.is_null() {
+            unsafe {
+                (*seat).refcount.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let group = Box::into_raw(Box::new(LibinputDeviceGroup::new()));
         Self {
             abi: LibinputDeviceAbi::new(seat, group, std::ptr::null_mut(), 1),
@@ -791,6 +888,7 @@ impl LibinputDevice {
             natural_scroll: false,
             accel_speed: 0.0,
             accel_profile: 2,
+            accel_custom: None,
             rotation_available: false,
             rotation_angle: 0,
             left_handed: false,
@@ -840,6 +938,18 @@ impl LibinputDevice {
             hold_default_enabled: false,
         }
     }
+
+    pub unsafe fn share_group(&mut self, group: *mut LibinputDeviceGroup) {
+        if group.is_null() || self.group == group {
+            return;
+        }
+        (*group).refcount.fetch_add(1, Ordering::Relaxed);
+        if !self.group.is_null() && (*self.group).refcount.fetch_sub(1, Ordering::AcqRel) == 1 {
+            drop(Box::from_raw(self.group));
+        }
+        self.group = group;
+        self.abi.group = group;
+    }
 }
 
 impl Drop for LibinputDevice {
@@ -860,9 +970,18 @@ impl Drop for LibinputDevice {
         }
         if !self.tablet_pad_mode_group.is_null() {
             unsafe {
-                drop(Box::from_raw(self.tablet_pad_mode_group));
+                crate::libinput_tablet_pad_mode_group_unref(self.tablet_pad_mode_group.cast());
             }
             self.tablet_pad_mode_group = std::ptr::null_mut();
+        }
+        if !self.seat.is_null() {
+            unsafe {
+                if (*self.seat).refcount.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    drop(Box::from_raw(self.seat));
+                }
+            }
+            self.seat = std::ptr::null_mut();
+            self.abi.seat = std::ptr::null_mut();
         }
     }
 }
@@ -897,6 +1016,8 @@ pub struct LibinputContext {
     pub backend: Mutex<BackendState>,
     pub backend_kind: BackendKind,
     pub seat_assigned: bool,
+    pub plugin_paths: Vec<CString>,
+    pub plugins_loaded: bool,
 }
 
 unsafe impl Send for LibinputContext {}
@@ -922,11 +1043,11 @@ impl LibinputContext {
             refcount: AtomicI32::new(1),
             user_data: std::ptr::null_mut(),
             context: std::ptr::null_mut(),
-            button_count: AtomicU32::new(0),
-            key_count: AtomicU32::new(0),
+            button_counts: Mutex::new(crate::evtrans::empty_seat_code_counts()),
+            key_counts: Mutex::new(crate::evtrans::empty_seat_code_counts()),
         }));
         let backend = BackendState::new();
-        let inotify_fd = backend.inotify_fd();
+        let hotplug_fds = backend.hotplug_fds();
         let ctx = Self {
             interface,
             user_data,
@@ -946,8 +1067,10 @@ impl LibinputContext {
             backend: Mutex::new(backend),
             backend_kind,
             seat_assigned: false,
+            plugin_paths: Vec::new(),
+            plugins_loaded: false,
         };
-        if let Some(fd) = inotify_fd {
+        for fd in hotplug_fds {
             ctx.register_fd(fd);
         }
         if wake_fd >= 0 {
@@ -1060,6 +1183,11 @@ impl Drop for LibinputContext {
                 libc::close(self.timer_fd);
             }
         }
+        for mut event in self.event_queue.drain(..) {
+            unsafe {
+                event.release_queued_device_ref();
+            }
+        }
         for seat in self.seats.drain(..) {
             if !seat.is_null() {
                 unsafe {
@@ -1081,9 +1209,7 @@ impl Drop for LibinputContext {
         for tool in self.tablet_tools.drain(..) {
             if !tool.is_null() {
                 unsafe {
-                    if (*tool).refcount.fetch_sub(1, Ordering::AcqRel) == 1 {
-                        drop(Box::from_raw(tool));
-                    }
+                    crate::libinput_tablet_tool_unref(tool.cast());
                 }
             }
         }

@@ -12,7 +12,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::evdev;
 use crate::evdev::{AbsoluteAxisCode, Device, EventType, InputEvent, KeyCode, RelativeAxisCode};
-use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
 
 use crate::ffi_types::{
     BackendKind, EventPayload, GestureEvent, KeyboardKeyEvent, LibinputContext, LibinputDevice,
@@ -269,6 +268,8 @@ struct MtSlot {
     reported: bool,
     dirty: bool,
     began_this_frame: bool,
+    ended_this_frame: bool,
+    ended_tracking_id: Option<i32>,
     dwt_released_this_frame: bool,
     palm_suppressed: bool,
     thumb_suppressed: bool,
@@ -457,6 +458,7 @@ struct HeldKey {
 
 struct TrackedDevice {
     device: Device,
+    quirks: std::sync::Arc<crate::quirks::AppliedQuirks>,
     restricted_fd: Option<RawFd>,
     path: PathBuf,
     is_absolute: bool,
@@ -471,6 +473,7 @@ struct TrackedDevice {
     is_dwt_keyboard: bool,
     keyboard_internal: bool,
     is_pointer: bool,
+    is_external_mouse: bool,
     is_touchpad: bool,
     touchpad_is_external: bool,
     is_clickpad: bool,
@@ -486,7 +489,14 @@ struct TrackedDevice {
     warned_missing_hi_res_horizontal: bool,
     wheel_is_virtual: bool,
     is_lenovo_scrollpoint: bool,
+    is_lenovo_t450_touchpad: bool,
+    is_lenovo_x230: bool,
+    is_synaptics_serial_touchpad: bool,
+    is_alps_serial_touchpad: bool,
+    jump_detection_disabled: bool,
+    wheel_always_accumulate: bool,
     trackpoint_multiplier: f64,
+    pointer_dpi: f64,
     invert_horizontal_scrolling: bool,
     wheel_state: u8,
     wheel_min_movement: i64,
@@ -514,7 +524,15 @@ struct TrackedDevice {
     debounce_bypass: bool,
     debounce_disabled: bool,
     last_button_time_usec: u64,
+    motion_history: crate::motion::MotionHistory,
     lagging_frame_count: u32,
+    t450_nonmotion_event_count: u32,
+    touchpad_frame_has_motion: bool,
+    touchpad_frame_has_other_axis: bool,
+    msc_timestamp_watch: bool,
+    msc_timestamp_state: u8,
+    msc_timestamp_interval: u64,
+    msc_timestamp_now: Option<u64>,
     scroll_button_accum_x: i64,
     scroll_button_accum_y: i64,
 
@@ -556,6 +574,9 @@ struct TrackedDevice {
     tap_button_down: Option<u16>,
     tap_release_since: Option<Instant>,
     tap_drag_active: bool,
+    tap_drag_lock_waiting: bool,
+    tap_drag_lock_resumed: bool,
+    tap_drag_lock_moved: bool,
     tap_fingers: u32,
     touch_start_time: Option<Instant>,
     last_movement_time: Option<Instant>,
@@ -589,6 +610,10 @@ struct TrackedDevice {
     tablet_buttons: Vec<u32>,
     tablet_x: f64,
     tablet_y: f64,
+    tablet_output_x: f64,
+    tablet_output_y: f64,
+    tablet_output_tilt_x: f64,
+    tablet_output_tilt_y: f64,
     tablet_last_event_x: f64,
     tablet_last_event_y: f64,
     tablet_last_event_pressure: f64,
@@ -648,6 +673,8 @@ struct TrackedDevice {
     tablet_held_buttons: Vec<u32>,
     tablet_ignored_initial_buttons: Vec<u32>,
     tablet_pending_button_events: Vec<(u32, bool)>,
+    tablet_smoothing_enabled: bool,
+    tablet_history: std::collections::VecDeque<(f64, f64, f64, f64)>,
 
     // --- tablet pad ---
     pad_ring_ranges: [Option<(i32, i32)>; 2],
@@ -657,6 +684,8 @@ struct TrackedDevice {
     pad_changed_axes: u8,
     pad_abs_misc_terminator: bool,
     pad_dial_values: [Option<f64>; 2],
+    pad_dials_map_to_ring: bool,
+    pad_dial_ring_values: [f64; 2],
 
     // --- multi-touch slots (for pinch) ---
     mt_slots: Vec<MtSlot>,
@@ -701,6 +730,20 @@ struct TrackedDevice {
 }
 
 unsafe impl Send for TrackedDevice {}
+
+#[derive(Clone, Copy)]
+struct QuirkSeedContext {
+    hardware_profile: Option<crate::chwd_input::DetectionResult>,
+    tag_pointing_stick: bool,
+    bus_type: u16,
+    is_clickpad: bool,
+    is_topbuttonpad: bool,
+    is_semi_mt: bool,
+    palm_detection_enabled: bool,
+    has_raw_mt_pressure: bool,
+    default_touch_pressure_range: Option<(i32, i32)>,
+    has_mt_size_resolution: bool,
+}
 
 #[derive(Default)]
 struct FingerScrollConstraint {
@@ -913,22 +956,7 @@ struct DebounceButton {
 /// In that case a repeated press must not increase the seat count; the next
 /// release closes the original logical press.
 fn transition_button_state(held_buttons: &mut Vec<u16>, code: u16, down: bool) -> bool {
-    if down {
-        if held_buttons.contains(&code) {
-            return false;
-        }
-        held_buttons.push(code);
-    } else {
-        if !held_buttons.contains(&code) {
-            return false;
-        }
-        held_buttons.retain(|button| *button != code);
-    }
-    true
-}
-
-fn is_evdev_button_code(code: u16) -> bool {
-    matches!(code, 0x100..=0x15f | 0x2c0..=0x2ff)
+    crate::evtrans::transition_button(held_buttons, code, down)
 }
 
 fn map_left_handed_button(code: u16, left_handed: bool, click_method: u32) -> u16 {
@@ -947,7 +975,414 @@ fn map_left_handed_button(code: u16, left_handed: bool, click_method: u32) -> u1
     }
 }
 
+fn tap_button_for_fingers(fingers: u32, map: u32) -> Option<u16> {
+    match (fingers, map) {
+        (1, _) => Some(KeyCode::BTN_LEFT.0),
+        (2, 0) => Some(KeyCode::BTN_RIGHT.0),
+        (3, 0) => Some(KeyCode::BTN_MIDDLE.0),
+        (2, 1) => Some(KeyCode::BTN_MIDDLE.0),
+        (3, 1) => Some(KeyCode::BTN_RIGHT.0),
+        _ => None,
+    }
+}
+
+fn trackpoint_speed_factor(speed: f64) -> f64 {
+    let mapped = speed + 1.0;
+    435_837.2 + (0.047_626_36 - 435_837.2) / (1.0 + (mapped / 240.4549).powf(2.377_168))
+}
+
+fn parse_mouse_dpi(value: &str) -> Option<f64> {
+    let mut fallback = None;
+    for token in value.split_ascii_whitespace() {
+        let (active, token) = token
+            .strip_prefix('*')
+            .map_or((false, token), |token| (true, token));
+        let dpi = token
+            .split_once('@')
+            .map_or(token, |(dpi, _)| dpi)
+            .parse::<f64>()
+            .ok()
+            .filter(|dpi| dpi.is_finite() && *dpi > 0.0)?;
+        if active {
+            return Some(dpi);
+        }
+        fallback.get_or_insert(dpi);
+    }
+    fallback
+}
+
+fn t450_update_nonmotion_count(count: &mut u32, motion: bool, other_axis: bool) -> bool {
+    if motion {
+        let swallow = *count > 10;
+        *count = 0;
+        swallow
+    } else {
+        if other_axis {
+            *count = count.saturating_add(1);
+        }
+        false
+    }
+}
+
+fn msc_timestamp_jump_scale(state: &mut u8, interval: &mut u64, now: u64) -> Option<f64> {
+    if now == 0 {
+        *state = 1;
+        *interval = 0;
+        return None;
+    }
+    match *state {
+        1 if now <= 20_000 => {
+            *state = 2;
+            *interval = now;
+            None
+        }
+        1 => {
+            *state = 3;
+            None
+        }
+        2 if now > interval.saturating_mul(2) => {
+            let delayed = now.saturating_sub(*interval);
+            *state = 3;
+            (delayed != 0).then_some(*interval as f64 / delayed as f64)
+        }
+        _ => None,
+    }
+}
+
+fn wheel_should_accumulate(always: bool, minimum_movement: i64) -> bool {
+    always || minimum_movement < 30
+}
+
+fn restore_ended_synaptics_slots(slots: &mut [MtSlot], fake_fingers: u32) -> usize {
+    if fake_fingers < 3 {
+        return slots.iter().filter(|slot| slot.active).count();
+    }
+    let mut active = slots.iter().filter(|slot| slot.active).count();
+    let target = (fake_fingers as usize).min(slots.len());
+    for slot in slots {
+        if active >= target {
+            break;
+        }
+        if slot.ended_this_frame && !slot.active {
+            slot.active = true;
+            slot.tracking_id = slot.ended_tracking_id.unwrap_or(slot.tracking_id);
+            slot.dirty = true;
+            slot.began_this_frame = false;
+            active += 1;
+        }
+    }
+    active
+}
+
+fn smooth_tablet_sample(
+    history: &mut std::collections::VecDeque<(f64, f64, f64, f64)>,
+    sample: (f64, f64, f64, f64),
+    enabled: bool,
+    reset: bool,
+) -> (f64, f64, f64, f64) {
+    if reset {
+        history.clear();
+    }
+    history.push_back(sample);
+    let limit = if enabled { 4 } else { 1 };
+    while history.len() > limit {
+        history.pop_front();
+    }
+    let count = history.len() as f64;
+    let totals = history
+        .iter()
+        .fold((0.0, 0.0, 0.0, 0.0), |(x, y, tilt_x, tilt_y), value| {
+            (x + value.0, y + value.1, tilt_x + value.2, tilt_y + value.3)
+        });
+    (
+        totals.0 / count,
+        totals.1 / count,
+        totals.2 / count,
+        totals.3 / count,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn configured_motion_factor(
+    device: *mut LibinputDevice,
+    dx: f64,
+    dy: f64,
+    time_usec: u64,
+    is_touchpad: bool,
+    is_pointing_stick: bool,
+    history: &mut crate::motion::MotionHistory,
+) -> f64 {
+    if (*device).accel_profile == 4 {
+        return (*device)
+            .accel_custom
+            .as_mut()
+            .and_then(|config| config.curve_mut(1))
+            .map(|curve| curve.factor(dx, dy, time_usec))
+            .unwrap_or(1.0);
+    }
+    let speed_setting = (*device).accel_speed;
+    if (*device).accel_profile == 1 {
+        return (1.0 + speed_setting).max(0.005);
+    }
+
+    let velocity = history.feed_velocity(dx, dy, time_usec, is_pointing_stick);
+
+    if is_touchpad {
+        return crate::tpad::speed_factor(speed_setting);
+    }
+    if is_pointing_stick {
+        return history.simpson_factor(velocity, |velocity| {
+            let velocity_ms = velocity * 1_000.0;
+            let curve =
+                10.062_54 + (0.3 - 10.062_54) / (1.0 + (velocity_ms / 0.920_545_9).powf(1.153_63));
+            curve * trackpoint_speed_factor(speed_setting)
+        });
+    }
+
+    let threshold = (0.4 - 0.25 * speed_setting).max(0.2);
+    let maximum = 2.0 + speed_setting * 1.5;
+    let incline = 1.1 + speed_setting * 0.75;
+    history.simpson_factor(velocity, |velocity| {
+        let velocity_ms = velocity * 1_000.0;
+        if velocity_ms < 0.07 {
+            (10.0 * velocity_ms + 0.3).min(maximum)
+        } else if velocity_ms < threshold {
+            1.0
+        } else {
+            (incline * (velocity_ms - threshold) + 1.0).min(maximum)
+        }
+    })
+}
+
+unsafe fn configured_scroll_factor(
+    device: *mut LibinputDevice,
+    dx: f64,
+    dy: f64,
+    time_usec: u64,
+) -> f64 {
+    if (*device).accel_profile != 4 || (dx == 0.0 && dy == 0.0) {
+        return 1.0;
+    }
+
+    (*device)
+        .accel_custom
+        .as_mut()
+        .and_then(|config| config.curve_mut(2))
+        .map(|curve| curve.factor(dx, dy, time_usec))
+        .unwrap_or(1.0)
+}
+
 impl TrackedDevice {
+    unsafe fn seed_resolved_quirks(
+        &mut self,
+        lib_dev: *mut LibinputDevice,
+        seed: QuirkSeedContext,
+    ) {
+        let quirks = std::sync::Arc::clone(&self.quirks);
+        let q = quirks.as_ref();
+        self.keyboard_internal = matches!(
+            q.keyboard_integration,
+            Some(crate::quirks::KeyboardIntegration::Internal)
+        );
+        self.pointing_stick_internal = seed.tag_pointing_stick
+            && !matches!(
+                q.pointing_stick_integration,
+                Some(crate::quirks::KeyboardIntegration::External)
+            )
+            && !matches!(seed.bus_type, 0x03 | 0x05);
+        self.is_semi_mt = seed.is_semi_mt;
+        self.pad_dials_map_to_ring = q.model_wacom_intuos_pro3rd;
+        self.is_lenovo_t450_touchpad = q.model_lenovo_t450_touchpad;
+        self.is_lenovo_x230 = q.model_lenovo_x230;
+        self.is_synaptics_serial_touchpad = q.model_synaptics_serial_touchpad;
+        self.is_alps_serial_touchpad = q.model_alps_serial_touchpad;
+        self.jump_detection_disabled = q.model_lenovo_x1_gen6_touchpad;
+        self.wheel_always_accumulate = q.model_scroll_on_middle_click;
+        self.msc_timestamp_watch = q.msc_timestamp_watch;
+        self.tablet_smoothing_enabled = q.tablet_smoothing.unwrap_or(!q.is_virtual);
+        if let Some(profile) = seed.hardware_profile {
+            self.is_lenovo_x230 |= profile.apply.lenovo_x230_motion;
+            self.touchpad_phantom_clicks |= profile.apply.phantom_click_filter;
+        }
+        self.trackpoint_multiplier = q.trackpoint_multiplier.unwrap_or_else(|| {
+            seed.hardware_profile
+                .and_then(|profile| profile.apply.trackpoint_multiplier)
+                .unwrap_or_else(|| q.trackpoint_multiplier_or_default())
+        });
+        self.invert_horizontal_scrolling = q.model_invert_horizontal_scrolling;
+        self.debounce_disabled = q.model_bouncing_keys;
+        self.tablet_mode_no_suspend = q.model_tablet_mode_no_suspend;
+        self.touchpad_visible_marker = q.model_touchpad_visible_marker;
+        self.touchpad_phantom_clicks |= q.model_touchpad_phantom_clicks;
+        self.thumb_pressure_threshold = q.thumb_pressure_threshold.map(f64::from);
+        self.thumb_size_threshold = q.thumb_size_threshold.map(f64::from);
+        self.thumb_detection_enabled =
+            seed.is_clickpad && (*lib_dev).height_mm.is_some_and(|height| height >= 50.0);
+        self.palm_pressure_threshold = (seed.palm_detection_enabled && seed.has_raw_mt_pressure)
+            .then_some(q.palm_pressure_or_default())
+            .filter(|threshold| *threshold != 0)
+            .map(f64::from);
+        self.palm_size_threshold = seed
+            .palm_detection_enabled
+            .then_some(q.palm_size_threshold)
+            .flatten()
+            .filter(|threshold| *threshold != 0)
+            .map(f64::from);
+        self.touch_pressure_range = q
+            .pressure_range
+            .or(seed.default_touch_pressure_range)
+            .map(|(down, up)| (f64::from(down), f64::from(up)));
+        self.touch_size_range = q
+            .touch_size_range
+            .filter(|_| seed.has_mt_size_resolution)
+            .map(|(down, up)| (f64::from(down), f64::from(up)));
+        self.palm_left_edge = None;
+        self.palm_right_edge = None;
+        self.palm_upper_edge = None;
+        if seed.palm_detection_enabled && !q.model_apple_touchpad {
+            if let (Some(width), Some((minimum, maximum))) = (
+                (*lib_dev).width_mm,
+                (*lib_dev).abs_x_range.or(self.abs_x_range),
+            ) {
+                if width >= 70.0 {
+                    let edge_mm = 8.0_f64.min(width * 0.08);
+                    let edge_units = f64::from(maximum - minimum) * edge_mm / width;
+                    self.palm_left_edge = Some(f64::from(minimum) + edge_units);
+                    self.palm_right_edge = Some(f64::from(maximum) - edge_units);
+                }
+            }
+            if !seed.is_topbuttonpad {
+                if let (Some(height), Some((minimum, maximum))) = (
+                    (*lib_dev).height_mm,
+                    (*lib_dev).abs_y_range.or(self.abs_y_range),
+                ) {
+                    if height > 55.0 {
+                        self.palm_upper_edge =
+                            Some(f64::from(minimum) + f64::from(maximum - minimum) * 0.05);
+                    }
+                }
+            }
+        }
+        if q.model_hp_zbook_studio_g3 {
+            self.mt_slots.truncate(2);
+        }
+        if q.model_hp_pavilion_dm4_touchpad {
+            self.mt_slots.truncate(1);
+        }
+        if q.disable_abs_mt_pressure {
+            self.has_mt_pressure = false;
+            self.touch_pressure_range = None;
+            for slot in &mut self.mt_slots {
+                slot.pressure = 0.0;
+            }
+        }
+        if q.disable_abs_distance {
+            self.tablet_has_distance = false;
+        }
+        if q.disable_abs_mt_tool_type {
+            for slot in &mut self.mt_slots {
+                slot.tool_type = 0;
+            }
+        }
+        if q.disable_hi_res_wheel_vertical {
+            self.supports_hi_res_vertical = false;
+        }
+        if q.disable_hi_res_wheel_horizontal {
+            self.supports_hi_res_horizontal = false;
+        }
+        if q.disable_tablet_tilt_x || q.disable_tablet_tilt_y {
+            self.tablet_has_tilt = false;
+        }
+        self.wheel_is_virtual = q.is_virtual;
+        self.is_lenovo_scrollpoint = q.model_lenovo_scrollpoint;
+        self.lid_write_open = (*lib_dev).switch_codes.contains(&0)
+            && q.lid_switch_reliability.as_deref() == Some("write_open");
+    }
+
+    fn update_tablet_smoothing(&mut self, reset: bool) {
+        let output = smooth_tablet_sample(
+            &mut self.tablet_history,
+            (
+                self.tablet_x,
+                self.tablet_y,
+                self.tablet_tilt_x,
+                self.tablet_tilt_y,
+            ),
+            self.tablet_smoothing_enabled,
+            reset,
+        );
+        self.tablet_output_x = output.0;
+        self.tablet_output_y = output.1;
+        self.tablet_output_tilt_x = output.2;
+        self.tablet_output_tilt_y = output.3;
+    }
+
+    fn restore_synaptics_serial_touches(&mut self) {
+        if (self.is_synaptics_serial_touchpad || self.quirks.model_synaptics_serial_touchpad)
+            && self.touch_fingers >= 3
+        {
+            let before = self.active_slot_count();
+            let after = restore_ended_synaptics_slots(&mut self.mt_slots, self.touch_fingers);
+            self.mt_contact_count_changed |= before != after;
+        }
+        for slot in &mut self.mt_slots {
+            slot.ended_this_frame = false;
+            slot.ended_tracking_id = None;
+        }
+        self.touch_active = self.mt_slots.iter().any(|slot| slot.active);
+    }
+
+    fn apply_touchpad_frame_quirks(&mut self) {
+        self.restore_synaptics_serial_touches();
+        if self.is_alps_serial_touchpad || self.quirks.model_alps_serial_touchpad {
+            let active = self.active_slot_count();
+            if self.touch_fingers > 1
+                && self.touch_fingers as usize > active
+                && active > 0
+                && active < self.mt_slots.len()
+            {
+                self.mt_slots.truncate(active);
+                self.current_slot = self.current_slot.min(active - 1);
+            }
+            if self
+                .mt_slots
+                .iter()
+                .any(|slot| slot.active && slot.x == 4095.0 && slot.y == 0.0)
+            {
+                self.current_dx = 0;
+                self.current_dy = 0;
+                self.motion_history.restart();
+            }
+        }
+        if self.is_lenovo_t450_touchpad
+            && t450_update_nonmotion_count(
+                &mut self.t450_nonmotion_event_count,
+                self.touchpad_frame_has_motion,
+                self.touchpad_frame_has_other_axis,
+            )
+        {
+            self.current_dx = 0;
+            self.current_dy = 0;
+            self.motion_history.restart();
+        }
+        self.touchpad_frame_has_motion = false;
+        self.touchpad_frame_has_other_axis = false;
+
+        if self.msc_timestamp_watch {
+            if let Some(now) = self.msc_timestamp_now.take() {
+                if let Some(scale) = msc_timestamp_jump_scale(
+                    &mut self.msc_timestamp_state,
+                    &mut self.msc_timestamp_interval,
+                    now,
+                ) {
+                    self.current_dx = (f64::from(self.current_dx) * scale).round() as i32;
+                    self.current_dy = (f64::from(self.current_dy) * scale).round() as i32;
+                    self.motion_history.restart();
+                }
+            }
+        }
+    }
+
     fn dwt_pairing_info(&self, fd: RawFd) -> DwtPairingInfo {
         DwtPairingInfo {
             fd,
@@ -1283,6 +1718,7 @@ impl TrackedDevice {
     #[allow(clippy::too_many_arguments)]
     fn new(
         device: Device,
+        quirks: std::sync::Arc<crate::quirks::AppliedQuirks>,
         restricted_fd: Option<RawFd>,
         path: PathBuf,
         lib_device: *mut LibinputDevice,
@@ -1292,6 +1728,7 @@ impl TrackedDevice {
         is_dwt_keyboard: bool,
         keyboard_internal: bool,
         is_pointer: bool,
+        is_external_mouse: bool,
         is_touchpad: bool,
         touchpad_is_external: bool,
         palm_pressure_threshold: Option<u32>,
@@ -1542,6 +1979,7 @@ impl TrackedDevice {
 
         Self {
             device,
+            quirks,
             restricted_fd,
             path,
             is_absolute,
@@ -1556,6 +1994,7 @@ impl TrackedDevice {
             is_dwt_keyboard,
             keyboard_internal,
             is_pointer,
+            is_external_mouse,
             is_touchpad,
             touchpad_is_external,
             is_clickpad,
@@ -1571,7 +2010,14 @@ impl TrackedDevice {
             warned_missing_hi_res_horizontal: false,
             wheel_is_virtual: false,
             is_lenovo_scrollpoint: false,
+            is_lenovo_t450_touchpad: false,
+            is_lenovo_x230: false,
+            is_synaptics_serial_touchpad: false,
+            is_alps_serial_touchpad: false,
+            jump_detection_disabled: false,
+            wheel_always_accumulate: false,
             trackpoint_multiplier: 1.0,
+            pointer_dpi: 1_000.0,
             invert_horizontal_scrolling: false,
             wheel_state: 0,
             wheel_min_movement: 47,
@@ -1599,7 +2045,15 @@ impl TrackedDevice {
             debounce_bypass: false,
             debounce_disabled: false,
             last_button_time_usec: 0,
+            motion_history: crate::motion::MotionHistory::default(),
             lagging_frame_count: 0,
+            t450_nonmotion_event_count: 0,
+            touchpad_frame_has_motion: false,
+            touchpad_frame_has_other_axis: false,
+            msc_timestamp_watch: false,
+            msc_timestamp_state: 0,
+            msc_timestamp_interval: 0,
+            msc_timestamp_now: None,
             scroll_button_accum_x: 0,
             scroll_button_accum_y: 0,
             pending_rel_x: 0,
@@ -1638,6 +2092,9 @@ impl TrackedDevice {
             tap_button_down: None,
             tap_release_since: None,
             tap_drag_active: false,
+            tap_drag_lock_waiting: false,
+            tap_drag_lock_resumed: false,
+            tap_drag_lock_moved: false,
             tap_fingers: 0,
             touch_start_time: None,
             last_movement_time: None,
@@ -1681,6 +2138,10 @@ impl TrackedDevice {
             tablet_buttons,
             tablet_x: current_abs_x.unwrap_or_default() as f64,
             tablet_y: current_abs_y.unwrap_or_default() as f64,
+            tablet_output_x: current_abs_x.unwrap_or_default() as f64,
+            tablet_output_y: current_abs_y.unwrap_or_default() as f64,
+            tablet_output_tilt_x: tablet_tilt_x,
+            tablet_output_tilt_y: tablet_tilt_y,
             tablet_last_event_x: current_abs_x.unwrap_or_default() as f64,
             tablet_last_event_y: current_abs_y.unwrap_or_default() as f64,
             tablet_last_event_pressure: tablet_pressure,
@@ -1740,6 +2201,8 @@ impl TrackedDevice {
             tablet_held_buttons: Vec::new(),
             tablet_ignored_initial_buttons: initial_tablet_buttons,
             tablet_pending_button_events: Vec::new(),
+            tablet_smoothing_enabled: true,
+            tablet_history: std::collections::VecDeque::with_capacity(4),
             pad_ring_ranges,
             pad_strip_ranges,
             pad_ring_values,
@@ -1747,6 +2210,8 @@ impl TrackedDevice {
             pad_changed_axes: 0,
             pad_abs_misc_terminator: false,
             pad_dial_values: [None; 2],
+            pad_dials_map_to_ring: false,
+            pad_dial_ring_values: [0.0; 2],
             mt_slots,
             current_slot: 0,
             protocol_a_tracking_id: None,
@@ -2624,7 +3089,8 @@ impl TrackedDevice {
         }
 
         self.wheel_min_movement = self.wheel_min_movement.min(value.abs());
-        let accumulate = self.wheel_min_movement < 30;
+        let accumulate =
+            wheel_should_accumulate(self.wheel_always_accumulate, self.wheel_min_movement);
         let direction = match (axis, value.is_positive()) {
             (0, true) => 1,
             (0, false) => -1,
@@ -2694,42 +3160,31 @@ fn monotonic_now() -> Option<Duration> {
     ))
 }
 
-unsafe fn press_seat_button(device: *mut LibinputDevice) -> u32 {
-    (*(*device).seat)
-        .button_count
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        + 1
+unsafe fn press_seat_button(device: *mut LibinputDevice, button: u16) -> u32 {
+    update_seat_code_count(&(*(*device).seat).button_counts, button, true)
 }
 
-unsafe fn release_seat_button(device: *mut LibinputDevice) -> u32 {
-    let count = &(*(*device).seat).button_count;
-    let previous = count
-        .fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |value| Some(value.saturating_sub(1)),
-        )
-        .unwrap_or(0);
-    previous.saturating_sub(1)
+unsafe fn release_seat_button(device: *mut LibinputDevice, button: u16) -> u32 {
+    update_seat_code_count(&(*(*device).seat).button_counts, button, false)
 }
 
-unsafe fn press_seat_key(device: *mut LibinputDevice) -> u32 {
-    (*(*device).seat)
-        .key_count
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        + 1
+fn update_seat_code_count(
+    counts: &std::sync::Mutex<crate::evtrans::SeatCodeCounts>,
+    key: u16,
+    pressed: bool,
+) -> u32 {
+    let mut counts = counts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    crate::evtrans::update_seat_count(&mut counts, key, pressed)
 }
 
-unsafe fn release_seat_key(device: *mut LibinputDevice) -> u32 {
-    let count = &(*(*device).seat).key_count;
-    let previous = count
-        .fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |value| Some(value.saturating_sub(1)),
-        )
-        .unwrap_or(0);
-    previous.saturating_sub(1)
+unsafe fn press_seat_key(device: *mut LibinputDevice, key: u16) -> u32 {
+    update_seat_code_count(&(*(*device).seat).key_counts, key, true)
+}
+
+unsafe fn release_seat_key(device: *mut LibinputDevice, key: u16) -> u32 {
+    update_seat_code_count(&(*(*device).seat).key_counts, key, false)
 }
 
 unsafe fn allocate_touch_seat_slot(ctx: *mut LibinputContext) -> i32 {
@@ -2770,7 +3225,7 @@ unsafe fn tablet_tool_for(
                     (**tool).serial == serial
                 }
         }) {
-            (*tool).device = device;
+            set_tablet_tool_device(tool, device);
             return tool;
         }
     }
@@ -2783,7 +3238,7 @@ unsafe fn tablet_tool_for(
                 (**tool).serial == serial
             }
     }) {
-        (*tool).device = device;
+        set_tablet_tool_device(tool, device);
         return tool;
     }
     let mut eraser_button_modes = u32::from(tool_type == 1);
@@ -2816,7 +3271,7 @@ unsafe fn tablet_tool_for(
         tool_id,
         name,
         tool_type,
-        device,
+        device: crate::libinput_device_ref(device),
         has_pressure: capabilities[0],
         has_distance: capabilities[1],
         has_tilt: capabilities[2] && !matches!(tool_type, 6 | 7),
@@ -2839,6 +3294,17 @@ unsafe fn tablet_tool_for(
     }));
     (*ctx).tablet_tools.push(tool);
     tool
+}
+
+unsafe fn set_tablet_tool_device(tool: *mut LibinputTabletTool, device: *mut LibinputDevice) {
+    if tool.is_null() || (*tool).device == device {
+        return;
+    }
+    let previous = (*tool).device;
+    (*tool).device = crate::libinput_device_ref(device);
+    if !previous.is_null() {
+        crate::libinput_device_unref(previous);
+    }
 }
 
 pub(crate) fn tablet_tool_name_for_id(tool_id: u64) -> Option<std::ffi::CString> {
@@ -2912,14 +3378,14 @@ unsafe fn tablet_tool_payload(
     let x_range = x_max - x_min + 1.0;
     let y_range = y_max - y_min + 1.0;
     let mut tablet_x = if has_custom_area {
-        td.tablet_x.clamp(x_min, x_max)
+        td.tablet_output_x.clamp(x_min, x_max)
     } else {
-        td.tablet_x
+        td.tablet_output_x
     };
     let mut tablet_y = if has_custom_area {
-        td.tablet_y.clamp(y_min, y_max)
+        td.tablet_output_y.clamp(y_min, y_max)
     } else {
-        td.tablet_y
+        td.tablet_output_y
     };
     if td.tablet_left_handed_applied {
         tablet_x = x_min + x_max - tablet_x;
@@ -2988,14 +3454,14 @@ unsafe fn tablet_tool_payload(
             }
         }
     };
-    let mut tilt_x = normalize_tilt(td.tablet_tilt_x, td.tablet_tilt_x_info);
-    let mut tilt_y = normalize_tilt(td.tablet_tilt_y, td.tablet_tilt_y_info);
+    let mut tilt_x = normalize_tilt(td.tablet_output_tilt_x, td.tablet_tilt_x_info);
+    let mut tilt_y = normalize_tilt(td.tablet_output_tilt_y, td.tablet_tilt_y_info);
     if td.tablet_left_handed_applied {
         tilt_x = -tilt_x;
         tilt_y = -tilt_y;
     }
-    (*lib_dev).tablet_current_x = td.tablet_x;
-    (*lib_dev).tablet_current_y = td.tablet_y;
+    (*lib_dev).tablet_current_x = td.tablet_output_x;
+    (*lib_dev).tablet_current_y = td.tablet_output_y;
     (*lib_dev).tablet_current_tilt_x = tilt_x;
     let tool_type = (*tool).tool_type;
     let mut rotation = if matches!(tool_type, 6 | 7) {
@@ -3097,9 +3563,9 @@ unsafe fn push_tablet_tool_button(
 ) {
     let (button, pressed) = button_state;
     let seat_button_count = if pressed {
-        press_seat_button(lib_dev)
+        press_seat_button(lib_dev, button as u16)
     } else {
-        release_seat_button(lib_dev)
+        release_seat_button(lib_dev, button as u16)
     };
     (*tool)
         .refcount
@@ -3396,14 +3862,40 @@ unsafe fn update_tablet_tip_from_pressure(td: &mut TrackedDevice, touch_button_c
 pub struct BackendState {
     devices: HashMap<RawFd, TrackedDevice>,
     requested_paths: Vec<PathBuf>,
-    inotify: Option<Inotify>,
+    discovery: crate::hwdetect::HardwareDiscovery,
+    quirks: crate::quirks::QuirksEngine,
     suspended: bool,
     lid_closed: bool,
     lid_client_closed: bool,
+    lid_unreliable_closed: bool,
     tablet_mode: bool,
 }
 
 unsafe impl Send for BackendState {}
+
+fn led_update_events(leds: u32) -> [InputEvent; 6] {
+    let mut events = [InputEvent::new(EventType::LED.0, 0, 0); 6];
+    for (code, event) in events[..5].iter_mut().enumerate() {
+        *event = InputEvent::new(
+            EventType::LED.0,
+            code as u16,
+            i32::from(leds & (1_u32 << code) != 0),
+        );
+    }
+    events[5] = InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0);
+    events
+}
+
+fn dial_v120_to_ring(current: &mut f64, delta: f64, left_handed: bool) -> f64 {
+    const V120_PER_REVOLUTION: f64 = 120.0 * 24.0;
+    *current = (*current + delta).rem_euclid(V120_PER_REVOLUTION);
+    let degrees = *current * 15.0 / 120.0;
+    if left_handed {
+        (degrees + 180.0).rem_euclid(360.0)
+    } else {
+        degrees
+    }
+}
 
 impl BackendState {
     unsafe fn release_context_device(ctx: *mut LibinputContext, device: *mut LibinputDevice) {
@@ -3418,25 +3910,15 @@ impl BackendState {
     }
 
     pub fn new() -> Self {
-        let inotify = Inotify::init(InitFlags::IN_NONBLOCK).ok().and_then(|ino| {
-            ino.add_watch(
-                "/dev/input",
-                AddWatchFlags::IN_CREATE
-                    | AddWatchFlags::IN_ATTRIB
-                    | AddWatchFlags::IN_DELETE
-                    | AddWatchFlags::IN_MOVED_FROM
-                    | AddWatchFlags::IN_MOVED_TO,
-            )
-            .ok()?;
-            Some(ino)
-        });
         Self {
             devices: HashMap::new(),
             requested_paths: Vec::new(),
-            inotify,
+            discovery: crate::hwdetect::HardwareDiscovery::new(),
+            quirks: crate::quirks::QuirksEngine::load_default(),
             suspended: false,
             lid_closed: false,
             lid_client_closed: false,
+            lid_unreliable_closed: false,
             tablet_mode: false,
         }
     }
@@ -3550,7 +4032,7 @@ impl BackendState {
         ctx: *mut LibinputContext,
         out: &mut VecDeque<LibinputEvent>,
     ) {
-        if !self.lid_closed {
+        if !self.lid_closed && !self.lid_unreliable_closed {
             return;
         }
         let Some(lid) = self
@@ -3559,6 +4041,7 @@ impl BackendState {
             .find(|tracked| (*tracked.lib_device).switch_codes.contains(&0))
         else {
             self.lid_closed = false;
+            self.lid_unreliable_closed = false;
             return;
         };
 
@@ -3581,6 +4064,7 @@ impl BackendState {
         let notify_client = self.lid_client_closed;
         self.lid_closed = false;
         self.lid_client_closed = false;
+        self.lid_unreliable_closed = false;
         if notify_client {
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_SWITCH_TOGGLE,
@@ -3595,9 +4079,26 @@ impl BackendState {
         }
     }
 
-    pub fn inotify_fd(&self) -> Option<RawFd> {
-        use std::os::fd::{AsFd, AsRawFd};
-        self.inotify.as_ref().map(|i| i.as_fd().as_raw_fd())
+    pub fn hotplug_fds(&self) -> Vec<RawFd> {
+        self.discovery.fds()
+    }
+
+    pub fn update_leds(&mut self, device: *mut LibinputDevice, leds: u32) {
+        let Some(tracked) = self
+            .devices
+            .values_mut()
+            .find(|tracked| tracked.lib_device == device)
+        else {
+            return;
+        };
+        let events = led_update_events(leds);
+        let _ = tracked.device.send_events(&events);
+    }
+
+    pub fn has_external_mouse(&self) -> bool {
+        self.devices
+            .values()
+            .any(|tracked| tracked.is_external_mouse)
     }
 
     // -----------------------------------------------------------------------
@@ -3615,6 +4116,7 @@ impl BackendState {
         for (path, _) in evdev::enumerate() {
             self.try_open(ctx, &path, out);
         }
+        self.discovery.mark_reconciled();
     }
 
     pub unsafe fn try_open(
@@ -3626,6 +4128,16 @@ impl BackendState {
         if (*ctx).backend_kind == BackendKind::Udev
             && self.devices.values().any(|tracked| tracked.path == path)
         {
+            return;
+        }
+        let database_properties = crate::hwdetect::udev_database_properties(path);
+        if (*ctx).backend_kind == BackendKind::Udev
+            && crate::hwdetect::udev_database_is_present()
+            && database_properties.is_empty()
+        {
+            // The devnode may precede its post-udev database record. Defer
+            // classification until netlink or periodic reconciliation rather
+            // than permanently adding an untagged, unquirked device.
             return;
         }
         let interface = &*(*ctx).interface;
@@ -3792,26 +4304,28 @@ impl BackendState {
         }
 
         let props = device.properties();
-        let is_topbuttonpad = props.contains(evdev::PropType::TOPBUTTONPAD);
         let keys = device.supported_keys();
         let rel = device.supported_relative_axes();
         let abs = device.supported_absolute_axes();
         let udev_device = crate::udev::UdevDevice::from_path(path);
         let udev_pointer = udev_device.as_ptr();
-        if crate::udev::property_value(udev_pointer, "LIBINPUT_IGNORE_DEVICE")
-            .is_some_and(|value| value != "0")
-        {
+        let property_value = |name: &str| {
+            database_properties
+                .get(name)
+                .cloned()
+                .or_else(|| crate::udev::property_value(udev_pointer, name))
+        };
+        if property_value("LIBINPUT_IGNORE_DEVICE").is_some_and(|value| value != "0") {
             return;
         }
         if (*ctx).backend_kind == crate::ffi_types::BackendKind::Udev {
             let assigned_seat = (*(*ctx).seat).physical_name.to_string_lossy();
-            let device_seat = crate::udev::property_value(udev_pointer, "ID_SEAT")
-                .unwrap_or_else(|| "seat0".to_string());
+            let device_seat = property_value("ID_SEAT").unwrap_or_else(|| "seat0".to_string());
             if device_seat != assigned_seat {
                 return;
             }
         }
-        let has_tag = |tag| crate::udev::property_equals(udev_pointer, tag, "1");
+        let has_tag = |tag| property_value(tag).as_deref() == Some("1");
         let tag_keyboard = has_tag("ID_INPUT_KEYBOARD");
         let tag_key = has_tag("ID_INPUT_KEY");
         let tag_touchpad = has_tag("ID_INPUT_TOUCHPAD");
@@ -3831,93 +4345,7 @@ impl BackendState {
             || tag_mouse
             || tag_pointing_stick;
         let use_evdev_fallback = !has_class_tag;
-        let is_keyboard = tag_keyboard
-            || ((use_evdev_fallback || tag_key)
-                && keys.is_some_and(|k| k.iter().any(|key| key.0 < 0x100)));
-        // DWT only pairs ordinary typewriter keyboards. A node exposing a
-        // handful of media or receiver keys must not suppress its touchpad.
-        let is_typewriter_keyboard = is_keyboard
-            && keys.is_some_and(|codes| (16_u16..=25).all(|code| codes.contains(KeyCode(code))));
-        let has_pen = keys.is_some_and(|k| {
-            k.contains(KeyCode::BTN_TOOL_PEN)
-                || k.contains(KeyCode::BTN_TOOL_RUBBER)
-                || k.contains(KeyCode::BTN_TOOL_BRUSH)
-                || k.contains(KeyCode::BTN_TOOL_PENCIL)
-                || k.contains(KeyCode::BTN_TOOL_AIRBRUSH)
-        });
-        let has_finger = keys.is_some_and(|k| k.contains(KeyCode::BTN_TOOL_FINGER));
-        let has_touch_button = keys.is_some_and(|k| k.contains(KeyCode::BTN_TOUCH));
-        let has_abs_xy = abs.is_some_and(|a| {
-            a.contains(AbsoluteAxisCode::ABS_X) && a.contains(AbsoluteAxisCode::ABS_Y)
-        });
-        let has_mt_xy = abs.is_some_and(|a| {
-            a.contains(AbsoluteAxisCode::ABS_MT_POSITION_X)
-                && a.contains(AbsoluteAxisCode::ABS_MT_POSITION_Y)
-        });
-        let is_touchpad = tag_touchpad
-            || (!has_pen
-                && props.contains(evdev::PropType::BUTTONPAD)
-                && (has_abs_xy || has_mt_xy))
-            || (use_evdev_fallback
-                && !has_pen
-                && (props.contains(evdev::PropType::POINTER)
-                    || props.contains(evdev::PropType::BUTTONPAD)
-                    || has_finger)
-                && (has_abs_xy || has_mt_xy));
-        // libwacom may assign the tablet tag to companion touch and pad
-        // nodes.  Upstream dispatches those nodes as touchpads, touchscreens,
-        // or tablet pads before considering the tablet-tool interface.
-        let mut has_tablet = (tag_tablet && !tag_touchpad && !tag_touchscreen && !tag_tablet_pad)
-            || (use_evdev_fallback && has_pen);
-        let mut has_touch = tag_touchscreen
-            || (use_evdev_fallback
-                && !has_pen
-                && !is_touchpad
-                && has_touch_button
-                && (has_abs_xy || has_mt_xy));
         let input_id = device.input_id();
-        let has_tablet_pad = tag_tablet_pad
-            || (use_evdev_fallback
-                && !is_keyboard
-                && !has_pen
-                && !has_finger
-                && !has_touch_button
-                && device.supported_events().contains(EventType::ABSOLUTE)
-                && keys.is_some_and(|k| {
-                    k.contains(KeyCode::BTN_0)
-                        || (input_id.vendor() == 0x056a && k.iter().any(|key| key.0 >= 0x100))
-                }));
-        let has_supported_switch = device
-            .supported_switches()
-            .is_some_and(|switches| switches.iter().any(|switch| matches!(switch.0, 0 | 1 | 10)));
-        let has_switch = has_supported_switch && (tag_switch || use_evdev_fallback);
-        let has_relative_pointer = rel.is_some_and(|r| {
-            r.contains(RelativeAxisCode::REL_X)
-                || r.contains(RelativeAxisCode::REL_Y)
-                || r.contains(RelativeAxisCode::REL_WHEEL)
-                || r.contains(RelativeAxisCode::REL_HWHEEL)
-                || r.contains(RelativeAxisCode::REL_WHEEL_HI_RES)
-                || r.contains(RelativeAxisCode::REL_HWHEEL_HI_RES)
-        });
-        let has_relative_motion = rel.is_some_and(|r| {
-            r.contains(RelativeAxisCode::REL_X) || r.contains(RelativeAxisCode::REL_Y)
-        });
-        let has_wheel = rel.is_some_and(|r| {
-            r.contains(RelativeAxisCode::REL_WHEEL)
-                || r.contains(RelativeAxisCode::REL_HWHEEL)
-                || r.contains(RelativeAxisCode::REL_WHEEL_HI_RES)
-                || r.contains(RelativeAxisCode::REL_HWHEEL_HI_RES)
-        });
-        let is_pointer = is_touchpad || tag_mouse || tag_pointing_stick || has_relative_pointer;
-        if !is_pointer
-            && !is_keyboard
-            && !has_touch
-            && !has_tablet
-            && !has_tablet_pad
-            && !has_switch
-        {
-            return;
-        }
 
         let lib_dev = Box::into_raw(Box::new(LibinputDevice::new(
             &name,
@@ -3925,93 +4353,91 @@ impl BackendState {
             (*ctx).seat,
             ctx,
         )));
-        (*lib_dev).has_pointer = is_pointer;
-        (*lib_dev).has_keyboard = is_keyboard;
-        (*lib_dev).has_touch = has_touch;
-        (*lib_dev).has_gesture = is_touchpad && !props.contains(evdev::PropType::SEMI_MT);
-        (*lib_dev).hold_enabled = (*lib_dev).has_gesture;
-        (*lib_dev).hold_default_enabled = (*lib_dev).has_gesture;
-        (*lib_dev).mt_slot_count = if has_mt_slot { mt_slot_count } else { 0 };
-        (*lib_dev).has_switch = has_switch;
-        (*lib_dev).switch_codes = device
-            .supported_switches()
-            .map(|switches| {
-                switches
-                    .iter()
-                    .filter_map(|switch| matches!(switch.0, 0 | 1 | 10).then_some(switch.0))
-                    .collect()
-            })
-            .unwrap_or_default();
-        (*lib_dev).has_tablet = has_tablet;
-        (*lib_dev).has_tablet_pad = has_tablet_pad;
+        if let Some(group_id) = crate::udev::property_value(udev_pointer, "LIBINPUT_DEVICE_GROUP") {
+            let shared_group = self.devices.values().find_map(|tracked| {
+                let candidate = (*tracked.lib_device).udev_device;
+                (!candidate.is_null()
+                    && crate::udev::property_value(candidate, "LIBINPUT_DEVICE_GROUP").as_deref()
+                        == Some(group_id.as_str()))
+                .then_some((*tracked.lib_device).group)
+            });
+            if let Some(group) = shared_group {
+                (*lib_dev).share_group(group);
+            }
+        }
         (*lib_dev).abs_x_range = abs_x_range_raw;
         (*lib_dev).abs_y_range = abs_y_range_raw;
         (*lib_dev).abs_x_resolution = abs_x_resolution.filter(|resolution| *resolution > 0);
         (*lib_dev).abs_y_resolution = abs_y_resolution.filter(|resolution| *resolution > 0);
-        (*lib_dev).calibration_available = has_abs_xy
-            && !is_touchpad
-            && !has_tablet_pad
-            && (!has_tablet
-                || props.contains(evdev::PropType::DIRECT)
-                || tablet_is_display_device(path));
-        (*lib_dev).area_available = has_tablet && !props.contains(evdev::PropType::DIRECT);
-        (*lib_dev).accel_available =
-            (is_touchpad || has_relative_motion || has_tablet) && !has_tablet_pad;
-        (*lib_dev).supports_button_scroll = is_pointer
-            && !has_tablet
-            && !has_tablet_pad
-            && has_relative_motion
-            && keys.is_some_and(|codes| {
-                codes.iter().any(|code| {
-                    (KeyCode::BTN_0.0..=KeyCode::BTN_9.0).contains(&code.0)
-                        || (KeyCode::BTN_LEFT.0..=KeyCode::BTN_TASK.0).contains(&code.0)
-                })
-            });
-        (*lib_dev).scroll_methods = u32::from((*lib_dev).supports_button_scroll) * 4;
         let mut event_codes: Vec<u16> = keys
             .map(|codes| codes.iter().map(|code| code.0).collect())
             .unwrap_or_default();
-        // Devices may legitimately carry more than one udev role (for
-        // example a keyboard receiver that also exposes pointer axes).
-        // Preserve every applicable role for quirk matching instead of
-        // letting an arbitrary single role hide keyboard integration quirks.
+        // Match quirks against raw udev roles. Quirk mutations must not feed
+        // back into section matching; they are consumed by classification
+        // only after the complete ordered quirk tree has resolved.
         let mut udev_types = Vec::new();
-        if is_keyboard || tag_key {
+        if tag_keyboard {
             udev_types.push("keyboard");
         }
-        if is_touchpad {
+        if tag_key {
+            udev_types.push("key");
+        }
+        if tag_touchpad {
             udev_types.push("touchpad");
         }
-        if has_touch {
+        if tag_touchscreen {
             udev_types.push("touchscreen");
         }
-        if has_tablet {
+        if tag_tablet {
             udev_types.push("tablet");
         }
-        if has_tablet_pad {
+        if tag_tablet_pad {
             udev_types.push("tablet-pad");
         }
         if tag_pointing_stick {
             udev_types.push("pointingstick");
         }
-        if tag_mouse || has_relative_pointer {
+        if tag_mouse {
             udev_types.push("mouse");
         }
-        if has_switch {
+        if tag_switch {
             udev_types.push("switch");
         }
         if udev_types.is_empty() {
             udev_types.push("unknown");
         }
-        let applied_quirks = crate::quirks::apply_quirks(
-            &name,
-            input_id.bus_type().0,
-            input_id.vendor(),
-            input_id.product(),
-            input_id.version(),
-            &udev_types,
+        let applied_quirks = std::sync::Arc::new(self.quirks.resolve(
+            &crate::quirks::QuirkProbe {
+                name: &name,
+                bus: input_id.bus_type().0,
+                vendor: input_id.vendor(),
+                product: input_id.product(),
+                version: input_id.version(),
+                udev_types: &udev_types,
+            },
             &mut event_codes,
-        );
+        ));
+        if !applied_quirks.parity_failures.is_empty() {
+            for failure in &applied_quirks.parity_failures {
+                crate::emit_error_log(ctx, &format!("quirk parity failure: {failure}"));
+            }
+            drop(Box::from_raw(lib_dev));
+            return;
+        }
+        if applied_quirks.ignore_device {
+            crate::emit_debug_log(ctx, &format!("{name}: ignored by resolved quirks"));
+            drop(Box::from_raw(lib_dev));
+            return;
+        }
+        if !applied_quirks.matched_sections.is_empty() {
+            crate::emit_debug_log(
+                ctx,
+                &format!(
+                    "{name}: matched quirks {}",
+                    applied_quirks.matched_sections.join(", ")
+                ),
+            );
+        }
         for message in &applied_quirks.messages {
             crate::emit_debug_log(ctx, message);
         }
@@ -4036,13 +4462,260 @@ impl BackendState {
             "INPUT_PROP_BUTTONPAD",
             props.contains(evdev::PropType::BUTTONPAD),
         );
+        let effective_pointer = input_prop_enabled(
+            "INPUT_PROP_POINTER",
+            props.contains(evdev::PropType::POINTER),
+        );
         let effective_semi_mt = input_prop_enabled(
             "INPUT_PROP_SEMI_MT",
             props.contains(evdev::PropType::SEMI_MT),
         );
+        let effective_direct =
+            input_prop_enabled("INPUT_PROP_DIRECT", props.contains(evdev::PropType::DIRECT));
+        let is_topbuttonpad = input_prop_enabled(
+            "INPUT_PROP_TOPBUTTONPAD",
+            props.contains(evdev::PropType::TOPBUTTONPAD),
+        );
+        let tag_pointing_stick = input_prop_enabled(
+            "INPUT_PROP_POINTING_STICK",
+            props.contains(evdev::PropType::POINTING_STICK),
+        ) || has_tag("ID_INPUT_POINTINGSTICK");
+        let absolute_events_enabled = !applied_quirks.disable_all_absolute_axes;
+        let has_abs_xy = absolute_events_enabled && has_abs_x && has_abs_y;
+        let has_mt_xy = absolute_events_enabled && has_mt_x && has_mt_y;
+        let has_mt_slot = absolute_events_enabled && has_mt_slot;
+        let has_key_code = |code: u16| event_codes.contains(&code);
+        let has_pen = [
+            KeyCode::BTN_TOOL_PEN.0,
+            KeyCode::BTN_TOOL_RUBBER.0,
+            KeyCode::BTN_TOOL_BRUSH.0,
+            KeyCode::BTN_TOOL_PENCIL.0,
+            KeyCode::BTN_TOOL_AIRBRUSH.0,
+        ]
+        .into_iter()
+        .any(has_key_code);
+        let has_finger = has_key_code(KeyCode::BTN_TOOL_FINGER.0);
+        let has_touch_button = has_key_code(KeyCode::BTN_TOUCH.0);
+        let keyboard_key_count = event_codes.iter().filter(|code| **code < 0x100).count();
+        let has_relative_motion = rel.is_some_and(|axes| {
+            axes.contains(RelativeAxisCode::REL_X) || axes.contains(RelativeAxisCode::REL_Y)
+        });
+        let has_wheel = rel.is_some_and(|axes| {
+            axes.contains(RelativeAxisCode::REL_WHEEL)
+                || axes.contains(RelativeAxisCode::REL_HWHEEL)
+                || (!applied_quirks.disable_hi_res_wheel_vertical
+                    && axes.contains(RelativeAxisCode::REL_WHEEL_HI_RES))
+                || (!applied_quirks.disable_hi_res_wheel_horizontal
+                    && axes.contains(RelativeAxisCode::REL_HWHEEL_HI_RES))
+        });
+        let has_relative_pointer = has_relative_motion || has_wheel;
+        let has_supported_switch = device
+            .supported_switches()
+            .is_some_and(|switches| switches.iter().any(|switch| matches!(switch.0, 0 | 1 | 10)));
+        let has_switch = has_supported_switch && (tag_switch || use_evdev_fallback);
+        let effective_forged_kind = if has_pen && (has_abs_xy || has_mt_xy) {
+            crate::capforge::CapabilityKind::Tablet
+        } else if !effective_direct
+            && (has_finger || (has_touch_button && effective_pointer))
+            && (has_abs_xy || has_mt_xy)
+        {
+            crate::capforge::CapabilityKind::Touchpad
+        } else if (effective_direct || has_touch_button) && (has_abs_xy || has_mt_xy) {
+            crate::capforge::CapabilityKind::Touchscreen
+        } else if has_relative_pointer {
+            crate::capforge::CapabilityKind::Mouse
+        } else if keyboard_key_count > 20 {
+            crate::capforge::CapabilityKind::Keyboard
+        } else if keyboard_key_count > 0 {
+            crate::capforge::CapabilityKind::Key
+        } else if has_switch {
+            crate::capforge::CapabilityKind::Switch
+        } else {
+            crate::capforge::CapabilityKind::Unknown
+        };
+        let hint_supported = match applied_quirks.class_hint {
+            None => true,
+            Some(crate::quirks::DeviceClassHint::Keyboard) => keyboard_key_count > 0,
+            Some(crate::quirks::DeviceClassHint::Mouse) => has_relative_pointer,
+            Some(crate::quirks::DeviceClassHint::Touchpad) => {
+                !effective_direct && !has_pen && (has_abs_xy || has_mt_xy)
+            }
+            Some(crate::quirks::DeviceClassHint::Touchscreen) => has_abs_xy || has_mt_xy,
+            Some(crate::quirks::DeviceClassHint::Tablet) => has_pen && (has_abs_xy || has_mt_xy),
+            Some(crate::quirks::DeviceClassHint::TabletPad) => {
+                absolute_events_enabled && !event_codes.is_empty()
+            }
+            Some(crate::quirks::DeviceClassHint::Switch) => has_supported_switch,
+        };
+        if !hint_supported {
+            crate::emit_error_log(
+                ctx,
+                &format!("{name}: quirk class hint is incompatible with kernel capabilities"),
+            );
+            drop(Box::from_raw(lib_dev));
+            return;
+        }
+        let class_hint = applied_quirks.class_hint;
+        let is_keyboard = tag_keyboard
+            || class_hint == Some(crate::quirks::DeviceClassHint::Keyboard)
+            || ((use_evdev_fallback || tag_key) && keyboard_key_count > 0)
+            || (use_evdev_fallback
+                && matches!(
+                    effective_forged_kind,
+                    crate::capforge::CapabilityKind::Keyboard
+                        | crate::capforge::CapabilityKind::Key
+                ));
+        let is_typewriter_keyboard =
+            is_keyboard && (16_u16..=25).all(|code| event_codes.contains(&code));
+        let is_touchpad = class_hint == Some(crate::quirks::DeviceClassHint::Touchpad)
+            || tag_touchpad
+            || (use_evdev_fallback
+                && effective_forged_kind == crate::capforge::CapabilityKind::Touchpad)
+            || (!effective_direct && !has_pen && effective_buttonpad && (has_abs_xy || has_mt_xy))
+            || (use_evdev_fallback
+                && !effective_direct
+                && !has_pen
+                && (effective_pointer || effective_buttonpad || has_finger)
+                && (has_abs_xy || has_mt_xy));
+        let mut has_tablet = class_hint == Some(crate::quirks::DeviceClassHint::Tablet)
+            || (tag_tablet && !tag_touchpad && !tag_touchscreen && !tag_tablet_pad)
+            || (use_evdev_fallback
+                && (has_pen || effective_forged_kind == crate::capforge::CapabilityKind::Tablet));
+        let has_tablet_pad = class_hint == Some(crate::quirks::DeviceClassHint::TabletPad)
+            || tag_tablet_pad
+            || (use_evdev_fallback
+                && absolute_events_enabled
+                && !is_keyboard
+                && !has_pen
+                && !has_finger
+                && !has_touch_button
+                && event_codes.iter().any(|code| *code >= 0x100));
+        let mut has_touch = class_hint == Some(crate::quirks::DeviceClassHint::Touchscreen)
+            || tag_touchscreen
+            || (use_evdev_fallback
+                && effective_forged_kind == crate::capforge::CapabilityKind::Touchscreen)
+            || (use_evdev_fallback
+                && !has_pen
+                && !is_touchpad
+                && (effective_direct || has_touch_button)
+                && (has_abs_xy || has_mt_xy));
+        let is_pointer = class_hint == Some(crate::quirks::DeviceClassHint::Mouse)
+            || is_touchpad
+            || tag_mouse
+            || tag_pointing_stick
+            || has_relative_pointer
+            || (use_evdev_fallback
+                && effective_forged_kind == crate::capforge::CapabilityKind::Mouse);
+        // INPUT_PROP_ACCELEROMETER is not an exclusive device class. Some
+        // tablet pads expose it alongside their pad buttons and rings, so
+        // reject only nodes for which no supported class survived the full
+        // post-quirk capability lattice.
+        if !is_pointer
+            && !is_keyboard
+            && !has_touch
+            && !has_tablet
+            && !has_tablet_pad
+            && !has_switch
+        {
+            drop(Box::from_raw(lib_dev));
+            return;
+        }
+        let is_external_mouse = is_pointer
+            && !is_touchpad
+            && !tag_pointing_stick
+            && matches!(input_id.bus_type().0, 0x03 | 0x05);
+        let profile_kind = if is_touchpad {
+            crate::capforge::CapabilityKind::Touchpad
+        } else if has_touch {
+            crate::capforge::CapabilityKind::Touchscreen
+        } else if has_tablet {
+            crate::capforge::CapabilityKind::Tablet
+        } else if is_pointer {
+            crate::capforge::CapabilityKind::Mouse
+        } else if is_keyboard {
+            crate::capforge::CapabilityKind::Keyboard
+        } else if has_switch {
+            crate::capforge::CapabilityKind::Switch
+        } else {
+            effective_forged_kind
+        };
+        let mut profile_properties = database_properties.clone();
+        for key in [
+            "ID_INPUT_KEYBOARD",
+            "ID_INPUT_MOUSE",
+            "ID_INPUT_POINTINGSTICK",
+            "ID_INPUT_TOUCHPAD",
+            "ID_INPUT_TOUCHSCREEN",
+            "ID_INPUT_TABLET",
+        ] {
+            if let Some(value) = property_value(key) {
+                profile_properties.insert(key.to_string(), value);
+            }
+        }
+        let system_profile_facts = crate::chwd_input::scan_system_facts();
+        let profile_facts = crate::chwd_input::DeviceFacts {
+            name: &name,
+            bus: input_id.bus_type().0,
+            vendor: input_id.vendor(),
+            product: input_id.product(),
+            kind: profile_kind,
+            properties: &profile_properties,
+            has_relative_motion,
+            has_absolute_xy: has_abs_xy,
+            has_multitouch: has_mt_xy,
+            key_count: event_codes.len(),
+        };
+        let hardware_detection =
+            crate::chwd_input::detect_device(&system_profile_facts, &profile_facts, true);
+        let hardware_profile = (hardware_detection.source
+            == crate::chwd_input::DetectSource::Profile)
+            .then_some(hardware_detection);
+        if hardware_detection.source != crate::chwd_input::DetectSource::Heuristic {
+            crate::emit_debug_log(
+                ctx,
+                &format!(
+                    "[libinput-rs/chwd] {} selected {} (prio {}, confidence {:.3}, source {:?})",
+                    name,
+                    hardware_detection.profile_id,
+                    hardware_detection.priority,
+                    hardware_detection.confidence,
+                    hardware_detection.source
+                ),
+            );
+        }
+        (*lib_dev).has_pointer = is_pointer;
+        (*lib_dev).has_keyboard = is_keyboard;
+        (*lib_dev).has_touch = has_touch;
+        (*lib_dev).has_tablet = has_tablet;
+        (*lib_dev).has_tablet_pad = has_tablet_pad;
+        (*lib_dev).has_switch = has_switch;
+        (*lib_dev).switch_codes = device
+            .supported_switches()
+            .map(|switches| {
+                switches
+                    .iter()
+                    .filter_map(|switch| matches!(switch.0, 0 | 1 | 10).then_some(switch.0))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (*lib_dev).mt_slot_count = if has_mt_slot { mt_slot_count } else { 0 };
+        (*lib_dev).calibration_available = has_abs_xy
+            && !is_touchpad
+            && !has_tablet_pad
+            && (!has_tablet || effective_direct || tablet_is_display_device(path));
+        (*lib_dev).area_available = has_tablet && !effective_direct;
         (*lib_dev).has_gesture = is_touchpad && !effective_semi_mt;
         (*lib_dev).hold_enabled = (*lib_dev).has_gesture;
         (*lib_dev).hold_default_enabled = (*lib_dev).has_gesture;
+        (*lib_dev).supports_button_scroll = is_pointer
+            && !has_tablet
+            && !has_tablet_pad
+            && has_relative_motion
+            && event_codes.iter().any(|code| {
+                (KeyCode::BTN_0.0..=KeyCode::BTN_9.0).contains(code)
+                    || (KeyCode::BTN_LEFT.0..=KeyCode::BTN_TASK.0).contains(code)
+            });
+        (*lib_dev).scroll_methods = u32::from((*lib_dev).supports_button_scroll) * 4;
         if applied_quirks.model_hp_zbook_studio_g3 {
             mt_slot_count = mt_slot_count.min(2);
             (*lib_dev).mt_slot_count = mt_slot_count;
@@ -4151,6 +4824,10 @@ impl BackendState {
                     + u32::from(
                         abs.is_some_and(|axes| axes.contains(AbsoluteAxisCode::ABS_THROTTLE)),
                     );
+            if applied_quirks.model_wacom_intuos_pro3rd {
+                (*lib_dev).tablet_pad_num_rings = (*lib_dev).tablet_pad_num_dials;
+                (*lib_dev).tablet_pad_num_dials = 0;
+            }
             (*lib_dev).tablet_pad_num_strips =
                 u32::from(abs.is_some_and(|axes| axes.contains(AbsoluteAxisCode::ABS_RX)))
                     + u32::from(abs.is_some_and(|axes| axes.contains(AbsoluteAxisCode::ABS_RY)));
@@ -4188,10 +4865,8 @@ impl BackendState {
         if applied_quirks.model_apple_touchpad_onebutton {
             click_methods = 2;
         }
-        let clickfinger_is_default = applied_quirks.model_apple_touchpad
-            || applied_quirks.model_apple_touchpad_onebutton
-            || applied_quirks.model_clickfinger_default
-            || (is_clickpad && input_id.vendor() == 0x05ac);
+        let clickfinger_is_default =
+            applied_quirks.is_clickfinger_default() || (is_clickpad && input_id.vendor() == 0x05ac);
         let click_default_method = if clickfinger_is_default && click_methods & 2 != 0 {
             2
         } else if click_methods & 1 != 0 {
@@ -4341,11 +5016,11 @@ impl BackendState {
         // INPUT_PROP_PRESSUREPAD (0x07) and a non-zero ABS_MT_PRESSURE
         // resolution mean the axis is contact/touch detection data rather
         // than the raw palm-pressure signal used by libinput's palm logic.
-        let pressurepad_property = props.contains(evdev::PropType(0x07))
-            || applied_quirks
-                .enabled_input_props
-                .iter()
-                .any(|property| property == "INPUT_PROP_PRESSUREPAD");
+        let pressurepad_property = applied_quirks.model_pressure_pad
+            || input_prop_enabled(
+                "INPUT_PROP_PRESSUREPAD",
+                props.contains(evdev::PropType(0x07)),
+            );
         let has_raw_mt_pressure = !applied_quirks.disable_abs_mt_pressure
             && device.get_absinfo().ok().is_some_and(|axes| {
                 axes.into_iter().any(|(axis, info)| {
@@ -4385,14 +5060,6 @@ impl BackendState {
                 })
             })
             .flatten();
-        let palm_pressure_threshold = (palm_detection_enabled && has_raw_mt_pressure)
-            .then_some(applied_quirks.palm_pressure_threshold.unwrap_or(130))
-            .filter(|threshold| *threshold != 0);
-        let palm_size_threshold = palm_detection_enabled
-            .then_some(applied_quirks.palm_size_threshold)
-            .flatten()
-            .filter(|threshold| *threshold != 0);
-
         if let Ok(absinfo) = device.get_absinfo() {
             let mut x = None;
             let mut y = None;
@@ -4493,98 +5160,59 @@ impl BackendState {
         (*ctx).register_fd(fd);
 
         let restricted_fd = restricted_guard.map(RestrictedFdGuard::disarm);
+        if !absolute_events_enabled {
+            (*lib_dev).abs_x_range = None;
+            (*lib_dev).abs_y_range = None;
+            (*lib_dev).abs_x_resolution = None;
+            (*lib_dev).abs_y_resolution = None;
+            (*lib_dev).calibration_available = false;
+            (*lib_dev).area_available = false;
+        }
         let mut td = TrackedDevice::new(
             device,
+            std::sync::Arc::clone(&applied_quirks),
             restricted_fd,
             path.to_path_buf(),
             lib_dev,
-            is_touchpad || has_touch || has_tablet || (is_pointer && has_abs_xy),
-            is_pointer && has_abs_xy && !is_touchpad,
+            absolute_events_enabled
+                && (is_touchpad || has_touch || has_tablet || (is_pointer && has_abs_xy)),
+            absolute_events_enabled && is_pointer && has_abs_xy && !is_touchpad,
             is_keyboard,
             is_typewriter_keyboard,
-            matches!(
-                applied_quirks.keyboard_integration,
-                Some(crate::quirks::KeyboardIntegration::Internal)
-            ),
+            false,
             is_pointer,
+            is_external_mouse,
             is_touchpad,
             external_touchpad,
-            palm_pressure_threshold,
-            palm_size_threshold,
-            applied_quirks
-                .pressure_range
-                .or(default_touch_pressure_range),
-            applied_quirks
-                .touch_size_range
-                .filter(|_| mt_size_major_resolution.is_some()),
+            None,
+            None,
+            None,
+            None,
             is_clickpad,
             is_topbuttonpad,
             tag_pointing_stick,
             input_id.vendor(),
             input_id.product(),
         );
-        td.pointing_stick_internal = tag_pointing_stick
-            && !matches!(
-                applied_quirks.pointing_stick_integration,
-                Some(crate::quirks::KeyboardIntegration::External)
-            )
-            && !matches!(input_id.bus_type().0, 0x03 | 0x05);
-        td.is_semi_mt = effective_semi_mt;
-        td.trackpoint_multiplier = applied_quirks.trackpoint_multiplier.unwrap_or(1.0);
-        td.invert_horizontal_scrolling = applied_quirks.model_invert_horizontal_scrolling;
-        td.debounce_disabled = applied_quirks.model_bouncing_keys;
-        td.tablet_mode_no_suspend = applied_quirks.model_tablet_mode_no_suspend;
-        td.touchpad_visible_marker = applied_quirks.model_touchpad_visible_marker;
-        td.touchpad_phantom_clicks = applied_quirks.model_touchpad_phantom_clicks;
-        td.thumb_pressure_threshold = applied_quirks.thumb_pressure_threshold.map(f64::from);
-        td.thumb_size_threshold = applied_quirks.thumb_size_threshold.map(f64::from);
-        td.thumb_detection_enabled =
-            is_clickpad && (*lib_dev).height_mm.is_some_and(|height| height >= 50.0);
-        if palm_detection_enabled && !applied_quirks.model_apple_touchpad {
-            if let (Some(width), Some((minimum, maximum))) = (
-                (*lib_dev).width_mm,
-                (*lib_dev).abs_x_range.or(td.abs_x_range),
-            ) {
-                if width >= 70.0 {
-                    let edge_mm = 8.0_f64.min(width * 0.08);
-                    let edge_units = f64::from(maximum - minimum) * edge_mm / width;
-                    td.palm_left_edge = Some(f64::from(minimum) + edge_units);
-                    td.palm_right_edge = Some(f64::from(maximum) - edge_units);
-                }
-            }
-            if !is_topbuttonpad {
-                if let (Some(height), Some((minimum, maximum))) = (
-                    (*lib_dev).height_mm,
-                    (*lib_dev).abs_y_range.or(td.abs_y_range),
-                ) {
-                    if height > 55.0 {
-                        td.palm_upper_edge =
-                            Some(f64::from(minimum) + f64::from(maximum - minimum) * 0.05);
-                    }
-                }
-            }
-        }
-        if applied_quirks.model_hp_zbook_studio_g3 {
-            td.mt_slots.truncate(2);
-        }
-        if applied_quirks.model_hp_pavilion_dm4_touchpad {
-            td.mt_slots.truncate(1);
-        }
-        if applied_quirks.disable_abs_mt_pressure {
-            td.has_mt_pressure = false;
-            td.touch_pressure_range = None;
-            for slot in &mut td.mt_slots {
-                slot.pressure = 0.0;
-            }
-        }
-        if applied_quirks.disable_abs_distance {
-            td.tablet_has_distance = false;
-        }
-        if applied_quirks.disable_abs_mt_tool_type {
-            for slot in &mut td.mt_slots {
-                slot.tool_type = 0;
-            }
-        }
+        td.seed_resolved_quirks(
+            lib_dev,
+            QuirkSeedContext {
+                hardware_profile,
+                tag_pointing_stick,
+                bus_type: input_id.bus_type().0,
+                is_clickpad,
+                is_topbuttonpad,
+                is_semi_mt: effective_semi_mt,
+                palm_detection_enabled,
+                has_raw_mt_pressure,
+                default_touch_pressure_range,
+                has_mt_size_resolution: mt_size_major_resolution.is_some(),
+            },
+        );
+        td.pointer_dpi = crate::udev::property_value(udev_pointer, "MOUSE_DPI")
+            .as_deref()
+            .and_then(parse_mouse_dpi)
+            .unwrap_or(1_000.0);
         let udev_fuzz = |primary: &str, fallback: &str| {
             crate::udev::property_value(raw_udev_device, primary)
                 .or_else(|| crate::udev::property_value(raw_udev_device, fallback))
@@ -4601,19 +5229,6 @@ impl BackendState {
         // clears it from evdev so the kernel does not filter the same axis a
         // second time. Keep that observable evdev behavior ABI-compatible.
         clear_kernel_abs_fuzz(&td.device);
-        if applied_quirks.disable_hi_res_wheel_vertical {
-            td.supports_hi_res_vertical = false;
-        }
-        if applied_quirks.disable_hi_res_wheel_horizontal {
-            td.supports_hi_res_horizontal = false;
-        }
-        if applied_quirks.disable_tablet_tilt_x || applied_quirks.disable_tablet_tilt_y {
-            td.tablet_has_tilt = false;
-        }
-        td.wheel_is_virtual = applied_quirks.is_virtual;
-        td.is_lenovo_scrollpoint = applied_quirks.model_lenovo_scrollpoint;
-        td.lid_write_open = (*lib_dev).switch_codes.contains(&0)
-            && applied_quirks.lid_switch_reliability.as_deref() != Some("reliable");
 
         out.push(LibinputEvent {
             event_type: LibinputEventType::LIBINPUT_EVENT_DEVICE_ADDED,
@@ -4623,11 +5238,15 @@ impl BackendState {
         });
         if let Ok(active_switches) = td.device.get_switch_state() {
             for code in (*lib_dev).switch_codes.iter().copied() {
-                if code == 0 && applied_quirks.lid_switch_reliability.as_deref() != Some("reliable")
+                if code == 0
+                    && matches!(
+                        applied_quirks.lid_switch_reliability.as_deref(),
+                        Some("unreliable" | "write_open")
+                    )
                 {
                     if active_switches.contains(evdev::SwitchCode(code)) {
                         td.ignored_initial_switches.insert(code);
-                        self.lid_closed = true;
+                        self.lid_unreliable_closed = true;
                     }
                     continue;
                 }
@@ -4672,6 +5291,22 @@ impl BackendState {
         }
         self.devices.insert(fd, td);
         self.pair_new_dwt_device(fd);
+
+        if is_external_mouse {
+            let touchpads = self
+                .devices
+                .values()
+                .filter(|tracked| {
+                    tracked.is_touchpad && (*tracked.lib_device).send_events_mode == 2
+                })
+                .map(|tracked| tracked.lib_device)
+                .collect::<Vec<_>>();
+            let mut releases = VecDeque::new();
+            for touchpad in touchpads {
+                self.release_active_inputs(ctx, touchpad, &mut releases);
+            }
+            out.extend(releases);
+        }
     }
 
     pub unsafe fn stop_scroll_for_device(
@@ -4741,7 +5376,7 @@ impl BackendState {
         };
         let time_usec = systime_to_usec(SystemTime::now());
         for key in tracked.held_keys.drain(..) {
-            let seat_key_count = release_seat_key(device);
+            let seat_key_count = release_seat_key(device, key.code);
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_KEYBOARD_KEY,
                 payload: EventPayload::KeyboardKey(KeyboardKeyEvent {
@@ -4762,7 +5397,7 @@ impl BackendState {
             if active_click.is_some_and(|(active_button, _)| active_button == button) {
                 continue;
             }
-            let seat_button_count = release_seat_button(device);
+            let seat_button_count = release_seat_button(device, button);
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
                 payload: EventPayload::PointerButton(PointerButtonEvent {
@@ -4776,7 +5411,7 @@ impl BackendState {
             });
         }
         if let Some((button, event_device)) = active_click {
-            let seat_button_count = release_seat_button(event_device);
+            let seat_button_count = release_seat_button(event_device, button);
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
                 payload: EventPayload::PointerButton(PointerButtonEvent {
@@ -4792,7 +5427,10 @@ impl BackendState {
         if let Some(button) = tracked.tap_button_down.take() {
             tracked.tap_release_since = None;
             tracked.tap_drag_active = false;
-            let seat_button_count = release_seat_button(device);
+            tracked.tap_drag_lock_waiting = false;
+            tracked.tap_drag_lock_resumed = false;
+            tracked.tap_drag_lock_moved = false;
+            let seat_button_count = release_seat_button(device, button);
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
                 payload: EventPayload::PointerButton(PointerButtonEvent {
@@ -4810,7 +5448,7 @@ impl BackendState {
             tracked.drag_3fg_candidate_since = None;
             tracked.drag_3fg_candidate_time_usec = 0;
             tracked.drag_3fg_release_since = None;
-            let seat_button_count = release_seat_button(device);
+            let seat_button_count = release_seat_button(device, KeyCode::BTN_LEFT.0);
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
                 payload: EventPayload::PointerButton(PointerButtonEvent {
@@ -4826,7 +5464,7 @@ impl BackendState {
         if !tracked.tablet_tool.is_null() {
             let tool = tracked.tablet_tool;
             for button in std::mem::take(&mut tracked.tablet_held_buttons) {
-                let seat_button_count = release_seat_button(device);
+                let seat_button_count = release_seat_button(device, button as u16);
                 (*tool)
                     .refcount
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5116,6 +5754,7 @@ impl BackendState {
             .values()
             .find(|tracked| tracked.is_pointing_stick)
             .map(|tracked| tracked.lib_device);
+        let external_mouse_present = self.has_external_mouse();
         // Process paired sources before touchpads so a keyboard or
         // trackpoint event and a following touch frame in the same dispatch
         // observe the new suppression state deterministically.
@@ -5162,7 +5801,15 @@ impl BackendState {
                     break;
                 }
 
-                let wakes_lid = self.lid_closed
+                if external_mouse_present
+                    && self.devices.get(&fd).is_some_and(|tracked| {
+                        tracked.is_touchpad && (*tracked.lib_device).send_events_mode == 2
+                    })
+                {
+                    continue;
+                }
+
+                let wakes_lid = (self.lid_closed || self.lid_unreliable_closed)
                     && self
                         .devices
                         .get(&fd)
@@ -5182,6 +5829,9 @@ impl BackendState {
                 let mut followups = Vec::new();
                 let inhibited = self.devices.get(&fd).is_some_and(|tracked| {
                     (self.lid_closed && tracked.is_touchpad)
+                        || (external_mouse_present
+                            && tracked.is_touchpad
+                            && (*tracked.lib_device).send_events_mode == 2)
                         || (self.tablet_mode
                             && (tracked.is_touchpad
                                 || (tracked.is_keyboard && tracked.keyboard_internal)
@@ -5242,6 +5892,7 @@ impl BackendState {
                                     let changed = self.lid_closed != state;
                                     self.lid_closed = state;
                                     self.lid_client_closed = state;
+                                    self.lid_unreliable_closed = false;
                                     changed
                                 }
                                 2 => {
@@ -5306,6 +5957,8 @@ impl BackendState {
                         finger_count: tracked.hold_fingers,
                         dx: 0.0,
                         dy: 0.0,
+                        dx_unaccel: 0.0,
+                        dy_unaccel: 0.0,
                         scale: 1.0,
                         angle: 0.0,
                         cancelled,
@@ -5359,6 +6012,7 @@ impl BackendState {
                 hold_timeout
             };
             if !(*tracked.lib_device).has_gesture
+                || !(*tracked.lib_device).hold_enabled
                 || tracked.hold_active
                 || tracked.hold_blocked
                 || !tracked
@@ -5384,6 +6038,8 @@ impl BackendState {
                     finger_count: fingers,
                     dx: 0.0,
                     dy: 0.0,
+                    dx_unaccel: 0.0,
+                    dy_unaccel: 0.0,
                     scale: 1.0,
                     angle: 0.0,
                     cancelled: false,
@@ -5405,10 +6061,13 @@ impl BackendState {
             }
             tracked.tap_release_since = None;
             tracked.tap_drag_active = false;
+            tracked.tap_drag_lock_waiting = false;
+            tracked.tap_drag_lock_resumed = false;
+            tracked.tap_drag_lock_moved = false;
             let Some(button) = tracked.tap_button_down.take() else {
                 continue;
             };
-            let seat_button_count = release_seat_button(tracked.lib_device);
+            let seat_button_count = release_seat_button(tracked.lib_device, button);
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
                 payload: EventPayload::PointerButton(PointerButtonEvent {
@@ -5434,7 +6093,7 @@ impl BackendState {
             if !std::mem::take(&mut tracked.drag_3fg_button_down) {
                 continue;
             }
-            let seat_button_count = release_seat_button(tracked.lib_device);
+            let seat_button_count = release_seat_button(tracked.lib_device, KeyCode::BTN_LEFT.0);
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
                 payload: EventPayload::PointerButton(PointerButtonEvent {
@@ -5528,9 +6187,7 @@ impl BackendState {
             if let Some(td) = self.devices.remove(&fd) {
                 (*ctx).unregister_fd(fd);
                 let lib_device = td.close((*ctx).interface, (*ctx).user_data);
-                (*lib_device)
-                    .refcount
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::libinput_device_ref(lib_device);
                 out.push_back(LibinputEvent {
                     event_type: LibinputEventType::LIBINPUT_EVENT_DEVICE_REMOVED,
                     payload: EventPayload::DeviceRemoved,
@@ -5575,7 +6232,9 @@ impl BackendState {
         let next_hold_timeout = self
             .devices
             .values()
-            .filter(|tracked| !tracked.hold_active && !tracked.hold_blocked)
+            .filter(|tracked| {
+                (*tracked.lib_device).hold_enabled && !tracked.hold_active && !tracked.hold_blocked
+            })
             .filter_map(|tracked| {
                 tracked.hold_started_at.map(|since| {
                     let timeout = if tracked.hold_fingers <= 2 {
@@ -5615,6 +6274,8 @@ impl BackendState {
             .flatten()
             .map(|deadline| deadline.saturating_duration_since(timer_now))
             .min();
+        let next_reconcile_timeout =
+            ((*ctx).backend_kind == BackendKind::Udev).then(|| self.discovery.next_reconcile());
         let next_timeout = [
             next_middle_timeout,
             next_debounce_timeout,
@@ -5625,6 +6286,7 @@ impl BackendState {
             next_drag_3fg_timeout,
             next_edge_scroll_timeout,
             next_dwt_timeout,
+            next_reconcile_timeout,
         ]
         .into_iter()
         .flatten()
@@ -5644,13 +6306,7 @@ impl BackendState {
         if self.suspended {
             return;
         }
-        let saw_event = {
-            let Some(ref ino) = self.inotify else { return };
-            let Ok(ievents) = ino.read_events() else {
-                return;
-            };
-            !ievents.is_empty()
-        };
+        let saw_event = self.discovery.drain_changed();
         if !saw_event {
             return;
         }
@@ -5674,9 +6330,7 @@ impl BackendState {
             };
             (*ctx).unregister_fd(fd);
             let lib_device = tracked.close((*ctx).interface, (*ctx).user_data);
-            (*lib_device)
-                .refcount
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::libinput_device_ref(lib_device);
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_DEVICE_REMOVED,
                 payload: EventPayload::DeviceRemoved,
@@ -5712,9 +6366,7 @@ impl BackendState {
         for (fd, td) in self.devices.drain() {
             (*ctx).unregister_fd(fd);
             let lib_device = td.close((*ctx).interface, (*ctx).user_data);
-            (*lib_device)
-                .refcount
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::libinput_device_ref(lib_device);
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_DEVICE_REMOVED,
                 payload: EventPayload::DeviceRemoved,
@@ -5746,9 +6398,7 @@ impl BackendState {
             .expect("tracked device disappeared");
         (*ctx).unregister_fd(fd);
         let lib_device = tracked.close((*ctx).interface, (*ctx).user_data);
-        (*lib_device)
-            .refcount
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::libinput_device_ref(lib_device);
         out.push_back(LibinputEvent {
             event_type: LibinputEventType::LIBINPUT_EVENT_DEVICE_REMOVED,
             payload: EventPayload::DeviceRemoved,
@@ -5792,6 +6442,7 @@ impl BackendState {
         // aggregate inhibition state from the freshly opened switch nodes.
         self.lid_closed = false;
         self.lid_client_closed = false;
+        self.lid_unreliable_closed = false;
         self.tablet_mode = false;
         if (*ctx).backend_kind == BackendKind::Udev {
             let mut events = Vec::new();
@@ -5813,9 +6464,7 @@ impl BackendState {
             for (fd, tracked) in self.devices.drain() {
                 (*ctx).unregister_fd(fd);
                 let lib_device = tracked.close((*ctx).interface, (*ctx).user_data);
-                (*lib_device)
-                    .refcount
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::libinput_device_ref(lib_device);
                 out.push_back(LibinputEvent {
                     event_type: LibinputEventType::LIBINPUT_EVENT_DEVICE_REMOVED,
                     payload: EventPayload::DeviceRemoved,
@@ -5851,7 +6500,6 @@ impl BackendState {
         let is_tablet_pad = (*lib_dev).has_tablet_pad;
         let cfg_tap = (*lib_dev).tap_enabled;
         let cfg_nat = (*lib_dev).natural_scroll;
-        let cfg_accel = (*lib_dev).accel_speed as f32 + 1.0;
 
         if (*lib_dev).send_events_mode == 1 {
             if td.is_topbuttonpad {
@@ -5931,7 +6579,7 @@ impl BackendState {
             if is_kbd
                 && is_ptr
                 && event.event_type() == EventType::KEY
-                && !is_evdev_button_code(event.code())
+                && !crate::evtrans::is_button_code(event.code())
             {
                 Self::process_keyboard_event(event, ts_usec, lib_dev, ctx, td, out);
                 if matches!(event.value(), 0 | 1) {
@@ -5996,7 +6644,6 @@ impl BackendState {
                     out,
                     cfg_tap,
                     cfg_nat,
-                    cfg_accel,
                     touch_arbitrated,
                     followups,
                 );
@@ -6034,6 +6681,8 @@ impl BackendState {
                     finger_count: td.pinch_fingers,
                     dx: 0.0,
                     dy: 0.0,
+                    dx_unaccel: 0.0,
+                    dy_unaccel: 0.0,
                     scale: 1.0,
                     angle: 0.0,
                     cancelled: true,
@@ -6051,6 +6700,8 @@ impl BackendState {
                     finger_count: td.swipe_fingers,
                     dx: 0.0,
                     dy: 0.0,
+                    dx_unaccel: 0.0,
+                    dy_unaccel: 0.0,
                     scale: 1.0,
                     angle: 0.0,
                     cancelled: true,
@@ -6068,6 +6719,8 @@ impl BackendState {
                     finger_count: td.hold_fingers,
                     dx: 0.0,
                     dy: 0.0,
+                    dx_unaccel: 0.0,
+                    dy_unaccel: 0.0,
                     scale: 1.0,
                     angle: 0.0,
                     cancelled: true,
@@ -6079,7 +6732,10 @@ impl BackendState {
         if let Some(button) = td.tap_button_down.take() {
             td.tap_release_since = None;
             td.tap_drag_active = false;
-            let seat_button_count = release_seat_button(lib_dev);
+            td.tap_drag_lock_waiting = false;
+            td.tap_drag_lock_resumed = false;
+            td.tap_drag_lock_moved = false;
+            let seat_button_count = release_seat_button(lib_dev, button);
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
                 payload: EventPayload::PointerButton(PointerButtonEvent {
@@ -6095,7 +6751,7 @@ impl BackendState {
         if std::mem::take(&mut td.drag_3fg_button_down) {
             td.drag_3fg_active = false;
             td.drag_3fg_release_since = None;
-            let seat_button_count = release_seat_button(lib_dev);
+            let seat_button_count = release_seat_button(lib_dev, KeyCode::BTN_LEFT.0);
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
                 payload: EventPayload::PointerButton(PointerButtonEvent {
@@ -6454,7 +7110,10 @@ impl BackendState {
             } else {
                 (*(*device).tablet_pad_mode_group).current_mode
             },
-            mode_group: (*device).tablet_pad_mode_group,
+            mode_group: crate::libinput_tablet_pad_mode_group_ref(
+                (*device).tablet_pad_mode_group.cast(),
+            )
+            .cast(),
             ring_number: 0,
             ring_position: 0.0,
             ring_source: 0,
@@ -6470,6 +7129,8 @@ impl BackendState {
             let state = u32::from(ev.value() != 0);
             if (*lib_dev).vendor_id == 0x056a && matches!(ev.code(), 0x240 | 0x243 | 0x278) {
                 let mut event = payload(ts_usec, lib_dev);
+                crate::libinput_tablet_pad_mode_group_unref(event.mode_group.cast());
+                event.mode_group = std::ptr::null_mut();
                 event.key = u32::from(ev.code());
                 event.key_state = state;
                 out.push_back(LibinputEvent {
@@ -6569,10 +7230,23 @@ impl BackendState {
         for dial in 0..2 {
             if let Some(delta) = td.pad_dial_values[dial].take() {
                 let mut event = payload(ts_usec, lib_dev);
-                event.dial_number = dial as u32;
-                event.dial_delta_v120 = delta;
+                let event_type = if td.pad_dials_map_to_ring {
+                    let degrees = dial_v120_to_ring(
+                        &mut td.pad_dial_ring_values[dial],
+                        delta,
+                        (*lib_dev).left_handed,
+                    );
+                    event.ring_number = dial as u32;
+                    event.ring_position = degrees;
+                    event.ring_source = 0;
+                    LibinputEventType::LIBINPUT_EVENT_TABLET_PAD_RING
+                } else {
+                    event.dial_number = dial as u32;
+                    event.dial_delta_v120 = delta;
+                    LibinputEventType::LIBINPUT_EVENT_TABLET_PAD_DIAL
+                };
                 out.push_back(LibinputEvent {
-                    event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_PAD_DIAL,
+                    event_type,
                     payload: EventPayload::TabletPad(event),
                     context: ctx,
                     device: lib_dev,
@@ -6918,6 +7592,7 @@ impl BackendState {
             td.tablet_tool_type = 1;
             td.tablet_proximity_pending = Some(true);
         }
+        td.update_tablet_smoothing(td.tablet_proximity_pending.is_some() || touch_button_changed);
         let Some(in_proximity) = td.tablet_proximity_pending.take() else {
             update_tablet_pressure_offset(td, false);
             update_tablet_tip_from_pressure(td, touch_button_changed);
@@ -6949,12 +7624,12 @@ impl BackendState {
             for button_event in std::mem::take(&mut td.tablet_pending_button_events) {
                 push_tablet_tool_button(td, lib_dev, ctx, out, ts_usec, tool, button_event);
             }
-            td.tablet_last_event_x = td.tablet_x;
-            td.tablet_last_event_y = td.tablet_y;
+            td.tablet_last_event_x = td.tablet_output_x;
+            td.tablet_last_event_y = td.tablet_output_y;
             td.tablet_last_event_pressure = td.tablet_pressure;
             td.tablet_last_event_distance = td.tablet_distance;
-            td.tablet_last_event_tilt_x = td.tablet_tilt_x;
-            td.tablet_last_event_tilt_y = td.tablet_tilt_y;
+            td.tablet_last_event_tilt_x = td.tablet_output_tilt_x;
+            td.tablet_last_event_tilt_y = td.tablet_output_tilt_y;
             td.tablet_last_event_rotation = td.tablet_rotation;
             td.tablet_last_event_slider = td.tablet_slider;
             td.tablet_last_event_size_major = td.tablet_size_major;
@@ -7211,7 +7886,7 @@ impl BackendState {
                 push_tablet_tool_button(td, lib_dev, ctx, out, ts_usec, tool, button_event);
             }
             for button in std::mem::take(&mut td.tablet_held_buttons) {
-                let seat_button_count = release_seat_button(lib_dev);
+                let seat_button_count = release_seat_button(lib_dev, button as u16);
                 (*tool)
                     .refcount
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -7328,12 +8003,12 @@ impl BackendState {
             td.tablet_size_major = raw_size_major;
             td.tablet_size_minor = raw_size_minor;
         }
-        td.tablet_last_event_x = td.tablet_x;
-        td.tablet_last_event_y = td.tablet_y;
+        td.tablet_last_event_x = td.tablet_output_x;
+        td.tablet_last_event_y = td.tablet_output_y;
         td.tablet_last_event_pressure = td.tablet_pressure;
         td.tablet_last_event_distance = td.tablet_distance;
-        td.tablet_last_event_tilt_x = td.tablet_tilt_x;
-        td.tablet_last_event_tilt_y = td.tablet_tilt_y;
+        td.tablet_last_event_tilt_x = td.tablet_output_tilt_x;
+        td.tablet_last_event_tilt_y = td.tablet_output_tilt_y;
         td.tablet_last_event_rotation = td.tablet_rotation;
         td.tablet_last_event_slider = td.tablet_slider;
         td.tablet_last_event_size_major = td.tablet_size_major;
@@ -7383,7 +8058,7 @@ impl BackendState {
                 return;
             }
             td.held_keys.push(HeldKey { code });
-            let seat_key_count = press_seat_key(lib_dev);
+            let seat_key_count = press_seat_key(lib_dev, code);
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_KEYBOARD_KEY,
                 payload: EventPayload::KeyboardKey(KeyboardKeyEvent {
@@ -7401,7 +8076,7 @@ impl BackendState {
                 return;
             }
             td.held_keys.retain(|k| k.code != code);
-            let seat_key_count = release_seat_key(lib_dev);
+            let seat_key_count = release_seat_key(lib_dev, code);
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_KEYBOARD_KEY,
                 payload: EventPayload::KeyboardKey(KeyboardKeyEvent {
@@ -7532,6 +8207,16 @@ impl BackendState {
                                 } else {
                                     td.scroll_button_accum_x = 0;
                                 }
+                                let (dx, dy) = if axis == 0 {
+                                    (0.0, value as f64)
+                                } else {
+                                    (value as f64, 0.0)
+                                };
+                                let natural_direction =
+                                    if (*lib_dev).natural_scroll { -1.0 } else { 1.0 };
+                                let value = value as f64
+                                    * configured_scroll_factor(lib_dev, dx, dy, ts_usec)
+                                    * natural_direction;
                                 for event_type in [
                                     LibinputEventType::LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS,
                                     LibinputEventType::LIBINPUT_EVENT_POINTER_AXIS,
@@ -7540,12 +8225,7 @@ impl BackendState {
                                         event_type,
                                         payload: EventPayload::PointerAxis(
                                             PointerAxisEvent::single(
-                                                ts_usec,
-                                                axis,
-                                                value as f64,
-                                                0,
-                                                0.0,
-                                                3,
+                                                ts_usec, axis, value, 0, 0.0, 3,
                                             ),
                                         ),
                                         context: ctx,
@@ -7559,34 +8239,48 @@ impl BackendState {
                 }
 
                 if td.pending_rel_x != 0 || td.pending_rel_y != 0 {
-                    let mut dx = td.pending_rel_x as f64 * td.trackpoint_multiplier;
-                    let mut dy = td.pending_rel_y as f64 * td.trackpoint_multiplier;
+                    let normalization = if td.is_pointing_stick {
+                        td.trackpoint_multiplier
+                    } else {
+                        1_000.0 / td.pointer_dpi
+                    };
+                    let mut dx_unaccel = td.pending_rel_x as f64 * normalization;
+                    let mut dy_unaccel = td.pending_rel_y as f64 * normalization;
                     td.pending_rel_x = 0;
                     td.pending_rel_y = 0;
                     if (*lib_dev).rotation_angle != 0 {
                         let radians = f64::from((*lib_dev).rotation_angle).to_radians();
                         let (sin, cos) = radians.sin_cos();
-                        let rotated_x = dx * cos - dy * sin;
-                        let rotated_y = dx * sin + dy * cos;
-                        dx = if rotated_x.abs() < f64::EPSILON * 8.0 {
+                        let rotated_x = dx_unaccel * cos - dy_unaccel * sin;
+                        let rotated_y = dx_unaccel * sin + dy_unaccel * cos;
+                        dx_unaccel = if rotated_x.abs() < f64::EPSILON * 8.0 {
                             0.0
                         } else {
                             rotated_x
                         };
-                        dy = if rotated_y.abs() < f64::EPSILON * 8.0 {
+                        dy_unaccel = if rotated_y.abs() < f64::EPSILON * 8.0 {
                             0.0
                         } else {
                             rotated_y
                         };
                     }
+                    let factor = configured_motion_factor(
+                        lib_dev,
+                        dx_unaccel,
+                        dy_unaccel,
+                        ts_usec,
+                        false,
+                        td.is_pointing_stick,
+                        &mut td.motion_history,
+                    );
                     out.push_back(LibinputEvent {
                         event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_MOTION,
                         payload: EventPayload::PointerMotion(PointerMotionEvent {
                             time_usec: ts_usec,
-                            dx,
-                            dy,
-                            dx_unaccel: dx,
-                            dy_unaccel: dy,
+                            dx: dx_unaccel * factor,
+                            dy: dy_unaccel * factor,
+                            dx_unaccel,
+                            dy_unaccel,
                         }),
                         context: ctx,
                         device: lib_dev,
@@ -7601,7 +8295,16 @@ impl BackendState {
                         if raw == 0 {
                             continue;
                         }
-                        let value = raw as f64 * direction;
+                        let raw_value = raw as f64 * direction;
+                        let (dx, dy) = if axis == 0 {
+                            (0.0, raw_value)
+                        } else {
+                            (raw_value, 0.0)
+                        };
+                        let natural_direction = if (*lib_dev).natural_scroll { -1.0 } else { 1.0 };
+                        let value = raw_value
+                            * configured_scroll_factor(lib_dev, dx, dy, ts_usec)
+                            * natural_direction;
                         for event_type in [
                             LibinputEventType::LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS,
                             LibinputEventType::LIBINPUT_EVENT_POINTER_AXIS,
@@ -7675,7 +8378,14 @@ impl BackendState {
                         } else {
                             low_res as f64 * 120.0
                         };
-                        let value_v120 = raw_v120 * direction;
+                        let raw_value_v120 = raw_v120 * direction;
+                        let (dx, dy) = if axis == 0 {
+                            (0.0, raw_value_v120)
+                        } else {
+                            (raw_value_v120, 0.0)
+                        };
+                        let value_v120 =
+                            raw_value_v120 * configured_scroll_factor(lib_dev, dx, dy, ts_usec);
                         out.push_back(LibinputEvent {
                             event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_SCROLL_WHEEL,
                             payload: EventPayload::PointerAxis(PointerAxisEvent::single(
@@ -7851,7 +8561,8 @@ impl BackendState {
                         }
                         if !td.middle_chord_active {
                             td.middle_chord_active = true;
-                            let seat_button_count = press_seat_button(lib_dev);
+                            let seat_button_count =
+                                press_seat_button(lib_dev, KeyCode::BTN_MIDDLE.0);
                             out.push_back(LibinputEvent {
                                 event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
                                 payload: EventPayload::PointerButton(PointerButtonEvent {
@@ -7870,7 +8581,8 @@ impl BackendState {
                     if td.middle_chord_active {
                         if !td.middle_left_down && !td.middle_right_down {
                             td.middle_chord_active = false;
-                            let seat_button_count = release_seat_button(lib_dev);
+                            let seat_button_count =
+                                release_seat_button(lib_dev, KeyCode::BTN_MIDDLE.0);
                             out.push_back(LibinputEvent {
                                 event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
                                 payload: EventPayload::PointerButton(PointerButtonEvent {
@@ -8164,9 +8876,9 @@ impl BackendState {
         };
         td.last_button_time_usec = ts_usec;
         let (state, seat_button_count) = if down {
-            (1, press_seat_button(lib_dev))
+            (1, press_seat_button(lib_dev, code))
         } else {
-            let count = release_seat_button(lib_dev);
+            let count = release_seat_button(lib_dev, code);
             if td.held_buttons.is_empty() {
                 td.left_handed_applied = (*lib_dev).left_handed;
             }
@@ -8248,11 +8960,17 @@ impl BackendState {
     ) {
         for (axis, raw_delta) in frame.scrolls {
             let mut values = [0.0; 2];
-            let value = raw_delta * 0.02 * 24.0;
+            let (raw_x, raw_y) = if axis == AXIS_VERTICAL {
+                (0.0, raw_delta)
+            } else {
+                (raw_delta, 0.0)
+            };
+            let (scroll_x, scroll_y) =
+                crate::tpad::configured_scroll(lib_dev, raw_x, raw_y, ts_usec);
             if axis == AXIS_VERTICAL {
-                values[0] = if natural_scroll { -value } else { value };
+                values[0] = if natural_scroll { -scroll_y } else { scroll_y };
             } else if axis == AXIS_HORIZONTAL {
-                values[1] = if natural_scroll { -value } else { value };
+                values[1] = if natural_scroll { -scroll_x } else { scroll_x };
             }
             Self::emit_finger_axis(ts_usec, lib_dev, ctx, axis, values, out);
         }
@@ -8357,9 +9075,9 @@ impl BackendState {
         };
 
         let seat_button_count = if ev.value() != 0 {
-            press_seat_button(event_device)
+            press_seat_button(event_device, button)
         } else {
-            release_seat_button(event_device)
+            release_seat_button(event_device, button)
         };
 
         out.push_back(LibinputEvent {
@@ -8386,10 +9104,28 @@ impl BackendState {
         out: &mut VecDeque<LibinputEvent>,
         cfg_tap: bool,
         cfg_nat: bool,
-        cfg_accel: f32,
         touch_arbitrated: bool,
         followups: &mut Vec<DwtFollowup>,
     ) {
+        if ev.event_type() == EventType::ABSOLUTE {
+            if matches!(
+                ev.code(),
+                code if code == AbsoluteAxisCode::ABS_X.0
+                    || code == AbsoluteAxisCode::ABS_Y.0
+                    || code == AbsoluteAxisCode::ABS_MT_POSITION_X.0
+                    || code == AbsoluteAxisCode::ABS_MT_POSITION_Y.0
+            ) {
+                td.touchpad_frame_has_motion = true;
+            } else {
+                td.touchpad_frame_has_other_axis = true;
+            }
+        } else if ev.event_type().0 == 4 && ev.code() == 5 && td.msc_timestamp_watch {
+            td.msc_timestamp_now = Some(ev.value() as u32 as u64);
+            return;
+        } else if ev.event_type() == EventType::SYNCHRONIZATION && ev.code() == 0 {
+            td.apply_touchpad_frame_quirks();
+        }
+
         if touch_arbitrated {
             td.touch_arbitration_suppressed = true;
             td.tap_emitted = true;
@@ -8498,9 +9234,16 @@ impl BackendState {
                         }
                     }
                     if td.touch_active {
-                        let continues_tap_drag =
-                            td.tap_button_down.is_some() && td.tap_release_since.take().is_some();
+                        let resumed_drag_lock = td.tap_button_down.is_some()
+                            && td.tap_drag_lock_waiting
+                            && (*lib_dev).tap_drag_enabled;
+                        let continues_tap_drag = (*lib_dev).tap_drag_enabled
+                            && td.tap_button_down.is_some()
+                            && (td.tap_release_since.take().is_some() || resumed_drag_lock);
                         td.tap_drag_active = continues_tap_drag;
+                        td.tap_drag_lock_resumed = resumed_drag_lock;
+                        td.tap_drag_lock_waiting = false;
+                        td.tap_drag_lock_moved = false;
                         td.touch_start_time = Some(Instant::now());
                         td.tap_emitted = td.touch_arbitration_suppressed || continues_tap_drag;
                         if new_touch_palm.is_some() {
@@ -8527,6 +9270,8 @@ impl BackendState {
                                     finger_count: td.hold_fingers,
                                     dx: 0.0,
                                     dy: 0.0,
+                                    dx_unaccel: 0.0,
+                                    dy_unaccel: 0.0,
                                     scale: 1.0,
                                     angle: 0.0,
                                     cancelled: false,
@@ -8549,6 +9294,8 @@ impl BackendState {
                                     finger_count: td.pinch_fingers,
                                     dx: 0.0,
                                     dy: 0.0,
+                                    dx_unaccel: 0.0,
+                                    dy_unaccel: 0.0,
                                     scale: td
                                         .gesture_primary_slot_distance((*lib_dev).click_method == 1)
                                         .map(|d| {
@@ -8582,7 +9329,7 @@ impl BackendState {
                             td.drag_3fg_button_down = false;
                             td.drag_3fg_active = false;
                             td.drag_3fg_release_since = None;
-                            let released_count = release_seat_button(lib_dev);
+                            let released_count = release_seat_button(lib_dev, KeyCode::BTN_LEFT.0);
                             out.push_back(LibinputEvent {
                                 event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
                                 payload: EventPayload::PointerButton(PointerButtonEvent {
@@ -8600,22 +9347,37 @@ impl BackendState {
                         // second contact and releases it when that contact
                         // lifts. A standalone tap is released by its timer.
                         if td.tap_drag_active {
-                            if let Some(button) = td.tap_button_down.take() {
-                                let released_count = release_seat_button(lib_dev);
-                                out.push_back(LibinputEvent {
-                                    event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
-                                    payload: EventPayload::PointerButton(PointerButtonEvent {
-                                        time_usec: ts_usec,
-                                        button: button as u32,
-                                        state: 0,
-                                        seat_button_count: released_count,
-                                    }),
-                                    context: ctx,
-                                    device: lib_dev,
+                            let resumed_as_release_tap = td.tap_drag_lock_resumed
+                                && !td.tap_drag_lock_moved
+                                && td.touch_start_time.is_some_and(|start| {
+                                    start.elapsed() < Duration::from_millis(250)
                                 });
+                            let drag_lock = (*lib_dev).tap_drag_lock_enabled;
+                            if drag_lock == 0 || resumed_as_release_tap {
+                                if let Some(button) = td.tap_button_down.take() {
+                                    let released_count = release_seat_button(lib_dev, button);
+                                    out.push_back(LibinputEvent {
+                                        event_type:
+                                            LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
+                                        payload: EventPayload::PointerButton(PointerButtonEvent {
+                                            time_usec: ts_usec,
+                                            button: button as u32,
+                                            state: 0,
+                                            seat_button_count: released_count,
+                                        }),
+                                        context: ctx,
+                                        device: lib_dev,
+                                    });
+                                }
+                                td.tap_release_since = None;
+                                td.tap_drag_lock_waiting = false;
+                            } else {
+                                td.tap_drag_lock_waiting = true;
+                                td.tap_release_since = (drag_lock == 1).then(Instant::now);
                             }
-                            td.tap_release_since = None;
                             td.tap_drag_active = false;
+                            td.tap_drag_lock_resumed = false;
+                            td.tap_drag_lock_moved = false;
                         } else if cfg_tap
                             && !td.tap_emitted
                             && !td.touch_arbitration_suppressed
@@ -8623,14 +9385,10 @@ impl BackendState {
                                 .touch_start_time
                                 .is_some_and(|start| start.elapsed() < Duration::from_millis(250))
                         {
-                            let button = match td.tap_fingers {
-                                1 => Some(KeyCode::BTN_LEFT.0),
-                                2 => Some(KeyCode::BTN_RIGHT.0),
-                                3 => Some(KeyCode::BTN_MIDDLE.0),
-                                _ => None,
-                            };
+                            let button =
+                                tap_button_for_fingers(td.tap_fingers, (*lib_dev).tap_button_map);
                             if let Some(button) = button {
-                                let pressed_count = press_seat_button(lib_dev);
+                                let pressed_count = press_seat_button(lib_dev, button);
                                 out.push_back(LibinputEvent {
                                     event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
                                     payload: EventPayload::PointerButton(PointerButtonEvent {
@@ -8713,7 +9471,7 @@ impl BackendState {
                             if let Some(button) = td.tap_button_down.take() {
                                 td.tap_release_since = None;
                                 td.tap_drag_active = false;
-                                let released_count = release_seat_button(lib_dev);
+                                let released_count = release_seat_button(lib_dev, button);
                                 out.push_back(LibinputEvent {
                                     event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
                                     payload: EventPayload::PointerButton(PointerButtonEvent {
@@ -9024,6 +9782,13 @@ impl BackendState {
                     if slot < td.mt_slots.len() {
                         let new_touch_palm = td.dwt_palm_for_new_touch(ts_usec);
                         let mt_slot = &mut td.mt_slots[slot];
+                        if val < 0 && mt_slot.active {
+                            mt_slot.ended_this_frame = true;
+                            mt_slot.ended_tracking_id = Some(mt_slot.tracking_id);
+                        } else if val >= 0 {
+                            mt_slot.ended_this_frame = false;
+                            mt_slot.ended_tracking_id = None;
+                        }
                         let new_contact =
                             val >= 0 && (!mt_slot.active || mt_slot.tracking_id != val);
                         let typing_palm = new_contact && new_touch_palm.is_some();
@@ -9719,6 +10484,8 @@ impl BackendState {
                                 finger_count: td.pinch_fingers,
                                 dx: 0.0,
                                 dy: 0.0,
+                                dx_unaccel: 0.0,
+                                dy_unaccel: 0.0,
                                 scale: 1.0,
                                 angle: 0.0,
                                 cancelled,
@@ -9769,6 +10536,8 @@ impl BackendState {
                                         finger_count: td.swipe_fingers,
                                         dx: 0.0,
                                         dy: 0.0,
+                                        dx_unaccel: 0.0,
+                                        dy_unaccel: 0.0,
                                         scale: 1.0,
                                         angle: 0.0,
                                         cancelled: false,
@@ -9833,6 +10602,8 @@ impl BackendState {
                                 finger_count: td.swipe_fingers,
                                 dx: 0.0,
                                 dy: 0.0,
+                                dx_unaccel: 0.0,
+                                dy_unaccel: 0.0,
                                 scale: 1.0,
                                 angle: 0.0,
                                 cancelled: false,
@@ -9953,6 +10724,8 @@ impl BackendState {
                                 finger_count: td.pinch_fingers,
                                 dx: 0.0,
                                 dy: 0.0,
+                                dx_unaccel: 0.0,
+                                dy_unaccel: 0.0,
                                 scale,
                                 angle,
                                 cancelled: false,
@@ -9988,6 +10761,9 @@ impl BackendState {
                     td.current_dy = td.current_dy.saturating_neg();
                 }
                 let has_movement = td.current_dx != 0 || td.current_dy != 0;
+                if td.tap_drag_active && has_movement {
+                    td.tap_drag_lock_moved = true;
+                }
                 let n_fingers = td.gesture_finger_count(button_areas);
 
                 if td.click_sequence_suppressed {
@@ -10004,27 +10780,22 @@ impl BackendState {
 
                 if td.active_click_button.is_some() {
                     if has_movement {
-                        let scale = 0.18_f32;
-                        let total_x = td.current_dx as f32 * scale * cfg_accel + td.remainder_x;
-                        let total_y = td.current_dy as f32 * scale * cfg_accel + td.remainder_y;
-                        let emit_x = total_x.round() as i32;
-                        let emit_y = total_y.round() as i32;
-                        td.remainder_x = total_x - emit_x as f32;
-                        td.remainder_y = total_y - emit_y as f32;
-                        if emit_x != 0 || emit_y != 0 {
-                            out.push_back(LibinputEvent {
-                                event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_MOTION,
-                                payload: EventPayload::PointerMotion(PointerMotionEvent {
-                                    time_usec: ts_usec,
-                                    dx: f64::from(emit_x),
-                                    dy: f64::from(emit_y),
-                                    dx_unaccel: f64::from(td.current_dx as f32 * scale),
-                                    dy_unaccel: f64::from(td.current_dy as f32 * scale),
-                                }),
-                                context: ctx,
-                                device: lib_dev,
-                            });
-                        }
+                        let motion = crate::tpad::configured_motion(
+                            lib_dev,
+                            f64::from(td.current_dx),
+                            f64::from(td.current_dy),
+                            ts_usec,
+                            &mut td.motion_history,
+                            td.is_lenovo_x230,
+                        );
+                        td.remainder_x = 0.0;
+                        td.remainder_y = 0.0;
+                        out.push_back(LibinputEvent {
+                            event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_MOTION,
+                            payload: EventPayload::PointerMotion(motion),
+                            context: ctx,
+                            device: lib_dev,
+                        });
                     }
                     td.current_dx = 0;
                     td.current_dy = 0;
@@ -10043,7 +10814,7 @@ impl BackendState {
                     y_range,
                     (*lib_dev).height_mm,
                 ));
-                if n_fingers == 1 && jump_distance_mm > 7.0 {
+                if n_fingers == 1 && !td.jump_detection_disabled && jump_distance_mm > 7.0 {
                     // A one-frame displacement this large is a sensor slot
                     // discontinuity, not plausible finger motion. Rebase at
                     // the new position so the following small deltas remain
@@ -10098,7 +10869,7 @@ impl BackendState {
                     td.drag_3fg_release_since = None;
                     td.drag_3fg_button_down = false;
                     td.drag_3fg_resume_scroll_active = n_fingers == 2;
-                    let seat_button_count = release_seat_button(lib_dev);
+                    let seat_button_count = release_seat_button(lib_dev, KeyCode::BTN_LEFT.0);
                     out.push_back(LibinputEvent {
                         event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
                         payload: EventPayload::PointerButton(PointerButtonEvent {
@@ -10130,6 +10901,8 @@ impl BackendState {
                                 finger_count: td.swipe_fingers,
                                 dx: 0.0,
                                 dy: 0.0,
+                                dx_unaccel: 0.0,
+                                dy_unaccel: 0.0,
                                 scale: 1.0,
                                 angle: 0.0,
                                 cancelled: false,
@@ -10146,6 +10919,8 @@ impl BackendState {
                             finger_count: td.swipe_fingers,
                             dx: 0.0,
                             dy: 0.0,
+                            dx_unaccel: 0.0,
+                            dy_unaccel: 0.0,
                             scale: 1.0,
                             angle: 0.0,
                             cancelled: true,
@@ -10160,7 +10935,7 @@ impl BackendState {
                     td.hold_started_at = None;
                     td.hold_blocked = true;
                     td.tap_emitted = true;
-                    let seat_button_count = press_seat_button(lib_dev);
+                    let seat_button_count = press_seat_button(lib_dev, KeyCode::BTN_LEFT.0);
                     out.push_back(LibinputEvent {
                         event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
                         payload: EventPayload::PointerButton(PointerButtonEvent {
@@ -10178,16 +10953,17 @@ impl BackendState {
                     td.finger_scroll_constraint.reset();
                     td.tap_emitted = true;
                     if has_movement {
-                        let scale = 0.18;
+                        let motion = crate::tpad::configured_motion(
+                            lib_dev,
+                            f64::from(td.current_dx),
+                            f64::from(td.current_dy),
+                            ts_usec,
+                            &mut td.motion_history,
+                            td.is_lenovo_x230,
+                        );
                         out.push_back(LibinputEvent {
                             event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_MOTION,
-                            payload: EventPayload::PointerMotion(PointerMotionEvent {
-                                time_usec: ts_usec,
-                                dx: td.current_dx as f64 * scale,
-                                dy: td.current_dy as f64 * scale,
-                                dx_unaccel: td.current_dx as f64 * scale,
-                                dy_unaccel: td.current_dy as f64 * scale,
-                            }),
+                            payload: EventPayload::PointerMotion(motion),
                             context: ctx,
                             device: lib_dev,
                         });
@@ -10255,6 +11031,8 @@ impl BackendState {
                             finger_count: td.hold_fingers,
                             dx: 0.0,
                             dy: 0.0,
+                            dx_unaccel: 0.0,
+                            dy_unaccel: 0.0,
                             scale: 1.0,
                             angle: 0.0,
                             cancelled: true,
@@ -10281,6 +11059,8 @@ impl BackendState {
                             finger_count: td.pinch_fingers,
                             dx: 0.0,
                             dy: 0.0,
+                            dx_unaccel: 0.0,
+                            dy_unaccel: 0.0,
                             scale: 1.0,
                             angle: 0.0,
                             cancelled: false,
@@ -10294,36 +11074,28 @@ impl BackendState {
                 }
 
                 td.tap_emitted = true;
-                let hw_scale: f32 = 0.18;
-
                 if n_fingers <= 1 {
                     let inactive_button_area_contact = button_areas
                         && td.mt_slots.iter().any(|slot| {
                             slot.active && slot.button_area_excluded && !slot.click_pinned
                         });
                     if !inactive_button_area_contact {
-                        let total_x =
-                            (td.current_dx as f32 * hw_scale) * cfg_accel + td.remainder_x;
-                        let total_y =
-                            (td.current_dy as f32 * hw_scale) * cfg_accel + td.remainder_y;
-                        let emit_x = total_x.round() as i32;
-                        let emit_y = total_y.round() as i32;
-                        td.remainder_x = total_x - emit_x as f32;
-                        td.remainder_y = total_y - emit_y as f32;
-                        if emit_x != 0 || emit_y != 0 {
-                            out.push_back(LibinputEvent {
-                                event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_MOTION,
-                                payload: EventPayload::PointerMotion(PointerMotionEvent {
-                                    time_usec: ts_usec,
-                                    dx: emit_x as f64,
-                                    dy: emit_y as f64,
-                                    dx_unaccel: (td.current_dx as f32 * hw_scale) as f64,
-                                    dy_unaccel: (td.current_dy as f32 * hw_scale) as f64,
-                                }),
-                                context: ctx,
-                                device: lib_dev,
-                            });
-                        }
+                        let motion = crate::tpad::configured_motion(
+                            lib_dev,
+                            f64::from(td.current_dx),
+                            f64::from(td.current_dy),
+                            ts_usec,
+                            &mut td.motion_history,
+                            td.is_lenovo_x230,
+                        );
+                        td.remainder_x = 0.0;
+                        td.remainder_y = 0.0;
+                        out.push_back(LibinputEvent {
+                            event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_MOTION,
+                            payload: EventPayload::PointerMotion(motion),
+                            context: ctx,
+                            device: lib_dev,
+                        });
                     }
                 } else if n_fingers == 2 && (*lib_dev).scroll_method == 1 {
                     // While both contacts are still below the pinch
@@ -10334,9 +11106,12 @@ impl BackendState {
                         td.finger_scroll_constraint.reset();
                         return;
                     }
-                    let scroll_scale = 0.02;
-                    let raw_scroll_x = f64::from(td.current_dx) * scroll_scale;
-                    let raw_scroll_y = f64::from(td.current_dy) * scroll_scale;
+                    let (raw_scroll_x, raw_scroll_y) = crate::tpad::configured_scroll(
+                        lib_dev,
+                        f64::from(td.current_dx),
+                        f64::from(td.current_dy),
+                        ts_usec,
+                    );
                     let delta_x_mm = touchpad_delta_mm(
                         f64::from(td.current_dx),
                         (*lib_dev).abs_x_resolution,
@@ -10402,8 +11177,6 @@ impl BackendState {
                         values[1] = if cfg_nat { -scroll_x } else { scroll_x };
                     }
                     if axes != 0 {
-                        values[0] *= 24.0;
-                        values[1] *= 24.0;
                         td.finger_scroll_axes |= axes;
                         for event_type in [
                             LibinputEventType::LIBINPUT_EVENT_POINTER_SCROLL_FINGER,
@@ -10421,15 +11194,24 @@ impl BackendState {
                     }
                 } else if n_fingers >= 3 {
                     // 3+ fingers = swipe gesture
-                    let gscale: f64 = 0.18;
+                    let motion = crate::tpad::configured_motion(
+                        lib_dev,
+                        f64::from(td.current_dx),
+                        f64::from(td.current_dy),
+                        ts_usec,
+                        &mut td.motion_history,
+                        td.is_lenovo_x230,
+                    );
                     let (event_type, event_payload) = if td.swipe_active {
                         (
                             LibinputEventType::LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE,
                             EventPayload::GestureSwipeUpdate(GestureEvent {
                                 time_usec: ts_usec,
                                 finger_count: td.swipe_fingers,
-                                dx: td.current_dx as f64 * gscale,
-                                dy: td.current_dy as f64 * gscale,
+                                dx: motion.dx,
+                                dy: motion.dy,
+                                dx_unaccel: motion.dx_unaccel,
+                                dy_unaccel: motion.dy_unaccel,
                                 scale: 1.0,
                                 angle: 0.0,
                                 cancelled: false,
@@ -10445,6 +11227,8 @@ impl BackendState {
                                 finger_count: td.swipe_fingers,
                                 dx: 0.0,
                                 dy: 0.0,
+                                dx_unaccel: 0.0,
+                                dy_unaccel: 0.0,
                                 scale: 1.0,
                                 angle: 0.0,
                                 cancelled: false,
@@ -10523,6 +11307,14 @@ mod tests {
     }
 
     #[test]
+    fn mixed_capability_nodes_keep_pointer_buttons_out_of_keyboard_path() {
+        assert!(!crate::evtrans::is_button_code(KeyCode::KEY_A.0));
+        assert!(crate::evtrans::is_button_code(KeyCode::BTN_LEFT.0));
+        assert!(crate::evtrans::is_button_code(KeyCode::BTN_0.0));
+        assert!(crate::evtrans::is_button_code(0x2c0));
+    }
+
+    #[test]
     fn left_handed_mapping_preserves_clickfinger_logical_buttons() {
         assert_eq!(
             map_left_handed_button(KeyCode::BTN_LEFT.0, true, 2),
@@ -10539,6 +11331,170 @@ mod tests {
         assert_eq!(
             map_left_handed_button(KeyCode::BTN_RIGHT.0, true, 0),
             KeyCode::BTN_LEFT.0
+        );
+    }
+
+    #[test]
+    fn tap_button_map_changes_two_and_three_finger_buttons() {
+        assert_eq!(tap_button_for_fingers(1, 0), Some(KeyCode::BTN_LEFT.0));
+        assert_eq!(tap_button_for_fingers(2, 0), Some(KeyCode::BTN_RIGHT.0));
+        assert_eq!(tap_button_for_fingers(3, 0), Some(KeyCode::BTN_MIDDLE.0));
+        assert_eq!(tap_button_for_fingers(2, 1), Some(KeyCode::BTN_MIDDLE.0));
+        assert_eq!(tap_button_for_fingers(3, 1), Some(KeyCode::BTN_RIGHT.0));
+    }
+
+    #[test]
+    fn led_updates_map_every_public_led_bit_to_evdev() {
+        let events = led_update_events(0b1_0101);
+        for (code, event) in events[..5].iter().enumerate() {
+            assert_eq!(event.event_type(), EventType::LED);
+            assert_eq!(event.code(), code as u16);
+            assert_eq!(event.value(), i32::from(matches!(code, 0 | 2 | 4)));
+        }
+        assert_eq!(events[5].event_type(), EventType::SYNCHRONIZATION);
+        assert_eq!(events[5].code(), 0);
+        assert_eq!(events[5].value(), 0);
+    }
+
+    #[test]
+    fn rhel_wacom_dial_mapping_wraps_and_honors_left_handed() {
+        let mut current = 0.0;
+        assert_eq!(dial_v120_to_ring(&mut current, 120.0, false), 15.0);
+        assert_eq!(dial_v120_to_ring(&mut current, -240.0, false), 345.0);
+        assert_eq!(dial_v120_to_ring(&mut current, 120.0, true), 180.0);
+    }
+
+    #[test]
+    fn upstream_speed_curves_preserve_default_and_nonzero_minimum() {
+        assert!(trackpoint_speed_factor(-1.0) > 0.0);
+        assert!((trackpoint_speed_factor(0.0) - 1.0).abs() < 0.01);
+        assert!((trackpoint_speed_factor(1.0) - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn mouse_dpi_uses_the_active_hwdb_entry() {
+        assert_eq!(parse_mouse_dpi("400@125 *800@125 1600@125"), Some(800.0));
+        assert_eq!(parse_mouse_dpi("1200"), Some(1200.0));
+        assert_eq!(parse_mouse_dpi("0"), None);
+    }
+
+    #[test]
+    fn t450_discards_first_motion_after_pressure_only_frames() {
+        let mut count = 0;
+        for _ in 0..11 {
+            assert!(!t450_update_nonmotion_count(&mut count, false, true));
+        }
+        assert!(t450_update_nonmotion_count(&mut count, true, false));
+        assert_eq!(count, 0);
+        assert!(!t450_update_nonmotion_count(&mut count, true, false));
+    }
+
+    #[test]
+    fn msc_timestamp_detects_the_post_resume_jump() {
+        let mut state = 0;
+        let mut interval = 0;
+        assert_eq!(msc_timestamp_jump_scale(&mut state, &mut interval, 0), None);
+        assert_eq!(
+            msc_timestamp_jump_scale(&mut state, &mut interval, 7_300),
+            None
+        );
+        let scale = msc_timestamp_jump_scale(&mut state, &mut interval, 123_456).unwrap();
+        assert!(scale > 0.0 && scale < 0.1);
+        assert_eq!(state, 3);
+    }
+
+    #[test]
+    fn scroll_on_middle_click_always_accumulates_small_wheel_steps() {
+        assert!(wheel_should_accumulate(true, 47));
+        assert!(!wheel_should_accumulate(false, 47));
+        assert!(wheel_should_accumulate(false, 8));
+    }
+
+    #[test]
+    fn synaptics_tripletap_restores_a_transiently_ended_slot() {
+        let mut slots = vec![
+            MtSlot {
+                active: true,
+                tracking_id: 10,
+                ..MtSlot::default()
+            },
+            MtSlot {
+                ended_this_frame: true,
+                ended_tracking_id: Some(11),
+                tracking_id: -1,
+                ..MtSlot::default()
+            },
+        ];
+        assert_eq!(restore_ended_synaptics_slots(&mut slots, 3), 2);
+        assert!(slots[1].active);
+        assert_eq!(slots[1].tracking_id, 11);
+    }
+
+    #[test]
+    fn tablet_smoothing_uses_four_samples_and_resets_on_contact_change() {
+        let mut history = std::collections::VecDeque::new();
+        assert_eq!(
+            smooth_tablet_sample(&mut history, (0.0, 0.0, 0.0, 0.0), true, false),
+            (0.0, 0.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            smooth_tablet_sample(&mut history, (4.0, 8.0, 2.0, 6.0), true, false),
+            (2.0, 4.0, 1.0, 3.0)
+        );
+        assert_eq!(
+            smooth_tablet_sample(&mut history, (9.0, 9.0, 9.0, 9.0), true, true),
+            (9.0, 9.0, 9.0, 9.0)
+        );
+        assert_eq!(
+            smooth_tablet_sample(&mut history, (3.0, 4.0, 5.0, 6.0), false, false),
+            (3.0, 4.0, 5.0, 6.0)
+        );
+    }
+
+    #[test]
+    fn seat_key_counts_are_isolated_per_key_code() {
+        let counts = std::sync::Mutex::new(crate::evtrans::empty_seat_code_counts());
+
+        assert_eq!(update_seat_code_count(&counts, 30, true), 1);
+        assert_eq!(update_seat_code_count(&counts, 42, true), 1);
+        assert_eq!(update_seat_code_count(&counts, 30, true), 2);
+        assert_eq!(update_seat_code_count(&counts, 42, false), 0);
+        assert_eq!(update_seat_code_count(&counts, 30, false), 1);
+        assert_eq!(update_seat_code_count(&counts, 30, false), 0);
+        assert_eq!(update_seat_code_count(&counts, 30, false), 0);
+    }
+
+    #[test]
+    fn seat_button_counts_are_isolated_per_button_code() {
+        let counts = std::sync::Mutex::new(crate::evtrans::empty_seat_code_counts());
+
+        assert_eq!(
+            update_seat_code_count(&counts, KeyCode::BTN_LEFT.0, true),
+            1
+        );
+        assert_eq!(
+            update_seat_code_count(&counts, KeyCode::BTN_RIGHT.0, true),
+            1
+        );
+        assert_eq!(
+            update_seat_code_count(&counts, KeyCode::BTN_LEFT.0, true),
+            2
+        );
+        assert_eq!(
+            update_seat_code_count(&counts, KeyCode::BTN_RIGHT.0, false),
+            0
+        );
+        assert_eq!(
+            update_seat_code_count(&counts, KeyCode::BTN_LEFT.0, false),
+            1
+        );
+        assert_eq!(
+            update_seat_code_count(&counts, KeyCode::BTN_LEFT.0, false),
+            0
+        );
+        assert_eq!(
+            update_seat_code_count(&counts, KeyCode::BTN_LEFT.0, false),
+            0
         );
     }
 }
