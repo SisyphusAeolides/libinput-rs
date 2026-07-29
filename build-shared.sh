@@ -14,7 +14,7 @@ if [[ -n ${RPM_LD_FLAGS:-} ]]; then
 fi
 
 native_libraries=(-ludev)
-if nm -u target/release/libinput.a 2>/dev/null | rg '_gfortran_' >/dev/null; then
+if nm -u target/release/libinput.a 2>/dev/null | grep '_gfortran_' >/dev/null; then
   native_libraries+=(-lgfortran)
 fi
 if [[ ${CARGO_FEATURES:-} == *libwacom* ]]; then
