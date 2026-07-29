@@ -52,6 +52,7 @@ header="$stage$includedir/libinput.h"
 pc_file="$stage$libdir/pkgconfig/libinput.pc"
 udev_dir="$stage/usr/lib/udev"
 udev_rules_dir="$udev_dir/rules.d"
+libexec_dir="$stage/usr/libexec/libinput"
 
 [[ -f "$runtime_library" ]]
 [[ -L "$runtime_link" && "$(readlink "$runtime_link")" == "libinput.so.10.13.0" ]]
@@ -67,10 +68,46 @@ udev_rules_dir="$udev_dir/rules.d"
 rg -F 'ExecStop=/usr/bin/libinput elan-recover --all --affected-only --quiet' \
     "$stage/usr/lib/systemd/system/libinput-rs-elan-resume.service"
 [[ ! -e "$stage/etc/libinput-rs/config.json" ]]
-[[ -L "$stage/usr/libexec/libinput/libinput-debug-events" ]]
-[[ -L "$stage/usr/libexec/libinput/libinput-list-devices" ]]
-[[ "$(readlink "$stage/usr/libexec/libinput/libinput-debug-events")" == "../../bin/libinput" ]]
-[[ "$(readlink "$stage/usr/libexec/libinput/libinput-list-devices")" == "../../bin/libinput" ]]
+native_helpers=(
+    libinput-tool
+    libinput-analyze
+    libinput-debug-events
+    libinput-debug-tablet
+    libinput-debug-tablet-pad
+    libinput-list-devices
+    libinput-measure
+    libinput-quirks
+    libinput-record
+)
+python_helpers=(
+    libinput-analyze-buttons
+    libinput-analyze-per-slot-delta
+    libinput-analyze-recording
+    libinput-analyze-touch-down-state
+    libinput-list-kernel-devices
+    libinput-measure-fuzz
+    libinput-measure-touch-size
+    libinput-measure-touchpad-pressure
+    libinput-measure-touchpad-size
+    libinput-measure-touchpad-tap
+    libinput-replay
+)
+for helper in "${native_helpers[@]}" "${python_helpers[@]}"; do
+    [[ -x "$libexec_dir/$helper" && ! -L "$libexec_dir/$helper" ]]
+done
+[[ "$(find "$libexec_dir" -maxdepth 1 -type f | wc -l)" -eq \
+    "$(( ${#native_helpers[@]} + ${#python_helpers[@]} ))" ]]
+for helper in "${native_helpers[@]}"; do
+    ! readelf -dW "$libexec_dir/$helper" | rg '\((RPATH|RUNPATH)\)'
+done
+for helper in \
+    libinput-debug-events \
+    libinput-debug-tablet \
+    libinput-debug-tablet-pad \
+    libinput-list-devices \
+    libinput-record; do
+    readelf -dW "$libexec_dir/$helper" | rg 'Shared library: \[libinput\.so\.10\]'
+done
 for helper in libinput-device-group libinput-fuzz-extract libinput-fuzz-to-zero; do
     [[ -x "$udev_dir/$helper" ]]
 done
@@ -106,8 +143,26 @@ for installed_path in \
     /usr/bin/libinput \
     /usr/bin/libinput-rs \
     /usr/bin/libinput-rs-chwd \
+    /usr/libexec/libinput/libinput-tool \
+    /usr/libexec/libinput/libinput-analyze \
+    /usr/libexec/libinput/libinput-analyze-buttons \
+    /usr/libexec/libinput/libinput-analyze-per-slot-delta \
+    /usr/libexec/libinput/libinput-analyze-recording \
+    /usr/libexec/libinput/libinput-analyze-touch-down-state \
     /usr/libexec/libinput/libinput-debug-events \
+    /usr/libexec/libinput/libinput-debug-tablet \
+    /usr/libexec/libinput/libinput-debug-tablet-pad \
     /usr/libexec/libinput/libinput-list-devices \
+    /usr/libexec/libinput/libinput-list-kernel-devices \
+    /usr/libexec/libinput/libinput-measure \
+    /usr/libexec/libinput/libinput-measure-fuzz \
+    /usr/libexec/libinput/libinput-measure-touch-size \
+    /usr/libexec/libinput/libinput-measure-touchpad-pressure \
+    /usr/libexec/libinput/libinput-measure-touchpad-size \
+    /usr/libexec/libinput/libinput-measure-touchpad-tap \
+    /usr/libexec/libinput/libinput-quirks \
+    /usr/libexec/libinput/libinput-record \
+    /usr/libexec/libinput/libinput-replay \
     /usr/lib/udev/libinput-device-group \
     /usr/lib/udev/libinput-fuzz-extract \
     /usr/lib/udev/libinput-fuzz-to-zero \
@@ -121,12 +176,24 @@ for installed_path in \
     rpm -qpl "$package" | rg -Fx "$installed_path"
 done
 
-"$stage/usr/bin/libinput" --version | rg '^libinput 1\.31\.3 \(libinput-rs\)$'
-"$stage/usr/bin/libinput" --help | rg 'list-devices'
-"$stage/usr/bin/libinput" elan-recover --help | rg '^Usage: libinput elan-recover'
+staged_runtime=(env "LD_LIBRARY_PATH=$stage$libdir")
+"${staged_runtime[@]}" "$stage/usr/bin/libinput" --version | rg '^1\.31\.3$'
+"${staged_runtime[@]}" "$stage/usr/bin/libinput" --help | rg 'list-devices'
+"${staged_runtime[@]}" "$stage/usr/bin/libinput" elan-recover --help | rg '^Usage: libinput elan-recover'
 "$stage/usr/bin/libinput-rs-chwd" --list-profiles | rg '^thinkpad-p53-elan'
-"$stage/usr/libexec/libinput/libinput-debug-events" --help | rg '^Usage: libinput debug-events'
-"$stage/usr/libexec/libinput/libinput-list-devices" --help | rg '^Usage: libinput list-devices'
+rg -a -F '/usr/libexec/libinput' "$libexec_dir/libinput-tool"
+for helper in "${native_helpers[@]}"; do
+    "${staged_runtime[@]}" "$libexec_dir/$helper" --help >/dev/null
+done
+for helper in "${python_helpers[@]}"; do
+    [[ "$(head -n 1 "$libexec_dir/$helper")" == '#!/usr/bin/python3' ]]
+    "$libexec_dir/$helper" --help >/dev/null
+done
+
+for requirement in python3 python3-libevdev python3-pyudev python3-pyyaml; do
+    rpm -qp --requires "$package" | rg -Fx "$requirement"
+done
+[[ "$(rpm -qpl "$package" | rg -c '/man/man1/libinput.*\.1\.gz$')" -eq 22 ]]
 
 pkg_config=(
     env

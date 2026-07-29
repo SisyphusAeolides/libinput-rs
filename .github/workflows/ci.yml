@@ -46,9 +46,10 @@ jobs:
 
       - name: Install DNF dependencies
         run: >-
-          dnf -y -q install cpio elfutils gcc gcc-gfortran libwacom-devel make pkgconf-pkg-config
-          ripgrep rust cargo clippy rustfmt binutils rpm-build rpmdevtools systemd-devel
-          systemd-rpm-macros
+          dnf -y -q install cpio curl elfutils gcc gcc-gfortran libevdev-devel
+          libwacom-devel make meson mtdev-devel ninja-build pkgconf-pkg-config
+          python3 python3-libevdev python3-pyudev python3-pyyaml ripgrep rust cargo
+          clippy rustfmt binutils rpm-build rpmdevtools systemd-devel systemd-rpm-macros
 
       - name: Check packaging inputs
         run: make packaging-check
@@ -101,16 +102,9 @@ jobs:
       - name: Build source RPM
         run: |
           rpm_topdir="$RUNNER_TEMP/libinput-rs-rpmbuild"
-          rm -rf "$rpm_topdir"
           mkdir -p "$rpm_topdir/SOURCES" "$rpm_topdir/SRPMS" "$rpm_topdir/RPMS"
           echo "RPM_TOPDIR=$rpm_topdir" >> "$GITHUB_ENV"
-          package_name=$(rpmspec -q --srpm --qf '%{NAME}' libinput-rs.spec)
-          package_version=$(rpmspec -q --srpm --qf '%{VERSION}' libinput-rs.spec)
-          tar --exclude='./target' --exclude='./rpmbuild' --exclude='./rpmbuild2' \
-            --exclude='./proofs/fortran/build' --exclude='./.git' \
-            --transform="s|^\./|$package_name-$package_version/|" \
-            -czf "$rpm_topdir/SOURCES/$package_name-$package_version.tar.gz" .
-          rpmbuild -bs libinput-rs.spec --define "_topdir $rpm_topdir"
+          make srpm RPM_TOPDIR="$rpm_topdir"
 
       - name: Rebuild binary RPMs
         run: rpmbuild --rebuild "$RPM_TOPDIR"/SRPMS/*.src.rpm --define "_topdir $RPM_TOPDIR"

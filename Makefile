@@ -8,8 +8,15 @@ RPM_TOPDIR ?= $(HOME)/rpmbuild
 PACKAGE_NAME := $(shell rpmspec -q --srpm --qf '%{NAME}' libinput-rs.spec 2>/dev/null)
 PACKAGE_VERSION := $(shell rpmspec -q --srpm --qf '%{VERSION}' libinput-rs.spec 2>/dev/null)
 SOURCE_ARCHIVE := $(RPM_TOPDIR)/SOURCES/$(PACKAGE_NAME)-$(PACKAGE_VERSION).tar.gz
+UPSTREAM_TOOLS_URL := $(shell rpmspec -P libinput-rs.spec 2>/dev/null | awk '/^Source1:/ { print $$2; exit }')
+UPSTREAM_TOOLS_SHA256 := $(shell awk '$$1 == "%global" && $$2 == "libinput_tools_sha256" { print $$3; exit }' libinput-rs.spec)
+UPSTREAM_TOOLS_ARCHIVE := $(RPM_TOPDIR)/SOURCES/$(notdir $(UPSTREAM_TOOLS_URL))
+UPSTREAM_TOOLS_ROOT := target/upstream-tools
+UPSTREAM_TOOLS_SOURCE_DIR := $(UPSTREAM_TOOLS_ROOT)/source
+UPSTREAM_TOOLS_BUILD_DIR := $(UPSTREAM_TOOLS_ROOT)/build
+UPSTREAM_TOOLS_STAGE_DIR := $(UPSTREAM_TOOLS_ROOT)/stage
 
-.PHONY: all build shared check packaging-check crate-package-check main-crate-package-check source-archive srpm rpm-package-check test abi-check proofs proofs-strict install
+.PHONY: all build shared check packaging-check crate-package-check main-crate-package-check source-archive upstream-tools-source upstream-tools srpm rpm-package-check test abi-check proofs proofs-strict install
 
 all: build shared
 
@@ -47,7 +54,15 @@ packaging-check:
 	grep -q '%{_datadir}/libinput/\*.quirks' libinput-rs.spec
 	grep -q '%{_bindir}/libinput' libinput-rs.spec
 	grep -q '%{_bindir}/libinput-rs-chwd' libinput-rs.spec
-	grep -q '%{_libexecdir}/libinput/libinput-debug-events' libinput-rs.spec
+	grep -q '%{_libexecdir}/libinput/libinput-\*' libinput-rs.spec
+	grep -q '^Source1:.*%{libinput_tools_commit}' libinput-rs.spec
+	grep -q '^%global libinput_tools_commit 26191d396d74d505541d6311f0b4ae68d791b890' libinput-rs.spec
+	grep -q '^%global libinput_tools_sha256 d5d8c8464f9cb24b0897c03edfe7d7c9e75ff5a91fe9b5b48791781aa9642858' libinput-rs.spec
+	grep -q 'libinput-tool' libinput-rs.spec
+	grep -q 'libinput-replay' libinput-rs.spec
+	grep -Eq '^Requires: +python3-libevdev' libinput-rs.spec
+	grep -Eq '^Requires: +python3-pyudev' libinput-rs.spec
+	grep -Eq '^Requires: +python3-pyyaml' libinput-rs.spec
 	grep -Eq '^install .*%\{_libdir\}/libinput\.so\.10' libinput-rs.spec
 	! grep -Eq '^BuildRequires: *(Agda|idris2)' libinput-rs.spec
 	grep -Eq '^BuildRequires: *gcc-gfortran' libinput-rs.spec
@@ -82,10 +97,41 @@ source-archive:
 	mkdir -p "$(RPM_TOPDIR)/SOURCES"
 	tar --exclude='./target' --exclude='./rpmbuild' --exclude='./rpmbuild2' \
 		--exclude='./proofs/fortran/build' --exclude='./.git' \
+		--exclude='./audit.py' --exclude='./fix_compile.py' \
 		--transform='s|^\./|$(PACKAGE_NAME)-$(PACKAGE_VERSION)/|' \
 		-czf "$(SOURCE_ARCHIVE)" .
 
-srpm: source-archive
+upstream-tools-source:
+	mkdir -p "$(RPM_TOPDIR)/SOURCES"
+	@if ! echo "$(UPSTREAM_TOOLS_SHA256)  $(UPSTREAM_TOOLS_ARCHIVE)" | sha256sum -c --status 2>/dev/null; then \
+		curl --fail --location --retry 3 --output "$(UPSTREAM_TOOLS_ARCHIVE).part" "$(UPSTREAM_TOOLS_URL)"; \
+		echo "$(UPSTREAM_TOOLS_SHA256)  $(UPSTREAM_TOOLS_ARCHIVE).part" | sha256sum -c -; \
+		mv "$(UPSTREAM_TOOLS_ARCHIVE).part" "$(UPSTREAM_TOOLS_ARCHIVE)"; \
+	fi
+	echo "$(UPSTREAM_TOOLS_SHA256)  $(UPSTREAM_TOOLS_ARCHIVE)" | sha256sum -c -
+
+$(UPSTREAM_TOOLS_SOURCE_DIR)/.stamp: | upstream-tools-source
+	mkdir -p "$(UPSTREAM_TOOLS_SOURCE_DIR)"
+	tar -xzf "$(UPSTREAM_TOOLS_ARCHIVE)" --strip-components=1 -C "$(UPSTREAM_TOOLS_SOURCE_DIR)"
+	touch "$@"
+
+$(UPSTREAM_TOOLS_BUILD_DIR)/.stamp: $(UPSTREAM_TOOLS_SOURCE_DIR)/.stamp
+	meson setup "$(UPSTREAM_TOOLS_BUILD_DIR)" "$(UPSTREAM_TOOLS_SOURCE_DIR)" \
+		--buildtype=release --prefix="$(PREFIX)" --libdir="$(notdir $(LIBDIR))" \
+		-Dtests=false -Ddocumentation=false -Ddebug-gui=false \
+		-Dlibwacom=false -Dlua-plugins=disabled
+	meson compile -C "$(UPSTREAM_TOOLS_BUILD_DIR)"
+	touch "$@"
+
+$(UPSTREAM_TOOLS_STAGE_DIR)/.stamp: $(UPSTREAM_TOOLS_BUILD_DIR)/.stamp
+	mkdir -p "$(UPSTREAM_TOOLS_STAGE_DIR)"
+	DESTDIR="$(abspath $(UPSTREAM_TOOLS_STAGE_DIR))" \
+		meson install -C "$(UPSTREAM_TOOLS_BUILD_DIR)" --no-rebuild
+	touch "$@"
+
+upstream-tools: $(UPSTREAM_TOOLS_STAGE_DIR)/.stamp
+
+srpm: source-archive upstream-tools-source
 	mkdir -p "$(RPM_TOPDIR)/SRPMS"
 	rpmbuild -bs libinput-rs.spec --define "_topdir $(RPM_TOPDIR)"
 
@@ -136,13 +182,26 @@ proofs-strict:
 	command -v "$(FC)" >/dev/null
 	$(MAKE) proofs FC="$(FC)"
 
-install: all
+install: all upstream-tools
 	install -Dm755 target/release/libinput $(DESTDIR)$(PREFIX)/bin/libinput
 	ln -sf libinput $(DESTDIR)$(PREFIX)/bin/libinput-rs
 	install -Dm755 target/release/libinput-rs-chwd $(DESTDIR)$(PREFIX)/bin/libinput-rs-chwd
 	install -d $(DESTDIR)$(PREFIX)/libexec/libinput
-	ln -sf ../../bin/libinput $(DESTDIR)$(PREFIX)/libexec/libinput/libinput-debug-events
-	ln -sf ../../bin/libinput $(DESTDIR)$(PREFIX)/libexec/libinput/libinput-list-devices
+	install -Dm755 $(UPSTREAM_TOOLS_STAGE_DIR)$(PREFIX)/bin/libinput \
+		$(DESTDIR)$(PREFIX)/libexec/libinput/libinput-tool
+	for helper in $(UPSTREAM_TOOLS_STAGE_DIR)$(PREFIX)/libexec/libinput/libinput-*; do \
+		test "$$(basename "$$helper")" = libinput-test && continue; \
+		install -Dm755 "$$helper" $(DESTDIR)$(PREFIX)/libexec/libinput/"$$(basename "$$helper")"; \
+	done
+	for helper in libinput-analyze-buttons libinput-analyze-per-slot-delta \
+		libinput-analyze-recording libinput-analyze-touch-down-state \
+		libinput-list-kernel-devices libinput-measure-fuzz \
+		libinput-measure-touch-size libinput-measure-touchpad-pressure \
+		libinput-measure-touchpad-size libinput-measure-touchpad-tap \
+		libinput-replay; do \
+		sed -i '1s|^#!/usr/bin/env python3$$|#!/usr/bin/python3|' \
+			$(DESTDIR)$(PREFIX)/libexec/libinput/"$$helper"; \
+	done
 	install -Dm755 target/release/libinput-device-group $(DESTDIR)$(PREFIX)/lib/udev/libinput-device-group
 	install -Dm755 target/release/libinput-fuzz-extract $(DESTDIR)$(PREFIX)/lib/udev/libinput-fuzz-extract
 	install -Dm755 target/release/libinput-fuzz-to-zero $(DESTDIR)$(PREFIX)/lib/udev/libinput-fuzz-to-zero
@@ -161,7 +220,9 @@ install: all
 	sed 's|@LIBDIR@|$(LIBDIR)|g' packaging/libinput-rs.pc.in > $(DESTDIR)$(LIBDIR)/pkgconfig/libinput.pc
 	install -Dm644 packaging/libinput-rs.8 $(DESTDIR)$(PREFIX)/share/man/man8/libinput-rs.8
 	install -Dm644 packaging/libinput-rs-chwd.8 $(DESTDIR)$(PREFIX)/share/man/man8/libinput-rs-chwd.8
-	install -Dm644 packaging/libinput.1 $(DESTDIR)$(PREFIX)/share/man/man1/libinput.1
-	ln -sf libinput.1 $(DESTDIR)$(PREFIX)/share/man/man1/libinput-debug-events.1
-	ln -sf libinput.1 $(DESTDIR)$(PREFIX)/share/man/man1/libinput-list-devices.1
-	install -Dm644 packaging/_libinput $(DESTDIR)$(PREFIX)/share/zsh/site-functions/_libinput
+	for manpage in $(UPSTREAM_TOOLS_STAGE_DIR)$(PREFIX)/share/man/man1/libinput*.1; do \
+		test "$$(basename "$$manpage")" = libinput-test.1 && continue; \
+		install -Dm644 "$$manpage" $(DESTDIR)$(PREFIX)/share/man/man1/"$$(basename "$$manpage")"; \
+	done
+	install -Dm644 $(UPSTREAM_TOOLS_STAGE_DIR)$(PREFIX)/share/zsh/site-functions/_libinput \
+		$(DESTDIR)$(PREFIX)/share/zsh/site-functions/_libinput

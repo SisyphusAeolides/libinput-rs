@@ -1,15 +1,11 @@
-use evdev_upstream::{AbsoluteAxisCode, Device, KeyCode, RelativeAxisCode};
-use std::collections::HashSet;
 use std::env;
-use std::ffi::OsString;
-use std::io::{self, Write};
+use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::thread;
-use std::time::Duration;
 
 const LIBINPUT_VERSION: &str = "1.31.3";
+const SYSTEM_TOOL: &str = "/usr/libexec/libinput/libinput-tool";
 
 fn main() -> ExitCode {
     match run() {
@@ -24,46 +20,61 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let mut args = env::args_os();
     let executable = args.next().unwrap_or_else(|| OsString::from("libinput"));
-    let executable_name = Path::new(&executable)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("libinput");
     let remaining: Vec<OsString> = args.collect();
 
-    if executable_name.ends_with("libinput-debug-events") {
-        return debug_events(&remaining);
-    }
-    if executable_name.ends_with("libinput-list-devices") {
-        return list_devices(&remaining);
+    if remaining.first().and_then(|value| value.to_str()) == Some("elan-recover") {
+        return elan_recover(&remaining[1..]);
     }
 
-    let Some(command) = remaining.first().and_then(|value| value.to_str()) else {
-        print_help();
-        return Ok(());
-    };
-    match command {
-        "--help" | "-h" | "help" => {
+    let helper = upstream_tool_path(&executable);
+    if helper.is_file() {
+        let error = Command::new(&helper).args(&remaining).exec();
+        return Err(format!("failed to execute {}: {error}", helper.display()));
+    }
+
+    fallback_without_tools(&remaining)
+}
+
+fn upstream_tool_path(executable: &OsStr) -> PathBuf {
+    let executable = Path::new(executable);
+    if executable.is_absolute() {
+        if let Some(prefix) = executable.parent().and_then(Path::parent) {
+            let adjacent = prefix.join("libexec/libinput/libinput-tool");
+            if adjacent.is_file() {
+                return adjacent;
+            }
+        }
+    }
+    PathBuf::from(SYSTEM_TOOL)
+}
+
+fn fallback_without_tools(args: &[OsString]) -> Result<(), String> {
+    match args.first().and_then(|value| value.to_str()) {
+        Some("--version" | "-V") => {
+            println!("{LIBINPUT_VERSION}");
+            Ok(())
+        }
+        None | Some("--help" | "-h" | "help") => {
             print_help();
             Ok(())
         }
-        "--version" | "-V" => {
-            println!("libinput {LIBINPUT_VERSION} (libinput-rs)");
-            Ok(())
-        }
-        "debug-events" => debug_events(&remaining[1..]),
-        "list-devices" => list_devices(&remaining[1..]),
-        "elan-recover" => elan_recover(&remaining[1..]),
-        other => exec_compatibility_helper(other, &remaining[1..]),
+        Some(command) => Err(format!(
+            "{command} is unavailable because the libinput utility payload is not installed"
+        )),
     }
 }
 
 fn print_help() {
     println!(
         "Usage: libinput [--help|--version] <command> [<args>]\n\n\
-         Commands:\n  list-devices  List input devices and capabilities\n  \
-         debug-events  Print kernel input events\n  \
-         elan-recover  Reinitialize a wedged ELAN I2C controller\n\n\
-         Additional libinput utility commands are dispatched from /usr/libexec/libinput when installed."
+         Global options:\n  --help ...... show this help and exit\n  \
+         --version ... show version information and exit\n\n\
+         Commands:\n  list-devices\n\tList all devices with their default configuration options\n\n  \
+         debug-events\n\tPrint events to stdout\n\n  \
+         measure <feature>\n\tMeasure various device properties. See the man page for more info\n\n  \
+         analyze <feature>\n\tAnalyze device events. See the man page for more info\n\n  \
+         record\n\tRecord event stream from a device node. See the man page for more info\n\n  \
+         replay\n\tReplay a previously recorded event stream. See the man page for more info"
     );
 }
 
@@ -125,222 +136,16 @@ fn elan_recover(args: &[OsString]) -> Result<(), String> {
     Ok(())
 }
 
-fn exec_compatibility_helper(command: &str, args: &[OsString]) -> Result<(), String> {
-    if !command
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return Err(format!("invalid command '{command}'"));
-    }
-    let helper = PathBuf::from(format!("/usr/libexec/libinput/libinput-{command}"));
-    if !helper.is_file() {
-        return Err(format!("{command} is not installed"));
-    }
-    let error = Command::new(helper).args(args).exec();
-    Err(format!("failed to execute {command}: {error}"))
-}
-
-fn list_devices(args: &[OsString]) -> Result<(), String> {
-    if args
-        .iter()
-        .any(|arg| matches!(arg.to_str(), Some("--help" | "-h")))
-    {
-        println!("Usage: libinput list-devices");
-        return Ok(());
-    }
-    if !args.is_empty() {
-        return Err("list-devices does not accept positional arguments".to_string());
-    }
-
-    for (path, _) in input::evdev::enumerate() {
-        let Ok(device) = Device::open(&path) else {
-            continue;
-        };
-        print_device(&path, &device);
-    }
-    Ok(())
-}
-
-fn print_device(path: &Path, device: &Device) {
-    let id = device.input_id();
-    let keys = device.supported_keys();
-    let relative = device.supported_relative_axes();
-    let absolute = device.supported_absolute_axes();
-    let keyboard = keys.is_some_and(|codes| codes.contains(KeyCode::KEY_A));
-    let pointer = relative.is_some_and(|axes| {
-        axes.contains(RelativeAxisCode::REL_X) || axes.contains(RelativeAxisCode::REL_Y)
-    }) || keys.is_some_and(|codes| codes.contains(KeyCode::BTN_LEFT));
-    let touch = absolute.is_some_and(|axes| {
-        axes.contains(AbsoluteAxisCode::ABS_MT_POSITION_X)
-            && axes.contains(AbsoluteAxisCode::ABS_MT_POSITION_Y)
-    });
-    let switches = device
-        .supported_switches()
-        .is_some_and(|codes| codes.iter().next().is_some());
-    let mut capabilities = Vec::new();
-    if keyboard {
-        capabilities.push("keyboard");
-    }
-    if pointer {
-        capabilities.push("pointer");
-    }
-    if touch {
-        capabilities.push("touch");
-    }
-    if switches {
-        capabilities.push("switch");
-    }
-
-    println!(
-        "Device:                  {}",
-        device.name().unwrap_or("Unknown")
-    );
-    println!("Kernel:                  {}", path.display());
-    println!(
-        "Id:                      {:04x}:{:04x}:{:04x}",
-        id.bus_type().0,
-        id.vendor(),
-        id.product()
-    );
-    println!("Capabilities:            {}", capabilities.join(" "));
-    println!();
-}
-
-struct DebugDevice {
-    path: PathBuf,
-    device: Device,
-}
-
-fn debug_events(args: &[OsString]) -> Result<(), String> {
-    let mut paths = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].to_str() {
-            Some("--help" | "-h") => {
-                println!("Usage: libinput debug-events [--device /dev/input/eventX]");
-                return Ok(());
-            }
-            Some("--device") => {
-                index += 1;
-                let Some(path) = args.get(index) else {
-                    return Err("--device requires a path".to_string());
-                };
-                paths.push(PathBuf::from(path));
-            }
-            Some("--verbose" | "--show-keycodes" | "--quiet") => {}
-            Some(option) => return Err(format!("unknown debug-events option '{option}'")),
-            None => return Err("debug-events arguments must be valid UTF-8".to_string()),
-        }
-        index += 1;
-    }
-
-    let explicit = !paths.is_empty();
-    if !explicit {
-        paths.extend(input::evdev::enumerate().map(|(path, _)| path));
-    }
-    let mut devices = Vec::new();
-    let mut opened = HashSet::new();
-    open_debug_devices(paths, &mut devices, &mut opened)?;
-    if devices.is_empty() {
-        return Err("no readable input devices".to_string());
-    }
-
-    loop {
-        let mut saw_event = false;
-        devices.retain_mut(|tracked| match tracked.device.fetch_events() {
-            Ok(events) => {
-                for event in events {
-                    saw_event = true;
-                    println!(
-                        "{} type={} code={} value={}",
-                        tracked.path.display(),
-                        event.event_type().0,
-                        event.code(),
-                        event.value()
-                    );
-                }
-                true
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => true,
-            Err(error) if error.raw_os_error() == Some(libc::ENODEV) => {
-                opened.remove(&tracked.path);
-                false
-            }
-            Err(error) => {
-                eprintln!("{}: {error}", tracked.path.display());
-                true
-            }
-        });
-        if !explicit {
-            let paths: Vec<PathBuf> = input::evdev::enumerate()
-                .map(|(path, _)| path)
-                .filter(|path| !opened.contains(path))
-                .collect();
-            open_debug_devices(paths, &mut devices, &mut opened)?;
-        }
-        if !saw_event {
-            thread::sleep(Duration::from_millis(4));
-        } else {
-            io::stdout()
-                .flush()
-                .map_err(|error| format!("failed to flush event output: {error}"))?;
-        }
-    }
-}
-
-fn open_debug_devices(
-    paths: impl IntoIterator<Item = PathBuf>,
-    devices: &mut Vec<DebugDevice>,
-    opened: &mut HashSet<PathBuf>,
-) -> Result<(), String> {
-    for path in paths {
-        if opened.contains(&path) {
-            continue;
-        }
-        match Device::open(&path) {
-            Ok(device) => {
-                device
-                    .set_nonblocking(true)
-                    .map_err(|error| format!("{}: {error}", path.display()))?;
-                println!(
-                    "{} DEVICE_ADDED {}",
-                    path.display(),
-                    device.name().unwrap_or("Unknown")
-                );
-                opened.insert(path.clone());
-                devices.push(DebugDevice { path, device });
-            }
-            Err(error) if !explicit_permission_error(&error) => {
-                eprintln!("{}: {error}", path.display());
-            }
-            Err(_) => {}
-        }
-    }
-    Ok(())
-}
-
-fn explicit_permission_error(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use super::explicit_permission_error;
-    use std::io;
+    use super::upstream_tool_path;
+    use std::ffi::OsStr;
 
     #[test]
-    fn expected_discovery_errors_remain_quiet() {
-        assert!(explicit_permission_error(&io::Error::from(
-            io::ErrorKind::PermissionDenied
-        )));
-        assert!(explicit_permission_error(&io::Error::from(
-            io::ErrorKind::NotFound
-        )));
-        assert!(!explicit_permission_error(&io::Error::from(
-            io::ErrorKind::InvalidData
-        )));
+    fn nonabsolute_invocation_uses_the_system_tool() {
+        assert_eq!(
+            upstream_tool_path(OsStr::new("libinput")),
+            std::path::Path::new("/usr/libexec/libinput/libinput-tool")
+        );
     }
 }

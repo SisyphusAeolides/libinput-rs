@@ -1,5 +1,7 @@
 %global libinput_compat_version 1.31.3
 %global libinput_replace_before 1.32.0
+%global libinput_tools_commit 26191d396d74d505541d6311f0b4ae68d791b890
+%global libinput_tools_sha256 d5d8c8464f9cb24b0897c03edfe7d7c9e75ff5a91fe9b5b48791781aa9642858
 
 Name:           libinput-rs
 Version:        0.3.1
@@ -16,6 +18,7 @@ Obsoletes:      libinput-devel < %{libinput_replace_before}
 License:        MIT AND Unicode-3.0
 URL:            https://github.com/SisyphusAeolides/libinput-rs
 Source0:        %{name}-%{version}.tar.gz
+Source1:        https://gitlab.freedesktop.org/libinput/libinput/-/archive/%{libinput_tools_commit}/libinput-%{libinput_tools_commit}.tar.gz
 
 %if 0%{?fedora}
 %global cargo_features --features libwacom
@@ -29,11 +32,20 @@ BuildRequires:  binutils
 BuildRequires:  gcc
 BuildRequires:  gcc-gfortran
 BuildRequires:  make
+BuildRequires:  meson >= 0.64
+BuildRequires:  ninja-build
+BuildRequires:  pkgconfig(libevdev) >= 1.10.0
+BuildRequires:  pkgconfig(mtdev) >= 1.1.0
 BuildRequires:  pkgconfig(libudev)
+BuildRequires:  python3
 BuildRequires:  systemd-rpm-macros
 %if 0%{?fedora}
 BuildRequires:  libwacom-devel >= 2.18
 %endif
+Requires:       python3
+Requires:       python3-libevdev
+Requires:       python3-pyudev
+Requires:       python3-pyyaml
 %description
 libinput-rs installs a Rust implementation of the libinput.so.10 ABI in the
 system library path. The single package also includes the C development files,
@@ -42,20 +54,73 @@ scrolling, tapping, click mapping, and disable-while-typing are handled inside
 the shared backend without a second process or exclusive device grab.
 
 %prep
-%autosetup
+echo "%{libinput_tools_sha256}  %{SOURCE1}" | sha256sum -c -
+%autosetup -a 1
 
 %build
 %set_build_flags
 CARGO_NET_OFFLINE=true CARGO_PROFILE_RELEASE_DEBUG=2 cargo build --frozen --release --bins %{cargo_features}
 CARGO_NET_OFFLINE=true CARGO_PROFILE_RELEASE_DEBUG=2 CARGO_FEATURES="%{cargo_features}" RPM_LD_FLAGS="%{build_ldflags}" ./build-shared.sh
+CFLAGS="%{build_cflags}" LDFLAGS="%{build_ldflags}" meson setup upstream-tools-build \
+    libinput-%{libinput_tools_commit} \
+    --buildtype=plain \
+    --prefix=%{_prefix} \
+    --libdir=%{_lib} \
+    -Dtests=false \
+    -Ddocumentation=false \
+    -Ddebug-gui=false \
+    -Dlibwacom=false \
+    -Dlua-plugins=disabled
+meson compile -C upstream-tools-build
 
 %install
 install -Dm755 target/release/libinput %{buildroot}%{_bindir}/libinput
 ln -s libinput %{buildroot}%{_bindir}/libinput-rs
 install -Dm755 target/release/libinput-rs-chwd %{buildroot}%{_bindir}/libinput-rs-chwd
 install -d %{buildroot}%{_libexecdir}/libinput
-ln -s ../../bin/libinput %{buildroot}%{_libexecdir}/libinput/libinput-debug-events
-ln -s ../../bin/libinput %{buildroot}%{_libexecdir}/libinput/libinput-list-devices
+upstream_stage="$(pwd)/upstream-tools-stage"
+rm -rf "$upstream_stage"
+DESTDIR="$upstream_stage" meson install -C upstream-tools-build --no-rebuild
+install -Dm755 "$upstream_stage%{_bindir}/libinput" \
+    %{buildroot}%{_libexecdir}/libinput/libinput-tool
+for helper in \
+    libinput-analyze \
+    libinput-analyze-buttons \
+    libinput-analyze-per-slot-delta \
+    libinput-analyze-recording \
+    libinput-analyze-touch-down-state \
+    libinput-debug-events \
+    libinput-debug-tablet \
+    libinput-debug-tablet-pad \
+    libinput-list-devices \
+    libinput-list-kernel-devices \
+    libinput-measure \
+    libinput-measure-fuzz \
+    libinput-measure-touch-size \
+    libinput-measure-touchpad-pressure \
+    libinput-measure-touchpad-size \
+    libinput-measure-touchpad-tap \
+    libinput-quirks \
+    libinput-record \
+    libinput-replay; do
+    install -Dm755 "$upstream_stage%{_libexecdir}/libinput/$helper" \
+        "%{buildroot}%{_libexecdir}/libinput/$helper"
+done
+for helper in \
+    libinput-analyze-buttons \
+    libinput-analyze-per-slot-delta \
+    libinput-analyze-recording \
+    libinput-analyze-touch-down-state \
+    libinput-list-kernel-devices \
+    libinput-measure-fuzz \
+    libinput-measure-touch-size \
+    libinput-measure-touchpad-pressure \
+    libinput-measure-touchpad-size \
+    libinput-measure-touchpad-tap \
+    libinput-replay; do
+    sed -i '1s|^#!/usr/bin/env python3$|#!/usr/bin/python3|' \
+        "%{buildroot}%{_libexecdir}/libinput/$helper"
+done
 install -Dm755 target/release/libinput-device-group %{buildroot}%{_prefix}/lib/udev/libinput-device-group
 install -Dm755 target/release/libinput-fuzz-extract %{buildroot}%{_prefix}/lib/udev/libinput-fuzz-extract
 install -Dm755 target/release/libinput-fuzz-to-zero %{buildroot}%{_prefix}/lib/udev/libinput-fuzz-to-zero
@@ -75,10 +140,15 @@ sed 's|@LIBDIR@|%{_libdir}|g' packaging/libinput-rs.pc.in \
     > %{buildroot}%{_libdir}/pkgconfig/libinput.pc
 install -Dm644 packaging/libinput-rs.8 %{buildroot}%{_mandir}/man8/libinput-rs.8
 install -Dm644 packaging/libinput-rs-chwd.8 %{buildroot}%{_mandir}/man8/libinput-rs-chwd.8
-install -Dm644 packaging/libinput.1 %{buildroot}%{_mandir}/man1/libinput.1
-ln -s libinput.1 %{buildroot}%{_mandir}/man1/libinput-debug-events.1
-ln -s libinput.1 %{buildroot}%{_mandir}/man1/libinput-list-devices.1
-install -Dm644 packaging/_libinput %{buildroot}%{_datadir}/zsh/site-functions/_libinput
+for manpage in "$upstream_stage%{_mandir}/man1"/libinput*.1; do
+    test "$(basename "$manpage")" = "libinput-test.1" && continue
+    install -Dm644 "$manpage" \
+        "%{buildroot}%{_mandir}/man1/$(basename "$manpage")"
+done
+install -Dm644 "$upstream_stage%{_datadir}/zsh/site-functions/_libinput" \
+    %{buildroot}%{_datadir}/zsh/site-functions/_libinput
+install -Dm644 libinput-%{libinput_tools_commit}/COPYING \
+    %{buildroot}%{_licensedir}/%{name}/third-party/libinput-tools/COPYING
 
 install -d %{buildroot}%{_licensedir}/%{name}/third-party
 for crate in vendor/*; do
@@ -116,8 +186,7 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 %{_bindir}/libinput-rs
 %{_bindir}/libinput
 %{_bindir}/libinput-rs-chwd
-%{_libexecdir}/libinput/libinput-debug-events
-%{_libexecdir}/libinput/libinput-list-devices
+%{_libexecdir}/libinput/libinput-*
 %{_prefix}/lib/udev/libinput-device-group
 %{_prefix}/lib/udev/libinput-fuzz-extract
 %{_prefix}/lib/udev/libinput-fuzz-to-zero
@@ -134,13 +203,13 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 %{_libdir}/pkgconfig/libinput.pc
 %{_mandir}/man8/libinput-rs.8*
 %{_mandir}/man8/libinput-rs-chwd.8*
-%{_mandir}/man1/libinput.1*
-%{_mandir}/man1/libinput-debug-events.1*
-%{_mandir}/man1/libinput-list-devices.1*
+%{_mandir}/man1/libinput*.1*
 %{_datadir}/zsh/site-functions/_libinput
 
 %changelog
 * Wed Jul 29 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.3.1-1
+- Ship the complete pinned libinput 1.31.3 diagnostic and recording utility suite
+- Dispatch standard commands through their upstream implementations
 - Share libinput device groups across controller companion nodes
 - Drive keyboard LEDs through the tracked evdev descriptor
 - Restore the libinput command, diagnostic entry points, manuals, and completion
