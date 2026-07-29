@@ -33,6 +33,21 @@ impl MotionHistory {
         *self = Self::default();
     }
 
+    /// Restart at a known device timestamp.
+    ///
+    /// Upstream seeds the current tracker when a contact begins. Without
+    /// that seed, the first motion frame is compared with timestamp zero and
+    /// is incorrectly treated as motion after the one-second timeout,
+    /// heavily decelerating the first gesture update.
+    pub fn restart_at(&mut self, time_usec: u64) {
+        self.restart();
+        self.trackers[self.current] = Tracker {
+            time_usec,
+            direction: UNDEFINED_DIRECTION,
+            ..Tracker::default()
+        };
+    }
+
     fn by_offset(&self, offset: usize) -> &Tracker {
         &self.trackers[(self.current + self.trackers.len() - offset) % self.trackers.len()]
     }
@@ -142,5 +157,13 @@ mod tests {
             ..MotionHistory::default()
         };
         assert_eq!(history.simpson_factor(3.0, |velocity| velocity), 2.0);
+    }
+
+    #[test]
+    fn timestamped_restart_preserves_first_frame_velocity() {
+        let mut history = MotionHistory::default();
+        history.restart_at(10_000);
+        let velocity = history.feed_velocity(10.0, 0.0, 20_000, false);
+        assert!((velocity - 0.001).abs() < 0.000_001);
     }
 }

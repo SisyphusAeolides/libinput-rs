@@ -27,9 +27,10 @@ unsafe fn resolutions(device: *mut LibinputDevice) -> (f64, f64) {
 
 /// Apply libinput's touchpad coordinate contract.
 ///
-/// The unaccelerated channel stays in device units with Y rescaled onto the X
-/// axis. Only the accelerated channel is normalized to the 1000-DPI baseline
-/// and passed through the selected profile.
+/// Both public channels are expressed in libinput's normalized coordinate
+/// space. The adaptive profile's unaccelerated channel uses the constant
+/// 0.9-baseline filter; flat profiles intentionally return the same value on
+/// both channels, and custom profiles use their fallback curve.
 pub unsafe fn configured_motion(
     device: *mut LibinputDevice,
     dx: f64,
@@ -39,70 +40,82 @@ pub unsafe fn configured_motion(
     lenovo_x230: bool,
 ) -> PointerMotionEvent {
     let (x_resolution, y_resolution) = resolutions(device);
-    let dx_unaccel = dx;
-    let dy_unaccel = dy * x_resolution / y_resolution;
+    let raw_x = dx;
+    let raw_y = dy * x_resolution / y_resolution;
 
     if (*device).accel_profile == 4 {
-        let factor = (*device)
-            .accel_custom
-            .as_mut()
-            .and_then(|config| config.curve_mut(1))
-            .map(|curve| curve.factor(dx_unaccel, dy_unaccel, time_usec))
-            .unwrap_or(1.0);
+        let (fallback_factor, motion_factor) =
+            (*device)
+                .accel_custom
+                .as_mut()
+                .map_or((1.0, 1.0), |config| {
+                    let fallback = config
+                        .curve_mut(0)
+                        .map(|curve| curve.factor(raw_x, raw_y, time_usec))
+                        .unwrap_or(1.0);
+                    let motion = config
+                        .curve_mut(1)
+                        .map(|curve| curve.factor(raw_x, raw_y, time_usec))
+                        .unwrap_or(fallback);
+                    (fallback, motion)
+                });
         return PointerMotionEvent {
             time_usec,
-            dx: dx_unaccel * factor,
-            dy: dy_unaccel * factor,
-            dx_unaccel,
-            dy_unaccel,
+            dx: raw_x * motion_factor,
+            dy: raw_y * motion_factor,
+            dx_unaccel: raw_x * fallback_factor,
+            dy_unaccel: raw_y * fallback_factor,
         };
     }
 
     let normalize = DEFAULT_DPI / (x_resolution * MM_PER_INCH);
-    if lenovo_x230 {
-        let normalized_x = dx_unaccel * normalize;
-        let normalized_y = dy_unaccel * normalize;
-        let profile_factor = if (*device).accel_profile == 1 {
-            0.1
-        } else {
-            let velocity = history.feed_velocity(normalized_x, normalized_y, time_usec, false);
-            history.simpson_factor(velocity, |velocity| {
-                lenovo_x230_profile(velocity, (*device).accel_speed)
-            })
+    if (*device).accel_profile == 1 {
+        let factor = MAGIC_SLOWDOWN * speed_factor((*device).accel_speed) * normalize;
+        return PointerMotionEvent {
+            time_usec,
+            dx: raw_x * factor,
+            dy: raw_y * factor,
+            dx_unaccel: raw_x * factor,
+            dy_unaccel: raw_y * factor,
         };
+    }
+    if lenovo_x230 {
+        let normalized_x = raw_x * normalize;
+        let normalized_y = raw_y * normalize;
+        let velocity = history.feed_velocity(normalized_x, normalized_y, time_usec, false);
+        let profile_factor = history.simpson_factor(velocity, |velocity| {
+            lenovo_x230_profile(velocity, (*device).accel_speed)
+        });
         return PointerMotionEvent {
             time_usec,
             dx: normalized_x * profile_factor,
             dy: normalized_y * profile_factor,
-            dx_unaccel,
-            dy_unaccel,
+            dx_unaccel: normalized_x * 4.0,
+            dy_unaccel: normalized_y * 4.0,
         };
     }
-    let profile_factor = if (*device).accel_profile == 1 {
-        MAGIC_SLOWDOWN * (1.0 + (*device).accel_speed).max(0.005)
-    } else {
-        let velocity = history.feed_velocity(dx_unaccel, dy_unaccel, time_usec, false);
-        history.simpson_factor(velocity, |velocity| {
-            let speed_mm_s = velocity * 1_000_000.0 / x_resolution;
-            let threshold = 130.0;
-            let adaptive = if speed_mm_s < 7.0 {
-                (0.1 * speed_mm_s + 0.3).min(BASELINE)
-            } else if speed_mm_s < threshold {
-                BASELINE
-            } else {
-                let speed = speed_mm_s.min(threshold * 4.0);
-                0.0025 * (speed / threshold) * (speed - threshold) + BASELINE
-            };
-            adaptive * speed_factor((*device).accel_speed) * MAGIC_SLOWDOWN
-        })
-    };
+    let velocity = history.feed_velocity(raw_x, raw_y, time_usec, false);
+    let profile_factor = history.simpson_factor(velocity, |velocity| {
+        let speed_mm_s = velocity * 1_000_000.0 / x_resolution;
+        let threshold = 130.0;
+        let adaptive = if speed_mm_s < 7.0 {
+            (0.1 * speed_mm_s + 0.3).min(BASELINE)
+        } else if speed_mm_s < threshold {
+            BASELINE
+        } else {
+            let speed = speed_mm_s.min(threshold * 4.0);
+            0.0025 * (speed / threshold) * (speed - threshold) + BASELINE
+        };
+        adaptive * speed_factor((*device).accel_speed) * MAGIC_SLOWDOWN
+    });
+    let constant_factor = BASELINE * MAGIC_SLOWDOWN * normalize;
 
     PointerMotionEvent {
         time_usec,
-        dx: dx_unaccel * profile_factor * normalize,
-        dy: dy_unaccel * profile_factor * normalize,
-        dx_unaccel,
-        dy_unaccel,
+        dx: raw_x * profile_factor * normalize,
+        dy: raw_y * profile_factor * normalize,
+        dx_unaccel: raw_x * constant_factor,
+        dy_unaccel: raw_y * constant_factor,
     }
 }
 

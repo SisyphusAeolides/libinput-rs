@@ -616,6 +616,10 @@ struct TrackedDevice {
     tablet_output_tilt_y: f64,
     tablet_last_event_x: f64,
     tablet_last_event_y: f64,
+    tablet_last_raw_x: f64,
+    tablet_last_raw_y: f64,
+    tablet_last_raw_tilt_x: f64,
+    tablet_last_raw_tilt_y: f64,
     tablet_last_event_pressure: f64,
     tablet_last_event_distance: f64,
     tablet_last_event_tilt_x: f64,
@@ -1083,8 +1087,15 @@ fn smooth_tablet_sample(
     if reset {
         history.clear();
     }
-    history.push_back(sample);
     let limit = if enabled { 4 } else { 1 };
+    // libinput primes the complete history with the first sample after a
+    // reset. This prevents the filter from ramping in with a changing
+    // denominator and matches tablet_history_push()'s recursive fill.
+    if history.is_empty() {
+        history.resize(limit, sample);
+    } else {
+        history.push_back(sample);
+    }
     while history.len() > limit {
         history.pop_front();
     }
@@ -1199,7 +1210,15 @@ impl TrackedDevice {
         self.jump_detection_disabled = q.model_lenovo_x1_gen6_touchpad;
         self.wheel_always_accumulate = q.model_scroll_on_middle_click;
         self.msc_timestamp_watch = q.msc_timestamp_watch;
-        self.tablet_smoothing_enabled = q.tablet_smoothing.unwrap_or(!q.is_virtual);
+        self.tablet_smoothing_enabled = if q.model_dell_canvas_totem {
+            // Upstream routes the Totem through evdev-totem rather than the
+            // generic tablet dispatcher, so its MT coordinates are never
+            // passed through tablet axis smoothing.
+            false
+        } else {
+            q.tablet_smoothing
+                .unwrap_or(!(q.is_virtual || seed.bus_type == 0x06))
+        };
         if let Some(profile) = seed.hardware_profile {
             self.is_lenovo_x230 |= profile.apply.lenovo_x230_motion;
             self.touchpad_phantom_clicks |= profile.apply.phantom_click_filter;
@@ -1299,15 +1318,32 @@ impl TrackedDevice {
             && q.lid_switch_reliability.as_deref() == Some("write_open");
     }
 
-    fn update_tablet_smoothing(&mut self, reset: bool) {
+    unsafe fn update_tablet_smoothing(&mut self, lib_dev: *mut LibinputDevice, reset: bool) {
+        // Upstream applies the configured tablet area before adding the
+        // coordinates to its smoothing history. Keeping raw, out-of-area
+        // samples in the history leaves a visible residue when the tool
+        // reaches an area edge and makes the final proximity-out event drift
+        // away from that edge.
+        let mut sample_x = self.tablet_x;
+        let mut sample_y = self.tablet_y;
+        if (*lib_dev).area_available {
+            let area = (*lib_dev).area;
+            if area != [0.0, 0.0, 1.0, 1.0] {
+                let (raw_x_min, raw_x_max) = (*lib_dev).abs_x_range.unwrap_or((0, 0));
+                let (raw_y_min, raw_y_max) = (*lib_dev).abs_y_range.unwrap_or((0, 0));
+                let x_span = f64::from(raw_x_max - raw_x_min);
+                let y_span = f64::from(raw_y_max - raw_y_min);
+                let x_min = f64::from(raw_x_min) + (x_span * area[0]).trunc();
+                let x_max = f64::from(raw_x_min) + (x_span * area[2]).trunc();
+                let y_min = f64::from(raw_y_min) + (y_span * area[1]).trunc();
+                let y_max = f64::from(raw_y_min) + (y_span * area[3]).trunc();
+                sample_x = sample_x.clamp(x_min, x_max);
+                sample_y = sample_y.clamp(y_min, y_max);
+            }
+        }
         let output = smooth_tablet_sample(
             &mut self.tablet_history,
-            (
-                self.tablet_x,
-                self.tablet_y,
-                self.tablet_tilt_x,
-                self.tablet_tilt_y,
-            ),
+            (sample_x, sample_y, self.tablet_tilt_x, self.tablet_tilt_y),
             self.tablet_smoothing_enabled,
             reset,
         );
@@ -1315,6 +1351,38 @@ impl TrackedDevice {
         self.tablet_output_y = output.1;
         self.tablet_output_tilt_x = output.2;
         self.tablet_output_tilt_y = output.3;
+        self.tablet_last_raw_x = sample_x;
+        self.tablet_last_raw_y = sample_y;
+        self.tablet_last_raw_tilt_x = self.tablet_tilt_x;
+        self.tablet_last_raw_tilt_y = self.tablet_tilt_y;
+    }
+
+    fn restore_tablet_proximity_axes(&mut self) {
+        self.tablet_x = self.tablet_last_raw_x;
+        self.tablet_y = self.tablet_last_raw_y;
+        self.tablet_output_x = self.tablet_last_raw_x;
+        self.tablet_output_y = self.tablet_last_raw_y;
+        self.tablet_tilt_x = self.tablet_last_raw_tilt_x;
+        self.tablet_tilt_y = self.tablet_last_raw_tilt_y;
+        self.tablet_output_tilt_x = self.tablet_last_raw_tilt_x;
+        self.tablet_output_tilt_y = self.tablet_last_raw_tilt_y;
+        self.tablet_pressure = self.tablet_last_event_pressure;
+        self.tablet_distance = self.tablet_last_event_distance;
+        self.tablet_rotation = self.tablet_last_event_rotation;
+        self.tablet_slider = self.tablet_last_event_slider;
+        self.tablet_size_major = self.tablet_last_event_size_major;
+        self.tablet_size_minor = self.tablet_last_event_size_minor;
+        self.tablet_x_changed = false;
+        self.tablet_y_changed = false;
+        self.tablet_pressure_changed = false;
+        self.tablet_distance_changed = false;
+        self.tablet_tilt_x_changed = false;
+        self.tablet_tilt_y_changed = false;
+        self.tablet_rotation_changed = false;
+        self.tablet_slider_changed = false;
+        self.tablet_size_major_changed = false;
+        self.tablet_size_minor_changed = false;
+        self.tablet_wheel_changed = false;
     }
 
     fn restore_synaptics_serial_touches(&mut self) {
@@ -2144,6 +2212,10 @@ impl TrackedDevice {
             tablet_output_tilt_y: tablet_tilt_y,
             tablet_last_event_x: current_abs_x.unwrap_or_default() as f64,
             tablet_last_event_y: current_abs_y.unwrap_or_default() as f64,
+            tablet_last_raw_x: current_abs_x.unwrap_or_default() as f64,
+            tablet_last_raw_y: current_abs_y.unwrap_or_default() as f64,
+            tablet_last_raw_tilt_x: tablet_tilt_x,
+            tablet_last_raw_tilt_y: tablet_tilt_y,
             tablet_last_event_pressure: tablet_pressure,
             tablet_last_event_distance: tablet_distance,
             tablet_last_event_tilt_x: tablet_tilt_x,
@@ -2297,10 +2369,17 @@ impl TrackedDevice {
     }
 
     fn gesture_finger_count(&self, button_areas: bool) -> usize {
+        // BTN_TOOL_* state may lag behind the MT slot releases (notably on
+        // ALPS devices). Once every trackable contact is gone the gesture is
+        // over regardless of a stale QUADTAP/TRIPLETAP bit; otherwise a
+        // swipe can remain active forever and never emit its END event.
+        let active = self.active_slot_count();
+        if active == 0 {
+            return 0;
+        }
         if self.is_semi_mt {
             return self.touch_fingers as usize;
         }
-        let active = self.active_slot_count();
         let eligible = self.gesture_tracked_contact_count(button_areas);
         // On pressure-aware hardware BTN_TOOL_* includes hovering contacts,
         // so only counts beyond the device's physical slot capacity are
@@ -3465,7 +3544,17 @@ unsafe fn tablet_tool_payload(
     (*lib_dev).tablet_current_tilt_x = tilt_x;
     let tool_type = (*tool).tool_type;
     let mut rotation = if matches!(tool_type, 6 | 7) {
-        ((-tilt_x).atan2(tilt_y).to_degrees() - 5.0).rem_euclid(360.0)
+        // Wacom mouse/lens rotation is derived from the current raw tilt
+        // sample before tablet position/tilt smoothing. Averaging the tilt
+        // first makes a newly-entered mouse inherit the pen's old tilt and
+        // can rotate the first event by more than 100 degrees.
+        let mut rotation_tilt_x = normalize_tilt(td.tablet_tilt_x, td.tablet_tilt_x_info);
+        let mut rotation_tilt_y = normalize_tilt(td.tablet_tilt_y, td.tablet_tilt_y_info);
+        if td.tablet_left_handed_applied {
+            rotation_tilt_x = -rotation_tilt_x;
+            rotation_tilt_y = -rotation_tilt_y;
+        }
+        ((-rotation_tilt_x).atan2(rotation_tilt_y).to_degrees() - 5.0).rem_euclid(360.0)
     } else if tool_type == 8 {
         (360.0 - td.tablet_rotation).rem_euclid(360.0)
     } else if let Some((minimum, maximum)) = td.tablet_rotation_info {
@@ -4441,6 +4530,18 @@ impl BackendState {
         for message in &applied_quirks.messages {
             crate::emit_debug_log(ctx, message);
         }
+        // AttrResolutionHint replaces a missing kernel resolution, not just
+        // the derived physical size. The touchpad motion and scroll filters
+        // normalize against this value exactly as upstream does after its
+        // quirks stage.
+        if let Some((x, y)) = applied_quirks.resolution_hint {
+            if (*lib_dev).abs_x_resolution.is_none() {
+                (*lib_dev).abs_x_resolution = Some(x.round() as i32);
+            }
+            if (*lib_dev).abs_y_resolution.is_none() {
+                (*lib_dev).abs_y_resolution = Some(y.round() as i32);
+            }
+        }
         let input_prop_enabled = |name: &str, kernel_enabled: bool| {
             if applied_quirks
                 .disabled_input_props
@@ -4509,6 +4610,18 @@ impl BackendState {
                     && axes.contains(RelativeAxisCode::REL_HWHEEL_HI_RES))
         });
         let has_relative_pointer = has_relative_motion || has_wheel;
+        // Untagged joysticks/gamepads must not fall through to the generic
+        // tablet-pad path merely because both classes use BTN_* codes and
+        // absolute axes. libinput deliberately rejects these nodes unless a
+        // device class tag or quirk identifies a supported input class.
+        let looks_like_joystick = use_evdev_fallback
+            && !has_relative_pointer
+            && !has_pen
+            && !has_finger
+            && !has_touch_button
+            && event_codes
+                .iter()
+                .any(|code| (0x120..=0x13f).contains(code));
         let has_supported_switch = device
             .supported_switches()
             .is_some_and(|switches| switches.iter().any(|switch| matches!(switch.0, 0 | 1 | 10)));
@@ -4584,6 +4697,7 @@ impl BackendState {
         let has_tablet_pad = class_hint == Some(crate::quirks::DeviceClassHint::TabletPad)
             || tag_tablet_pad
             || (use_evdev_fallback
+                && !looks_like_joystick
                 && absolute_events_enabled
                 && !is_keyboard
                 && !has_pen
@@ -5587,6 +5701,7 @@ impl BackendState {
                     device: td.lib_device,
                 });
             }
+            td.restore_tablet_proximity_axes();
             (*tool)
                 .refcount
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5634,6 +5749,7 @@ impl BackendState {
                 continue;
             }
             let tool = td.tablet_tool;
+            td.restore_tablet_proximity_axes();
             (*tool)
                 .refcount
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -7592,7 +7708,13 @@ impl BackendState {
             td.tablet_tool_type = 1;
             td.tablet_proximity_pending = Some(true);
         }
-        td.update_tablet_smoothing(td.tablet_proximity_pending.is_some() || touch_button_changed);
+        let leaving_proximity = td.tablet_proximity_pending == Some(false);
+        if !leaving_proximity {
+            td.update_tablet_smoothing(
+                lib_dev,
+                td.tablet_proximity_pending.is_some() || touch_button_changed,
+            );
+        }
         let Some(in_proximity) = td.tablet_proximity_pending.take() else {
             update_tablet_pressure_offset(td, false);
             update_tablet_tip_from_pressure(td, touch_button_changed);
@@ -7847,12 +7969,20 @@ impl BackendState {
         update_tablet_pressure_offset(td, in_proximity);
         update_tablet_tip_from_pressure(td, touch_button_changed);
         if !in_proximity {
-            td.tablet_x = td.tablet_last_event_x;
-            td.tablet_y = td.tablet_last_event_y;
+            td.tablet_x = td.tablet_last_raw_x;
+            td.tablet_y = td.tablet_last_raw_y;
+            // Proximity-out frames commonly carry kernel reset values for
+            // ABS_X/Y and tilt. Upstream skips that frame's axis update and
+            // reports the last raw, area-clipped state, without smoothing it.
+            // The event retains those axes while reporting none as changed.
+            td.tablet_output_x = td.tablet_last_raw_x;
+            td.tablet_output_y = td.tablet_last_raw_y;
             td.tablet_pressure = td.tablet_last_event_pressure;
             td.tablet_distance = td.tablet_last_event_distance;
-            td.tablet_tilt_x = td.tablet_last_event_tilt_x;
-            td.tablet_tilt_y = td.tablet_last_event_tilt_y;
+            td.tablet_tilt_x = td.tablet_last_raw_tilt_x;
+            td.tablet_tilt_y = td.tablet_last_raw_tilt_y;
+            td.tablet_output_tilt_x = td.tablet_last_raw_tilt_x;
+            td.tablet_output_tilt_y = td.tablet_last_raw_tilt_y;
             td.tablet_rotation = td.tablet_last_event_rotation;
             td.tablet_slider = td.tablet_last_event_slider;
             td.tablet_size_major = td.tablet_last_event_size_major;
@@ -8244,8 +8374,15 @@ impl BackendState {
                     } else {
                         1_000.0 / td.pointer_dpi
                     };
-                    let mut dx_unaccel = td.pending_rel_x as f64 * normalization;
-                    let mut dy_unaccel = td.pending_rel_y as f64 * normalization;
+                    // The public unaccelerated channel is the raw evdev
+                    // delta. DPI and pointing-stick normalization belongs
+                    // only to the filtered channel; exposing it here breaks
+                    // clients that use unaccelerated deltas for exact input
+                    // (and differs observably on low-DPI devices).
+                    let mut dx_unaccel = td.pending_rel_x as f64;
+                    let mut dy_unaccel = td.pending_rel_y as f64;
+                    let mut dx_filtered = dx_unaccel * normalization;
+                    let mut dy_filtered = dy_unaccel * normalization;
                     td.pending_rel_x = 0;
                     td.pending_rel_y = 0;
                     if (*lib_dev).rotation_angle != 0 {
@@ -8263,11 +8400,23 @@ impl BackendState {
                         } else {
                             rotated_y
                         };
+                        let rotated_x = dx_filtered * cos - dy_filtered * sin;
+                        let rotated_y = dx_filtered * sin + dy_filtered * cos;
+                        dx_filtered = if rotated_x.abs() < f64::EPSILON * 8.0 {
+                            0.0
+                        } else {
+                            rotated_x
+                        };
+                        dy_filtered = if rotated_y.abs() < f64::EPSILON * 8.0 {
+                            0.0
+                        } else {
+                            rotated_y
+                        };
                     }
                     let factor = configured_motion_factor(
                         lib_dev,
-                        dx_unaccel,
-                        dy_unaccel,
+                        dx_filtered,
+                        dy_filtered,
                         ts_usec,
                         false,
                         td.is_pointing_stick,
@@ -8277,8 +8426,8 @@ impl BackendState {
                         event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_MOTION,
                         payload: EventPayload::PointerMotion(PointerMotionEvent {
                             time_usec: ts_usec,
-                            dx: dx_unaccel * factor,
-                            dy: dy_unaccel * factor,
+                            dx: dx_filtered * factor,
+                            dy: dy_filtered * factor,
                             dx_unaccel,
                             dy_unaccel,
                         }),
@@ -9780,6 +9929,11 @@ impl BackendState {
                 } else if code == AbsoluteAxisCode::ABS_MT_TRACKING_ID.0 {
                     let slot = td.current_slot;
                     if slot < td.mt_slots.len() {
+                        let begins_first_contact =
+                            val >= 0 && !td.mt_slots.iter().any(|candidate| candidate.active);
+                        if begins_first_contact {
+                            td.motion_history.restart_at(ts_usec);
+                        }
                         let new_touch_palm = td.dwt_palm_for_new_touch(ts_usec);
                         let mt_slot = &mut td.mt_slots[slot];
                         if val < 0 && mt_slot.active {
@@ -11439,7 +11593,7 @@ mod tests {
         );
         assert_eq!(
             smooth_tablet_sample(&mut history, (4.0, 8.0, 2.0, 6.0), true, false),
-            (2.0, 4.0, 1.0, 3.0)
+            (1.0, 2.0, 0.5, 1.5)
         );
         assert_eq!(
             smooth_tablet_sample(&mut history, (9.0, 9.0, 9.0, 9.0), true, true),
