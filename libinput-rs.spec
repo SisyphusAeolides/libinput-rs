@@ -3,7 +3,7 @@
 
 Name:           libinput-rs
 Version:        0.3.0
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Rust drop-in replacement for libinput
 
 Provides:       libinput = %{libinput_compat_version}
@@ -25,6 +25,7 @@ Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  cargo >= 1.75
 BuildRequires:  rust >= 1.75
+BuildRequires:  binutils
 BuildRequires:  gcc
 BuildRequires:  make
 BuildRequires:  pkgconfig(libudev)
@@ -116,6 +117,11 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 %{_mandir}/man8/libinput-rs.8*
 
 %changelog
+* Wed Jul 29 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.3.0-2
+- Restore per-key and per-button seat-wide state tracking
+- Forward keyboard lock LED state through the existing evdev device
+- Accept auxiliary keyboard nodes identified by ID_INPUT_KEY
+
 * Tue Jul 28 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.3.0-1
 - Consolidate runtime, development files, and companion into one RPM
 - Embed permission-independent evdev discovery in the single source crate
