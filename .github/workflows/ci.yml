@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install native dependencies
         run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
@@ -40,7 +40,7 @@ jobs:
     container: fedora:44
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -122,7 +122,7 @@ jobs:
           rpm -qp --obsoletes "$RPM_RUNTIME"
 
       - name: Upload binary RPMs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: libinput-rs-rpms
           path: ${{ env.RPM_RUNTIME }}
@@ -136,11 +136,12 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
+      max-parallel: 4
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install native and test dependencies
         run: >-
@@ -200,7 +201,7 @@ jobs:
 
       - name: Upload test-derived parity evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: libinput-rs-parity-shard-${{ matrix.shard }}
           if-no-files-found: warn
@@ -214,10 +215,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download parity shards
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: libinput-rs-parity-shard-*
           path: ${{ runner.temp }}/libinput-rs-parity-shards
@@ -230,7 +231,7 @@ jobs:
             "$RUNNER_TEMP/libinput-rs-parity.toml"
 
       - name: Upload test-derived parity evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: libinput-rs-parity
           if-no-files-found: error
@@ -245,13 +246,13 @@ jobs:
     container: fedora:44
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install rpmlint
         run: dnf -y -q install rpmlint >/dev/null 2>&1
 
       - name: Download binary RPMs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: libinput-rs-rpms
           path: rpm
@@ -264,7 +265,7 @@ jobs:
 
       - name: Upload RPM lint report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rpmlint-report
           path: rpmlint.txt
@@ -275,7 +276,7 @@ jobs:
     container: fedora:44
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install proof compilers
         run: dnf -y -q install Agda idris2 gcc-gfortran make
