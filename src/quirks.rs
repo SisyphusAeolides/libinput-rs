@@ -211,13 +211,8 @@ impl QuirksEngine {
                 database
             })
             .unwrap_or_else(|| Arc::new(load_database(directory)));
-        let dmi_modalias = fs::read_to_string("/sys/devices/virtual/dmi/id/modalias")
-            .unwrap_or_else(|_| "dmi:*".to_string());
-        let device_tree = fs::read("/sys/firmware/devicetree/base/compatible")
-            .ok()
-            .and_then(|bytes| bytes.split(|byte| *byte == 0).next().map(Vec::from))
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .unwrap_or_default();
+        let (dmi_modalias, device_tree) =
+            system_match_identifiers(std::env::var_os("LIBINPUT_RUNNING_TEST_SUITE").is_some());
         Self {
             database,
             dmi_modalias,
@@ -247,6 +242,24 @@ impl QuirksEngine {
         }
         applied
     }
+}
+
+fn system_match_identifiers(running_test_suite: bool) -> (String, String) {
+    // Upstream deliberately removes host-machine DMI and device-tree evidence
+    // from synthetic litest devices. Without this, a hosted runner can apply
+    // quirks for its hypervisor vendor to an unrelated synthetic device.
+    if running_test_suite {
+        return ("dmi:".to_string(), String::new());
+    }
+
+    let dmi_modalias = fs::read_to_string("/sys/devices/virtual/dmi/id/modalias")
+        .unwrap_or_else(|_| "dmi:*".to_string());
+    let device_tree = fs::read("/sys/firmware/devicetree/base/compatible")
+        .ok()
+        .and_then(|bytes| bytes.split(|byte| *byte == 0).next().map(Vec::from))
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_default();
+    (dmi_modalias, device_tree)
 }
 
 fn load_database(directory: &Path) -> QuirksDatabase {
@@ -1078,6 +1091,14 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synthetic_test_devices_do_not_inherit_host_machine_matches() {
+        let (dmi, device_tree) = system_match_identifiers(true);
+        assert_eq!(dmi, "dmi:");
+        assert!(device_tree.is_empty());
+        assert!(!glob_matches("dmi:*svnMicrosoftCorporation:*", &dmi));
+    }
 
     #[test]
     fn glob_supports_quirk_name_patterns() {
