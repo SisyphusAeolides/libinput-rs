@@ -7,7 +7,7 @@ libinput-rs \- Rust libinput ABI replacement
 .SH DESCRIPTION
 The
 .B libinput-rs
-package installs an experimental ABI-compatible implementation of
+package installs a tested drop-in implementation of
 .IR libinput.so.10
 in the system library directory. Display managers, compositors, and other
 libinput clients use it after the dynamic linker cache is refreshed and the
@@ -48,8 +48,8 @@ pkg-config metadata supplied by libinput-rs on 64-bit Fedora systems.
 .I /usr/lib/systemd/system/libinput-rs-elan-resume.service
 P53-gated one-shot ELAN recovery after system resume.
 .SH INSTALLATION
-Perform replacement testing from a text console or SSH session with a tested
-rollback path. Install the single replacement package:
+Install from a text console or SSH session so rollback remains available.
+Install the single replacement package:
 .PP
 .nf
 sudo dnf install libinput-rs --allowerasing

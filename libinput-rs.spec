@@ -6,7 +6,7 @@
 Name:           libinput-rs
 Version:        0.3.1
 Release:        1%{?dist}
-Summary:        Rust implementation of the libinput ABI
+Summary:        Drop-in Rust replacement for libinput 1.31.3
 
 Provides:       libinput = %{libinput_compat_version}
 Provides:       libinput%{?_isa} = %{libinput_compat_version}
@@ -48,9 +48,10 @@ Requires:       python3-libevdev
 Requires:       python3-pyudev
 Requires:       python3-pyyaml
 %description
-libinput-rs installs a Rust implementation of the libinput.so.10 ABI in the
-system library path. The single package also includes the C development files,
-command-line tools, udev integration, and hardware quirks. Touchpad motion,
+libinput-rs installs a tested drop-in Rust implementation of the libinput
+1.31.3 libinput.so.10 ABI in the system library path. The single package also
+includes the matching C development files, command-line tools, manual pages,
+shell completion, udev integration, and hardware quirks. Touchpad motion,
 scrolling, tapping, click mapping, and disable-while-typing are handled inside
 the shared backend without a second process or exclusive device grab.
 

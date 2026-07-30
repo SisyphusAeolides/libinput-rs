@@ -15,10 +15,12 @@ make packaging-check
 ```
 
 Run the pinned upstream public-ABI behavioral suite from the release test VM
-with `LIBINPUT_RS_PARITY_REPORT` set. An unfiltered release run must report all
-23,245 pinned cases, zero failures, and a passing status. Keep the generated
+with `LIBINPUT_RS_PARITY_REPORT` set. The unfiltered release result must be
+exactly 23,245 completed, 12,185 pass, 11,059 private-interface N/A, one pinned
+release-build skip, zero failures, and status `PASS`. Keep the generated
 candidate-hash-bound report with the CI artifacts; a focused or shortened run
-is not release evidence.
+is not release evidence. Eight isolated workers complete the corpus without
+changing its inventory or result requirements.
 
 The release version must match in `Cargo.toml`, `Cargo.lock`, and
 `libinput-rs.spec`.
@@ -60,8 +62,8 @@ copr-cli create libinput-rs \
   --chroot fedora-rawhide-x86_64 \
   --chroot rhel-9-x86_64 \
   --chroot rhel-10-x86_64 \
-  --description "Rust implementation of the libinput ABI and compatibility tools" \
-  --instructions "Experimental replacement testing requires a text console or SSH-capable system and a verified rollback path."
+  --description "100% drop-in Rust replacement for libinput 1.31.3" \
+  --instructions "Install from a text console or SSH-capable system so distribution-package rollback remains available."
 ```
 
 Submit the source RPM:

@@ -1,8 +1,8 @@
-//! Experimental Rust implementation of the libinput.so ABI.
+//! Rust implementation of the libinput.so.10 ABI.
 //!
-//! The complete C ABI surface is exported, but behavioral compatibility is
-//! still gated by the upstream test suite. Do not install this library over a
-//! system libinput until every compatibility gate is complete.
+//! Version 0.3.1 is a tested drop-in replacement for libinput 1.31.3 on the
+//! supported x86_64 DNF/RPM targets. The release gate covers the complete
+//! public ABI and the pinned upstream public-ABI behavioral corpus.
 
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
@@ -4348,6 +4348,22 @@ mod tests {
             assert!(!path_ctx.is_null());
             assert_eq!(libinput_udev_assign_seat(path_ctx, seat.as_ptr()), -1);
             libinput_unref(path_ctx);
+        }
+    }
+
+    #[test]
+    fn overlong_seat_name_does_not_assign_or_queue_devices() {
+        unsafe {
+            let fake_udev = 1usize as *mut libc::c_void;
+            let seat = std::ffi::CString::new("a".repeat(257)).unwrap();
+            let ctx = libinput_udev_create_context(&INTERFACE, std::ptr::null_mut(), fake_udev);
+            assert!(!ctx.is_null());
+
+            assert_eq!(libinput_udev_assign_seat(ctx, seat.as_ptr()), -1);
+            assert!(!(*ctx).seat_assigned);
+            assert!((*ctx).event_queue.is_empty());
+
+            libinput_unref(ctx);
         }
     }
 

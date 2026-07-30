@@ -7,8 +7,9 @@ version_nodes = 25
 [evidence]
 producer = "scripts/run-upstream-public-abi-suite.sh"
 expected_completed = 23245
+expected_pass = 12185
+expected_not_applicable = 11059
+expected_skip = 1
+expected_skipped_test = "keyboard:keyboard_keycode_obfuscation:LITEST_KEYBOARD"
 required_result = "PASS"
 required_failures = 0
-
-# Pass/fail fields are deliberately absent. The producer writes a fresh,
-# candidate-hash-bound report after the complete pinned corpus exits cleanly.

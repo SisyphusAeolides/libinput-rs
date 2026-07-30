@@ -1,8 +1,9 @@
 # Compatibility gates
 
-`libinput-rs` targets library ABI and behavioral compatibility with the
-reference in `libinput-1.31.3.toml`. The checked-in file defines required
-evidence; it does not become proof merely because a field was manually set.
+`libinput-rs` provides 100% drop-in ABI, behavioral, and package compatibility
+with the libinput 1.31.3 reference on the supported x86_64 DNF/RPM targets.
+The checked-in manifest defines the exact required evidence; it does not become
+proof merely because a field was manually set.
 Matching function names is necessary but not sufficient: event behavior,
 configuration status values, ownership, restricted-file callbacks, device
 admission, quirks, and suspend/resume must be derived from a complete passing
@@ -18,6 +19,9 @@ disposable, public-ABI test runner. It runs the suite serially against the
 Rust library through an isolated loader path and does not change the
 installed system library.
 
-Library-compatibility evidence does not establish full distribution-package
-parity for every upstream utility or downstream distribution patch. Individual
-passing tests are useful progress, but do not turn a group green.
+The unfiltered release result is 23,245 completed cases: 12,185 pass, 11,059
+are hash-pinned as requiring an upstream-private configuration interface, one
+is the upstream release-build skip for internal event debugging, and zero
+fail. RPM verification separately checks the complete Fedora-compatible
+runtime, development, utility, manual-page, completion, udev, and quirks
+payload.

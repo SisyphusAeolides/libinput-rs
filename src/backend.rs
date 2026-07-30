@@ -6821,6 +6821,16 @@ impl BackendState {
             return;
         }
 
+        // A udev context does not own a seat until
+        // libinput_udev_assign_seat() succeeds. Hotplug notifications may
+        // still arrive while the context is in that state (in particular
+        // when another context creates a uinput device), but they must not
+        // cause devices to be opened or events to be queued. Drain the
+        // discovery sources above so the public fd does not remain readable.
+        if (*ctx).backend_kind == BackendKind::Udev && !(*ctx).seat_assigned {
+            return;
+        }
+
         let disappeared: Vec<*mut LibinputDevice> = self
             .devices
             .values()

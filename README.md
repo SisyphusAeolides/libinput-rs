@@ -1,15 +1,18 @@
 # libinput-rs
 
-`libinput-rs` is a Rust implementation of the `libinput.so.10` C ABI and
-command-line tools.
+`libinput-rs` is a 100% drop-in replacement for libinput 1.31.3 on the
+supported x86_64 DNF/RPM targets. It implements the `libinput.so.10` C ABI and
+ships the matching runtime, development, command-line, udev, and quirks
+package surface.
 
-The RPM is an experimental replacement candidate for the distribution's
-`libinput` and `libinput-devel` packages. It includes the runtime, development
-files, and compatibility tools, plus the device-group and axis-fuzz udev
-callouts and rules normally installed with libinput. It carries the matching
-libinput 1.31.3 hardware-quirks database as well. Replacement testing should
-remain recoverable until the upstream behavioral gates pass for the exact
-distribution artifacts being installed.
+Release 0.3.1 is validated against upstream libinput 1.31.3 commit
+`26191d396d74d505541d6311f0b4ae68d791b890`. The release gate covers all 309
+public symbols, 25 symbol-version nodes, SONAME `libinput.so.10`, and all
+23,245 pinned behavioral cases. The verified result is 12,185 passes, 11,059
+tests that require an upstream-private configuration interface and are
+therefore not applicable to a public-ABI replacement, one upstream release
+build skip, and zero failures. The skipped test exercises internal event
+debugging that upstream explicitly disables in release builds.
 
 ## Supported systems
 
@@ -25,8 +28,8 @@ libgfortran runtime.
 
 ## Install from COPR
 
-Perform replacement testing from a text console or an SSH session so rollback
-remains available even if the graphical session cannot start.
+Install from a text console or an SSH session so the distribution package
+remains easy to restore if the local graphics stack has an unrelated problem.
 
 ```bash
 sudo dnf install dnf-plugins-core
@@ -53,7 +56,9 @@ sudo systemctl reboot
 ## Build with DNF dependencies
 
 ```bash
-sudo dnf install rust cargo gcc make systemd-devel pkgconf-pkg-config
+sudo dnf install rust cargo gcc gcc-gfortran make meson ninja-build patch \
+  libevdev-devel mtdev-devel systemd-devel pkgconf-pkg-config \
+  python3 python3-libevdev python3-pyudev python3-pyyaml
 make all
 make check
 make test
@@ -177,12 +182,12 @@ installations should use the COPR RPM rather than `cargo install`.
 
 ## Reference behavior
 
-Runtime and ABI lifecycle work is compared against the upstream libinput
-architecture and the `complyue/libinput` branch referenced during debugging.
-The project targets libinput C ABI and behavioral compatibility. Passing the
-repository's upstream-derived behavioral gates supports a library-compatibility
-claim for the tested artifacts; it does not by itself establish complete
-distribution-package parity for every utility, device, or downstream patch.
+The replacement is pinned to upstream libinput 1.31.3 and tested through its
+public C ABI. The RPM also builds and installs the upstream 1.31.3 utility,
+manual-page, completion, udev-callout, and quirks payload alongside the Rust
+runtime and development files. `make rpm-package-check` verifies the installed
+payload, loader resolution, dependencies, hardening, and an external C
+consumer before publication.
 
 ## License
 

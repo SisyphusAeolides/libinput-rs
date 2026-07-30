@@ -21,6 +21,11 @@ set -euo pipefail
 expected_upstream_commit=26191d396d74d505541d6311f0b4ae68d791b890
 expected_private_config_test_count=196
 expected_private_config_test_hash=e29aba062bc3d8811b9978a9b22d4c444ce2f84cb175b835016943de798b7cce
+expected_completed=23245
+expected_passed=12185
+expected_not_applicable=11059
+expected_skipped=1
+expected_skipped_test_hash=a5357d16e54b88fee77deb453ffb595b268fca5df012981f13f89d7892ae169d
 
 die() {
 	printf '%s\n' "run-upstream-public-abi-suite: $*" >&2
@@ -386,8 +391,27 @@ result=$(summary_value status)
 # An unfiltered parity run must cover the exact pinned corpus. This prevents a
 # shortened or accidentally filtered run from creating release evidence.
 if (( ${#suite_arguments[@]} == 0 )); then
-	[[ $completed == 23245 ]] ||
-		die "pinned upstream corpus size changed: expected 23245, completed $completed"
+	[[ $completed == "$expected_completed" ]] ||
+		die "pinned upstream corpus size changed: expected $expected_completed, completed $completed"
+	[[ $passed == "$expected_passed" ]] ||
+		die "pinned upstream pass count changed: expected $expected_passed, passed $passed"
+	[[ $not_applicable == "$expected_not_applicable" ]] ||
+		die "pinned upstream not-applicable count changed: expected $expected_not_applicable, found $not_applicable"
+	[[ $skipped == "$expected_skipped" ]] ||
+		die "pinned upstream skip count changed: expected $expected_skipped, found $skipped"
+
+	skipped_tests="$workdir/skipped-tests"
+	awk '
+		/^  - name: / {
+			name = $0
+			sub(/^  - name: "/, "", name)
+			sub(/"$/, "", name)
+		}
+		/status: SKIP/ { print name }
+	' "$raw_report" > "$skipped_tests"
+	skipped_test_hash=$(sha256sum "$skipped_tests" | awk '{print $1}')
+	[[ $skipped_test_hash == "$expected_skipped_test_hash" ]] ||
+		die "pinned upstream skipped-test inventory changed: $skipped_test_hash"
 fi
 
 if [[ -n ${LIBINPUT_RS_PARITY_REPORT:-} ]]; then
