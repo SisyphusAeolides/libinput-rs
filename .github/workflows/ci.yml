@@ -182,7 +182,7 @@ jobs:
           LIBINPUT_RS_PARITY_REPORT: ${{ runner.temp }}/libinput-rs-parity.toml
           LIBINPUT_RS_RAW_REPORT: ${{ runner.temp }}/libinput-rs-upstream-suite.yaml
           LIBINPUT_RS_SUITE_QUIET: "1"
-          LIBINPUT_RS_SUITE_JOBS: "2"
+          LIBINPUT_RS_SUITE_JOBS: "4"
         run: |
           sudo modprobe uinput
           test -c /dev/uinput
