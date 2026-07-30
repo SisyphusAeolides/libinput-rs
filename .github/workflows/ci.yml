@@ -189,7 +189,9 @@ jobs:
           LIBINPUT_RS_PARITY_REPORT: ${{ runner.temp }}/libinput-rs-parity-shard-${{ matrix.shard }}.toml
           LIBINPUT_RS_RAW_REPORT: ${{ runner.temp }}/libinput-rs-upstream-suite-shard-${{ matrix.shard }}.yaml
           LIBINPUT_RS_SUITE_QUIET: "1"
-          LIBINPUT_RS_SUITE_JOBS: "1"
+          # Upstream disables the host VT keyboard only with multiple workers.
+          # Keep synthetic key sequences away from the hosted runner console.
+          LIBINPUT_RS_SUITE_JOBS: "2"
           LIBINPUT_RS_SUITE_SHARD_INDEX: ${{ matrix.shard }}
           LIBINPUT_RS_SUITE_SHARD_TOTAL: "8"
         run: |
