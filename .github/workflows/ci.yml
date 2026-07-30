@@ -130,9 +130,14 @@ jobs:
       - name: Verify RPM payloads
         run: make rpm-package-check RPM_RUNTIME="$RPM_RUNTIME"
 
-  upstream-behavior:
-    name: Upstream behavioral parity
+  upstream-behavior-shards:
+    name: Upstream behavioral parity shard ${{ matrix.shard }}/8
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
 
     steps:
       - uses: actions/checkout@v4
@@ -148,6 +153,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.75.0
 
       - name: Run keyboard and ownership regressions
+        if: matrix.shard == 0
         run: |
           cargo test --locked keyboard_chords_keep_independent_per_code_state
           cargo test --locked duplicate_keyboards_count_the_same_key_per_device
@@ -179,10 +185,12 @@ jobs:
       - name: Run compositor-facing upstream suite
         env:
           LIBINPUT_RS_ALLOW_UINPUT_TESTS: "1"
-          LIBINPUT_RS_PARITY_REPORT: ${{ runner.temp }}/libinput-rs-parity.toml
-          LIBINPUT_RS_RAW_REPORT: ${{ runner.temp }}/libinput-rs-upstream-suite.yaml
+          LIBINPUT_RS_PARITY_REPORT: ${{ runner.temp }}/libinput-rs-parity-shard-${{ matrix.shard }}.toml
+          LIBINPUT_RS_RAW_REPORT: ${{ runner.temp }}/libinput-rs-upstream-suite-shard-${{ matrix.shard }}.yaml
           LIBINPUT_RS_SUITE_QUIET: "1"
-          LIBINPUT_RS_SUITE_JOBS: "8"
+          LIBINPUT_RS_SUITE_JOBS: "1"
+          LIBINPUT_RS_SUITE_SHARD_INDEX: ${{ matrix.shard }}
+          LIBINPUT_RS_SUITE_SHARD_TOTAL: "8"
         run: |
           sudo modprobe uinput
           test -c /dev/uinput
@@ -194,11 +202,41 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: libinput-rs-parity
+          name: libinput-rs-parity-shard-${{ matrix.shard }}
           if-no-files-found: warn
           path: |
+            ${{ runner.temp }}/libinput-rs-parity-shard-${{ matrix.shard }}.toml
+            ${{ runner.temp }}/libinput-rs-upstream-suite-shard-${{ matrix.shard }}.yaml
+
+  upstream-behavior:
+    name: Upstream behavioral parity
+    needs: upstream-behavior-shards
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download parity shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: libinput-rs-parity-shard-*
+          path: ${{ runner.temp }}/libinput-rs-parity-shards
+          merge-multiple: true
+
+      - name: Aggregate and verify exact parity evidence
+        run: |
+          scripts/aggregate-upstream-public-abi-shards.sh \
+            "$RUNNER_TEMP/libinput-rs-parity-shards" \
+            "$RUNNER_TEMP/libinput-rs-parity.toml"
+
+      - name: Upload test-derived parity evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: libinput-rs-parity
+          if-no-files-found: error
+          path: |
             ${{ runner.temp }}/libinput-rs-parity.toml
-            ${{ runner.temp }}/libinput-rs-upstream-suite.yaml
+            ${{ runner.temp }}/libinput-rs-parity-shards/*.yaml
 
   rpm-lint:
     name: RPM lint

@@ -6,8 +6,9 @@
 # public libinput ABI contract, so it cannot configure an opaque replacement
 # library. This script copies the supplied source tree into /tmp, discovers
 # exactly those test bodies, marks them not applicable, builds the copied
-# suite, and runs the remaining public-ABI corpus with one worker. It never
-# writes the supplied source tree or its configured build directory.
+# suite, and runs the selected public-ABI corpus with the configured worker
+# count. It never writes the supplied source tree or its configured build
+# directory.
 #
 # Usage:
 #   scripts/run-upstream-public-abi-suite.sh UPSTREAM_SOURCE_DIR UPSTREAM_BUILD_DIR [SUITE_ARGUMENTS...]
@@ -61,9 +62,19 @@ shift 2
 
 suite_jobs=${LIBINPUT_RS_SUITE_JOBS:-1}
 suite_quiet=${LIBINPUT_RS_SUITE_QUIET:-0}
+if [[ -v LIBINPUT_RS_SUITE_SHARD_INDEX || -v LIBINPUT_RS_SUITE_SHARD_TOTAL ]]; then
+	[[ -v LIBINPUT_RS_SUITE_SHARD_INDEX && -v LIBINPUT_RS_SUITE_SHARD_TOTAL ]] ||
+		die 'set both LIBINPUT_RS_SUITE_SHARD_INDEX and LIBINPUT_RS_SUITE_SHARD_TOTAL'
+fi
+suite_shard_index=${LIBINPUT_RS_SUITE_SHARD_INDEX:-0}
+suite_shard_total=${LIBINPUT_RS_SUITE_SHARD_TOTAL:-1}
 suite_arguments=("$@")
 [[ $suite_jobs =~ ^[1-9][0-9]*$ ]] || die 'LIBINPUT_RS_SUITE_JOBS must be a positive integer'
 [[ $suite_quiet =~ ^[01]$ ]] || die 'LIBINPUT_RS_SUITE_QUIET must be 0 or 1'
+[[ $suite_shard_index =~ ^[0-9]+$ ]] || die 'LIBINPUT_RS_SUITE_SHARD_INDEX must be a non-negative integer'
+[[ $suite_shard_total =~ ^[1-9][0-9]*$ ]] || die 'LIBINPUT_RS_SUITE_SHARD_TOTAL must be a positive integer'
+(( suite_shard_index < suite_shard_total )) ||
+	die 'LIBINPUT_RS_SUITE_SHARD_INDEX must be smaller than LIBINPUT_RS_SUITE_SHARD_TOTAL'
 for argument in "$@"; do
 	case "$argument" in
 		--jobs|--jobs=*)
@@ -246,6 +257,7 @@ private_config_header="$source_copy/test/libinput-rs-public-abi-private-config.h
 		'' \
 		'#include <stdbool.h>' \
 		'#include <stddef.h>' \
+		'#include <stdint.h>' \
 		'#include <string.h>' \
 		'' \
 		'static inline bool' \
@@ -262,6 +274,24 @@ private_config_header="$source_copy/test/libinput-rs-public-abi-private-config.h
 		'}' \
 		'' \
 		'return false;' \
+		'}' \
+		''
+	printf '#define LIBINPUT_RS_PUBLIC_ABI_SHARD_INDEX %sU\n' "$suite_shard_index"
+	printf '#define LIBINPUT_RS_PUBLIC_ABI_SHARD_TOTAL %sU\n' "$suite_shard_total"
+	printf '%s\n' \
+		'' \
+		'static inline bool' \
+		'libinput_rs_public_abi_in_shard(const char *name)' \
+		'{' \
+		'uint64_t hash = UINT64_C(14695981039346656037);' \
+		'' \
+		'for (const unsigned char *p = (const unsigned char *)name; *p; p++) {' \
+		'hash ^= *p;' \
+		'hash *= UINT64_C(1099511628211);' \
+		'}' \
+		'' \
+		'return hash % LIBINPUT_RS_PUBLIC_ABI_SHARD_TOTAL ==' \
+		'       LIBINPUT_RS_PUBLIC_ABI_SHARD_INDEX;' \
 		'}' \
 		'' \
 		'#endif'
@@ -290,6 +320,20 @@ sed -e 's/^\t/ &/' -e 's/\\\\$/\\/' <<'PATCH' | patch -d "$source_copy" -p1 --ba
  
  #define END_TEST \\
  	return LITEST_PASS; \\
+PATCH
+
+sed -e 's/^\t/ &/' <<'PATCH' | patch -d "$source_copy" -p1 --batch
+--- a/test/litest.c
++++ b/test/litest.c
+@@ -1598,6 +1598,8 @@ litest_run_suite(struct list *suites, int njobs)
+			tdesc.args.range = t->range;
+			tdesc.rangeval = t->rangeval;
+			tdesc.params = t->params;
++			if (!libinput_rs_public_abi_in_shard(tdesc.name))
++				continue;
+			litest_runner_add_test(runner, &tdesc);
+			ntests++;
+		}
 PATCH
 
 [[ -r "$private_config_header" ]] || die 'private-config exclusion header was not generated'
@@ -390,7 +434,7 @@ result=$(summary_value status)
 
 # An unfiltered parity run must cover the exact pinned corpus. This prevents a
 # shortened or accidentally filtered run from creating release evidence.
-if (( ${#suite_arguments[@]} == 0 )); then
+if (( ${#suite_arguments[@]} == 0 && suite_shard_total == 1 )); then
 	[[ $completed == "$expected_completed" ]] ||
 		die "pinned upstream corpus size changed: expected $expected_completed, completed $completed"
 	[[ $passed == "$expected_passed" ]] ||
@@ -422,6 +466,8 @@ if [[ -n ${LIBINPUT_RS_PARITY_REPORT:-} ]]; then
 target_version = "1.31.3"
 target_commit = "$expected_upstream_commit"
 candidate_sha256 = "$candidate_sha256"
+shard_index = $suite_shard_index
+shard_total = $suite_shard_total
 completed = $completed
 pass = $passed
 not_applicable = $not_applicable
