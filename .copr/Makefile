@@ -1,25 +1,19 @@
 .DEFAULT_GOAL := srpm
 
-repo_root := $(shell git rev-parse --show-toplevel)
+repo_root := $(CURDIR)
 spec ?= $(repo_root)/libinput-rs.spec
 outdir ?= $(CURDIR)/out
 
 .PHONY: srpm
 
 srpm:
-	dnf -y install git || :
 	@set -efu; \
 	set -f; \
 	repo_root='$(repo_root)'; \
 	spec='$(spec)'; \
 	outdir='$(outdir)'; \
-	if test -n "$$(git -C "$$repo_root" status --porcelain --untracked-files=all --ignore-submodules=all)"; then \
-		printf '%s\n' 'refusing to build an SRPM from a dirty checkout' >&2; \
-		exit 1; \
-	fi; \
 	test -f "$$spec"; \
 	spec=$$(cd "$$(dirname "$$spec")" && pwd -P)/$$(basename "$$spec"); \
-	git -C "$$repo_root" ls-files --error-unmatch -- "$$spec" >/dev/null; \
 	metadata=$$(rpmspec -q --srpm --qf '%{NAME} %{VERSION}' "$$spec"); \
 	set -- $$metadata; \
 	if test "$$#" -ne 2 || test -z "$$1" || test -z "$$2"; then \
@@ -35,7 +29,7 @@ srpm:
 		printf 'refusing to overwrite existing source archive: %s\n' "$$archive" >&2; \
 		exit 1; \
 	fi; \
-	git -C "$$repo_root" archive --format=tar.gz --prefix="$$name-$$version/" --output="$$archive" HEAD; \
+	tar --exclude=./.git --exclude=./out --exclude=./target --exclude=./build_workspace -czf "$$archive" -C "$$repo_root" --transform="s,^\./,$$name-$$version/," --transform="s,^\.$$,$$name-$$version," .; \
 	rpmbuild -bs "$$spec" \
 		--define "_sourcedir $$outdir" \
 		--define "_srcrpmdir $$outdir"; \
