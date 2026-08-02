@@ -1122,13 +1122,27 @@ impl LibinputContext {
             if fd < 0 {
                 continue;
             }
-            unsafe {
-                while libc::read(
-                    fd,
-                    (&mut value as *mut u64).cast(),
-                    std::mem::size_of::<u64>(),
-                ) > 0
-                {}
+            loop {
+                let result = unsafe {
+                    libc::read(
+                        fd,
+                        (&mut value as *mut u64).cast(),
+                        std::mem::size_of::<u64>(),
+                    )
+                };
+                if result < 0 {
+                    let errno = std::io::Error::last_os_error().raw_os_error();
+                    if errno == Some(libc::EAGAIN) || errno == Some(libc::EWOULDBLOCK) {
+                        break;
+                    }
+                    if result == 0 {
+                        break;
+                    }
+                } else if result == 0 {
+                    break;
+                } else {
+                    continue;
+                }
             }
         }
     }
