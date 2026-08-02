@@ -1130,18 +1130,15 @@ impl LibinputContext {
                         std::mem::size_of::<u64>(),
                     )
                 };
-                if result < 0 {
-                    let errno = std::io::Error::last_os_error().raw_os_error();
-                    if errno == Some(libc::EAGAIN) || errno == Some(libc::EWOULDBLOCK) {
-                        break;
+                match result.cmp(&0) {
+                    std::cmp::Ordering::Less => {
+                        let errno = std::io::Error::last_os_error().raw_os_error();
+                        if errno == Some(libc::EAGAIN) || errno == Some(libc::EWOULDBLOCK) {
+                            break;
+                        }
                     }
-                    if result == 0 {
-                        break;
-                    }
-                } else if result == 0 {
-                    break;
-                } else {
-                    continue;
+                    std::cmp::Ordering::Equal => break,
+                    std::cmp::Ordering::Greater => continue,
                 }
             }
         }
