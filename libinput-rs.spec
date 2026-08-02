@@ -4,7 +4,7 @@
 %global libinput_tools_sha256 d5d8c8464f9cb24b0897c03edfe7d7c9e75ff5a91fe9b5b48791781aa9642858
 
 Name:           libinput-rs
-Version:        0.3.2
+Version:        0.3.3
 Release:        1%{?dist}
 Summary:        Drop-in Rust replacement for libinput 1.31.3
 
