@@ -1,7 +1,7 @@
 # libinput-rs
 
-`libinput-rs` is a 100% drop-in replacement for libinput 1.31.3 on the
-supported x86_64 DNF/RPM targets. It implements the `libinput.so.10` C ABI and
+`libinput-rs` is a 100% drop-in replacement for libinput 1.31.3 on
+x86_64 Arch-based systems. It implements the `libinput.so.10` C ABI and
 ships the matching runtime, development, command-line, udev, and quirks
 package surface.
 
@@ -16,49 +16,51 @@ debugging that upstream explicitly disables in release builds.
 
 ## Supported systems
 
-The supported packaging path is DNF/RPM. The COPR project targets Fedora 44,
-Fedora rawhide, EPEL 9, EPEL 10, RHEL 9, and RHEL 10 on x86_64. Fedora RPMs
-enable optional libwacom tablet metadata integration. EPEL and RHEL builds use
-conservative kernel, evdev, and udev fallbacks and do not require libwacom.
+The supported packaging path is the Sisyphus Arch repository on x86_64
+Arch-based distributions. The package replaces the distribution `libinput`
+package and installs the same shared-library ABI, tools, headers, udev rules,
+and quirks tree.
 
-Agda and Idris 2 proofs are verified in Fedora CI and are not runtime or RPM
-build dependencies. GNU Fortran compiles the capability bitmap kernel during
-the RPM build; the packaged library therefore depends on the standard
-libgfortran runtime.
+Agda and Idris 2 proofs are verified in CI and are not runtime dependencies.
+GNU Fortran compiles the capability bitmap kernel during the package build; the
+packaged library therefore depends on the standard libgfortran runtime.
 
-## Install from COPR
+## Install from the Sisyphus repository
 
-Install from a text console or an SSH session so the distribution package
-remains easy to restore if the local graphics stack has an unrelated problem.
+Add the repository to `/etc/pacman.conf`:
 
-```bash
-sudo dnf install dnf-plugins-core
-sudo dnf copr enable sisyphuscode/libinput-rs
-sudo dnf install libinput-rs --allowerasing
-sudo ldconfig
-sudo systemctl reboot
+```ini
+[sisyphus]
+SigLevel = Optional TrustAll
+Server = https://sisyphusaeolides.github.io/Sisyphus-Repo/$arch
 ```
 
-There is no resident companion service. Resolution-aware motion, scrolling,
+Then install it:
+
+```bash
+sudo pacman -Syy
+sudo pacman -S libinput-rs
+```
+
+The package replaces `libinput` and does not run a resident companion service.
+Resolution-aware motion, scrolling,
 tapping, click mapping, and disable-while-typing run in the shared backend used
 by the compositor. This avoids a second process exclusively grabbing a
 mixed-capability device and prevents two independent input state machines from
 competing.
 
-To restore the distribution's original runtime and development packages:
+To restore the distribution's original runtime package:
 
 ```bash
-sudo dnf install libinput libinput-devel --allowerasing
-sudo ldconfig
-sudo systemctl reboot
+sudo pacman -S libinput
 ```
 
-## Build with DNF dependencies
+## Build on Arch
 
 ```bash
-sudo dnf install rust cargo gcc gcc-gfortran make meson ninja-build patch \
-  libevdev-devel mtdev-devel systemd-devel pkgconf-pkg-config \
-  python3 python3-libevdev python3-pyudev python3-pyyaml
+sudo pacman -S --needed base-devel rust cargo gcc-fortran meson ninja patch \
+  libevdev mtdev systemd pkgconf python-libevdev python-pyudev python-yaml \
+  curl rpm-tools
 make all
 make check
 make test
@@ -75,7 +77,9 @@ failed SMBus handoff. On a machine where SMBus probing itself is the failure,
 the PS/2 path can be forced with:
 
 ```bash
-sudo grubby --update-kernel=ALL --args=psmouse.elantech_smbus=0
+sudoedit /etc/default/grub
+# Add psmouse.elantech_smbus=0 to GRUB_CMDLINE_LINUX_DEFAULT, then run:
+sudo grub-mkconfig -o /boot/grub/grub.cfg
 sudo reboot
 ```
 
@@ -83,7 +87,7 @@ Confirm the workaround after reboot with
 `cat /sys/module/psmouse/parameters/elantech_smbus`; it should print `0`.
 
 ThinkPad P53 systems exposing the affected `LEN0408` Elantech v4 controller
-should not force SMBus off. The RPM installs a narrowly matched udev rule that
+should not force SMBus off. The Arch package installs a narrowly matched udev rule that
 keeps the PS/2 driver's packet CRC validation enabled as a fallback across boot
 and hotplug. This rejects corrupted combined TrackPoint, button, and touchpad
 packets before they reach userspace.
@@ -91,7 +95,7 @@ packets before they reach userspace.
 The P53's I2C controller can also remain enumerated while silently ceasing to
 deliver kernel events. `sudo libinput elan-recover` safely discovers only
 devices already bound to `elan_i2c`, unbinds and rebinds each controller, and
-waits for its evdev nodes to return. The RPM enables a non-resident systemd
+waits for its evdev nodes to return. The Arch package enables a non-resident systemd
 sleep unit that runs this recovery after resume only when DMI identifies a
 ThinkPad P53. It does not open or grab input devices and exits immediately.
 
@@ -102,7 +106,7 @@ API, so existing compositor and desktop preferences continue to apply.
 
 ## Replacement layout
 
-The single RPM installs `libinput.so.10` in the system linker path together
+The Arch package installs `libinput.so.10` in the system linker path together
 with `libinput.h`, the unversioned linker name, `libinput.pc`, and the libinput
 udev callouts and rules.
 
@@ -164,11 +168,10 @@ under `proofs/`:
 join laws. `HwSpec.idr` makes hardware classification total and keeps ignored
 or unclassifiable devices out of the live registry by type.
 
-Agda, Idris 2, and GNU Fortran are available through DNF on the Fedora CI
-target:
+On Arch, install the formal verification toolchains when needed:
 
 ```bash
-sudo dnf install Agda idris2 gcc-gfortran
+sudo pacman -S --needed agda idris2 gcc-fortran
 make proofs
 ```
 
@@ -176,18 +179,18 @@ make proofs
 
 ## Publishing
 
-The RPM and crates.io release procedure is documented in [RELEASING.md](RELEASING.md).
-Crates.io publishes one `libinput-rs` source crate. System replacement
-installations should use the COPR RPM rather than `cargo install`.
+The Arch package and crates.io release procedure is documented in
+[RELEASING.md](RELEASING.md). Crates.io publishes one `libinput-rs` source
+crate; system replacement installations should use the Sisyphus package.
 
 ## Reference behavior
 
 The replacement is pinned to upstream libinput 1.31.3 and tested through its
-public C ABI. The RPM also builds and installs the upstream 1.31.3 utility,
+public C ABI. The Arch package also builds and installs the upstream 1.31.3 utility,
 manual-page, completion, udev-callout, and quirks payload alongside the Rust
-runtime and development files. `make rpm-package-check` verifies the installed
-payload, loader resolution, dependencies, hardening, and an external C
-consumer before publication.
+runtime and development files. `make packaging-check` and the package build
+verify the installed payload, loader resolution, dependencies, hardening, and
+an external C consumer before publication.
 
 ## License
 
