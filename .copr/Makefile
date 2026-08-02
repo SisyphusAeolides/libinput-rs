@@ -7,6 +7,7 @@ outdir ?= $(CURDIR)/out
 .PHONY: srpm
 
 srpm:
+	dnf -y install git || :
 	@set -efu; \
 	set -f; \
 	repo_root='$(repo_root)'; \
