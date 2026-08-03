@@ -17,24 +17,26 @@ concurrency:
 jobs:
   aggregate:
     runs-on: ubuntu-24.04
+    timeout-minutes: 35
     steps:
-      - name: Publish latest main workflow conclusions
+      - name: Publish latest observed main workflow conclusions
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          repo="$GITHUB_REPOSITORY"; sha="$GITHUB_SHA"; self_path=".github/workflows/ci-aggregate-status.yml"; actions_url="https://github.com/$repo/actions"; total=0; failed=0
-          printf '## CI aggregate status\n\n| Workflow | Conclusion | Revision |\n|---|---|---|\n' >> "$GITHUB_STEP_SUMMARY"
-          while IFS=$'\t' read -r workflow_id workflow_name workflow_path; do
-            [ -n "$workflow_id" ] || continue; [ "$workflow_path" != "$self_path" ] || continue; total=$((total + 1))
-            run_json="$(gh api "repos/$repo/actions/workflows/$workflow_id/runs?branch=main&per_page=1" --jq '.workflow_runs[0] // empty')"; context="$(printf 'ci/%s-%s' "$workflow_name" "$workflow_id" | cut -c1-100)"
-            if [ -z "$run_json" ]; then state="error"; conclusion="missing"; run_sha="none"; run_url="$actions_url"; failed=$((failed + 1)); else
-              run_id="$(jq -r '.id' <<< "$run_json")"; status="$(jq -r '.status' <<< "$run_json")"; deadline=$((SECONDS + 1800))
-              while [ "$status" != "completed" ] && [ "$SECONDS" -lt "$deadline" ]; do sleep 20; run_json="$(gh api "repos/$repo/actions/runs/$run_id")"; status="$(jq -r '.status' <<< "$run_json")"; done
-              run_sha="$(jq -r '.head_sha // "unknown"' <<< "$run_json")"; run_url="$(jq -r '.html_url // empty' <<< "$run_json")"; [ -n "$run_url" ] || run_url="$actions_url"
-              if [ "$status" != "completed" ]; then state="error"; conclusion="timed_out"; failed=$((failed + 1)); else conclusion="$(jq -r '.conclusion // "unknown"' <<< "$run_json")"; case "$conclusion" in success|neutral|skipped) state="success" ;; failure) state="failure"; failed=$((failed + 1)) ;; *) state="error"; failed=$((failed + 1)) ;; esac; fi
-            fi
-            short_sha="${run_sha:0:7}"; gh api --method POST "repos/$repo/statuses/$sha" -f state="$state" -f context="$context" -f description="latest $conclusion at $short_sha" -f target_url="$run_url" >/dev/null; printf '| %s | %s | `%s` |\n' "$workflow_name" "$conclusion" "$short_sha" >> "$GITHUB_STEP_SUMMARY"
-          done < <(gh api --paginate "repos/$repo/actions/workflows?per_page=100" --jq '.workflows[] | select(.state == "active") | [.id, .name, .path] | @tsv')
-          if [ "$total" -eq 0 ]; then aggregate_state="error"; aggregate_description="no active workflows found"; elif [ "$failed" -eq 0 ]; then aggregate_state="success"; aggregate_description="$total active workflows green"; else aggregate_state="failure"; aggregate_description="$failed of $total workflows require repair"; fi
-          gh api --method POST "repos/$repo/statuses/$sha" -f state="$aggregate_state" -f context="ci/aggregate" -f description="$aggregate_description" -f target_url="$actions_url" >/dev/null
+          repo="$GITHUB_REPOSITORY"; sha="$GITHUB_SHA"
+          self_path=".github/workflows/ci-aggregate-status.yml"; actions_url="https://github.com/$repo/actions"
+          observed=0; unobserved=0; failed=0
+          while IFS=$'\t' read -r id name path; do
+            [ -n "$id" ] || continue; [ "$path" != "$self_path" ] || continue
+            run="$(gh api "repos/$repo/actions/workflows/$id/runs?branch=main&per_page=1" --jq '.workflow_runs[0] // empty')"
+            if [ -z "$run" ]; then unobserved=$((unobserved + 1)); continue; fi
+            observed=$((observed + 1)); run_id="$(jq -r '.id' <<< "$run")"; status="$(jq -r '.status' <<< "$run")"; deadline=$((SECONDS + 1800))
+            while [ "$status" != completed ] && [ "$SECONDS" -lt "$deadline" ]; do sleep 20; run="$(gh api "repos/$repo/actions/runs/$run_id")"; status="$(jq -r '.status' <<< "$run")"; done
+            run_sha="$(jq -r '.head_sha // "unknown"' <<< "$run")"; url="$(jq -r '.html_url // empty' <<< "$run")"; [ -n "$url" ] || url="$actions_url"
+            if [ "$status" != completed ]; then state=error; conclusion=timed_out; failed=$((failed + 1)); else conclusion="$(jq -r '.conclusion // "unknown"' <<< "$run")"; case "$conclusion" in success|neutral|skipped) state=success ;; failure) state=failure; failed=$((failed + 1)) ;; *) state=error; failed=$((failed + 1)) ;; esac; fi
+            context="$(printf 'ci/%s-%s' "$name" "$id" | cut -c1-100)"; short="${run_sha:0:7}"
+            gh api --method POST "repos/$repo/statuses/$sha" -f state="$state" -f context="$context" -f description="latest $conclusion at $short" -f target_url="$url" >/dev/null
+          done < <(gh api --paginate "repos/$repo/actions/workflows?per_page=100" --jq '.workflows[] | select(.state == "active") | [.id,.name,.path] | @tsv')
+          if [ "$observed" -eq 0 ]; then state=error; description="no main workflow runs observed"; elif [ "$failed" -eq 0 ]; then state=success; description="$observed observed workflows green; $unobserved not scheduled"; else state=failure; description="$failed of $observed observed workflows require repair"; fi
+          gh api --method POST "repos/$repo/statuses/$sha" -f state="$state" -f context="ci/aggregate" -f description="$description" -f target_url="$actions_url" >/dev/null
