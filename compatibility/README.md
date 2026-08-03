@@ -25,25 +25,3 @@ is the upstream release-build skip for internal event debugging, and zero
 fail. RPM verification separately checks the complete Fedora-compatible
 runtime, development, utility, manual-page, completion, udev, and quirks
 payload.
-
-## Current ArachOS integration status
-
-This project is maintained as part of the ArachOS production graph. Its role is
-the bounded input compatibility route..
-
-CI and release evidence are evaluated on immutable revisions. Hardware support
-is reported by bounded route and support level; this README does not claim
-universal native support. Gate 3 requires signed hardware identity, target
-kernel provenance, package authority, health checks, rollback behavior, and
-representative physical-hardware evidence before production qualification.
-
-## Current ArachOS integration status
-
-This project is maintained as part of the ArachOS production graph. Its role is
-the bounded input compatibility route.
-
-CI and release evidence are evaluated on immutable revisions. Hardware support
-is reported by bounded route and support level; this README does not claim
-universal native support. Gate 3 requires signed hardware identity, target
-kernel provenance, package authority, health checks, rollback behavior, and
-representative physical-hardware evidence before production qualification.
