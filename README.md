@@ -25,6 +25,14 @@ Agda and Idris 2 proofs are verified in CI and are not runtime dependencies.
 GNU Fortran compiles the capability bitmap kernel during the package build; the
 packaged library therefore depends on the standard libgfortran runtime.
 
+## Install on DNF/RPM systems
+
+```bash
+sudo dnf copr enable sisyphuscode/libinput-rs
+sudo dnf install libinput-rs
+systemctl enable --now libinput-rs-elan-resume.service
+```
+
 ## Install from the Sisyphus repository
 
 Add the repository to `/etc/pacman.conf`:
