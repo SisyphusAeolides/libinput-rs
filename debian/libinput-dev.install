@@ -1,0 +1,3 @@
+usr/include/libinput.h
+usr/lib/*/libinput.so
+usr/lib/*/pkgconfig/libinput.pc

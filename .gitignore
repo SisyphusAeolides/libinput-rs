@@ -6,3 +6,16 @@ error.html
 proofs/agda/*.agdai
 proofs/idris/build/
 proofs/fortran/build/
+/.ppa-build/
+/debian/.debhelper/
+/debian/debhelper-build-stamp
+/debian/files
+/debian/*.debhelper*
+/debian/*.substvars
+/debian/libinput10/
+/debian/libinput-bin/
+/debian/libinput-dev/
+/debian/libinput-tools/
+/debian/libinput-rs/
+/debian/tmp/
+/debian/upstream-stage/

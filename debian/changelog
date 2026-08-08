@@ -1,0 +1,8 @@
+libinput-rs (1:0.3.3-1~ppa1~ubuntu26.04.1) resolute; urgency=medium
+
+  * Initial Ubuntu release for the Corinth PPA.
+  * Preserve the libinput10, libinput-bin, libinput-dev, and libinput-tools
+    package identities used by Ubuntu.
+  * Ship the complete libinput 1.31.3 ABI, utility, udev, and quirks surface.
+
+ -- Kenny Glowner <SisyphusAeolides@pm.me>  Sat, 08 Aug 2026 00:00:00 -0500

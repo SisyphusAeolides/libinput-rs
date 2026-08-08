@@ -5,8 +5,8 @@ FC = gfortran
 REFERENCE_LIBINPUT ?= /usr/lib64/libinput.so.10
 RPM_RUNTIME ?=
 RPM_TOPDIR ?= $(HOME)/rpmbuild
-PACKAGE_NAME := $(shell rpmspec -q --srpm --qf '%{NAME}' libinput-rs.spec 2>/dev/null)
-PACKAGE_VERSION := $(shell rpmspec -q --srpm --qf '%{VERSION}' libinput-rs.spec 2>/dev/null)
+PACKAGE_NAME := $(or $(shell rpmspec -q --srpm --qf '%{NAME}' libinput-rs.spec 2>/dev/null),$(shell awk '/^Name:/ { print $$2; exit }' libinput-rs.spec))
+PACKAGE_VERSION := $(or $(shell rpmspec -q --srpm --qf '%{VERSION}' libinput-rs.spec 2>/dev/null),$(shell awk '/^Version:/ { print $$2; exit }' libinput-rs.spec))
 SOURCE_ARCHIVE := $(RPM_TOPDIR)/SOURCES/$(PACKAGE_NAME)-$(PACKAGE_VERSION).tar.gz
 UPSTREAM_TOOLS_URL := $(shell rpmspec -P libinput-rs.spec 2>/dev/null | awk '/^Source1:/ { print $$2; exit }')
 UPSTREAM_TOOLS_SHA256 := $(shell awk '$$1 == "%global" && $$2 == "libinput_tools_sha256" { print $$3; exit }' libinput-rs.spec)
@@ -16,9 +16,18 @@ UPSTREAM_TOOLS_SOURCE_DIR := $(UPSTREAM_TOOLS_ROOT)/source
 UPSTREAM_TOOLS_BUILD_DIR := $(UPSTREAM_TOOLS_ROOT)/build
 UPSTREAM_TOOLS_STAGE_DIR := $(UPSTREAM_TOOLS_ROOT)/stage
 
-.PHONY: all build shared check packaging-check crate-package-check main-crate-package-check source-archive upstream-tools-source upstream-tools srpm rpm-package-check test abi-check proofs proofs-strict install
+.PHONY: all build shared check packaging-check crate-package-check main-crate-package-check source-archive upstream-tools-source upstream-tools srpm rpm-package-check deb ppa-source ppa-source-unsigned test abi-check proofs proofs-strict install
 
 all: build shared
+
+deb:
+	dpkg-buildpackage --build=binary --no-sign
+
+ppa-source:
+	sh scripts/build-deb-source.sh
+
+ppa-source-unsigned:
+	sh scripts/build-deb-source.sh --unsigned
 
 build:
 	CARGO_NET_OFFLINE=true CARGO_PROFILE_RELEASE_DEBUG=2 cargo build --frozen --release --bins
@@ -81,9 +90,20 @@ packaging-check:
 	test "$(PACKAGE_VERSION)" = "$$(awk '/^\[package\]/{package=1; next} package && /^version = /{gsub(/[" ]/, "", $$3); print $$3; exit}' Cargo.toml)"
 	test -f packaging/libinput.h
 	test -f packaging/libinput-rs.pc.in
+	grep -Fq 'plugindir=$${libdir}/libinput/plugins' packaging/libinput-rs.pc.in
+	grep -Fq 'Name: Libinput' packaging/libinput-rs.pc.in
 	test -f packaging/libinput-rs-smoke.c
 	test -f packaging/rpmlintrc
 	test -x scripts/verify-rpm-package.sh
+	test -f debian/control
+	test -f debian/changelog
+	test -x debian/rules
+	test -x scripts/build-deb-source.sh
+	grep -q '^Package: libinput10$$' debian/control
+	grep -q '^Package: libinput-bin$$' debian/control
+	grep -q '^Package: libinput-dev$$' debian/control
+	grep -q '^Package: libinput-tools$$' debian/control
+	grep -q '^Package: libinput-rs$$' debian/control
 
 crate-package-check:
 	cargo metadata --locked --offline --no-deps >/dev/null

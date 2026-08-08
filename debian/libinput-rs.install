@@ -1,0 +1,7 @@
+usr/bin/libinput-rs
+usr/bin/libinput-rs-chwd
+usr/lib/udev/rules.d/90-libinput-rs-elantech-crc.rules
+usr/lib/systemd/system/libinput-rs-elan-resume.service
+usr/lib/systemd/system-preset/91-libinput-rs-elan.preset
+usr/share/man/man8/libinput-rs.8
+usr/share/man/man8/libinput-rs-chwd.8

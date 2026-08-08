@@ -1,11 +1,11 @@
 # libinput-rs
 
 `libinput-rs` is a 100% drop-in replacement for libinput 1.31.3 on
-x86_64 Arch-based systems. It implements the `libinput.so.10` C ABI and
+x86_64 Ubuntu, DNF/RPM, and Arch-based systems. It implements the `libinput.so.10` C ABI and
 ships the matching runtime, development, command-line, udev, and quirks
 package surface.
 
-Release 0.3.1 is validated against upstream libinput 1.31.3 commit
+Release 0.3.3 is validated against upstream libinput 1.31.3 commit
 `26191d396d74d505541d6311f0b4ae68d791b890`. The release gate covers all 309
 public symbols, 25 symbol-version nodes, SONAME `libinput.so.10`, and all
 23,245 pinned behavioral cases. The verified result is 12,185 passes, 11,059
@@ -16,14 +16,49 @@ debugging that upstream explicitly disables in release builds.
 
 ## Supported systems
 
-The supported packaging path is the Sisyphus Arch repository on x86_64
-Arch-based distributions. The package replaces the distribution `libinput`
-package and installs the same shared-library ABI, tools, headers, udev rules,
-and quirks tree.
+Supported package paths are the Corinth PPA for Ubuntu 26.04, COPR for
+DNF/RPM systems, and the Sisyphus repository for Arch-based distributions.
+Each path replaces the distribution libinput packages and installs the same
+shared-library ABI, tools, headers, udev rules, and quirks tree.
 
 Agda and Idris 2 proofs are verified in CI and are not runtime dependencies.
 GNU Fortran compiles the capability bitmap kernel during the package build; the
 packaged library therefore depends on the standard libgfortran runtime.
+
+## Install on Ubuntu
+
+Published Resolute builds are available from the Corinth PPA:
+
+```bash
+sudo add-apt-repository ppa:sisyphusaeolides/corinth
+sudo apt update
+sudo apt install libinput-rs
+```
+
+The source produces Ubuntu's native `libinput10`, `libinput-bin`,
+`libinput-dev`, and `libinput-tools` package identities. Installing
+`libinput-rs` upgrades those packages together, so existing reverse
+dependencies continue to resolve without package substitutions.
+
+To build the Debian packages locally:
+
+```bash
+sudo apt install build-essential cargo rustc debhelper devscripts gfortran \
+  meson ninja-build pkgconf libevdev-dev libmtdev-dev libudev-dev \
+  libwacom-dev libgtk-3-dev libcairo2-dev libwayland-dev \
+  wayland-protocols python3-libevdev python3-pyudev python3-yaml
+make check
+make test
+make deb
+```
+
+To create a signed, offline-buildable Launchpad source upload:
+
+```bash
+make ppa-source
+dput ppa:sisyphusaeolides/corinth \
+  ../libinput-rs_0.3.3-1~ppa1~ubuntu26.04.1_source.changes
+```
 
 ## Install on DNF/RPM systems
 
