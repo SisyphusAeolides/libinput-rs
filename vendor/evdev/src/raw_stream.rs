@@ -434,8 +434,17 @@ impl RawDevice {
         let spare_capacity_size = std::mem::size_of_val(spare_capacity);
 
         // use libc::read instead of nix::unistd::read b/c we need to pass an uninitialized buf
-        let res = unsafe { libc::read(fd, spare_capacity.as_mut_ptr() as _, spare_capacity_size) };
-        let bytes_read = nix::errno::Errno::result(res)?;
+        // Retry on EINTR: a signal (e.g. SIGWINCH) must not silently break the event drain
+        // loop and leave a touch frame open, which would stall pointer motion.
+        let bytes_read = loop {
+            let res = unsafe {
+                libc::read(fd, spare_capacity.as_mut_ptr() as _, spare_capacity_size)
+            };
+            match nix::errno::Errno::result(res) {
+                Err(nix::errno::Errno::EINTR) => continue,
+                other => break other?,
+            }
+        };
         let num_read = bytes_read as usize / mem::size_of::<input_event>();
         unsafe {
             let len = self.event_buf.len();
