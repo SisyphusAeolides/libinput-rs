@@ -61,32 +61,10 @@ echo "%{libinput_tools_sha256}  %{SOURCE1}" | sha256sum -c -
 %autosetup -a 1
 patch -d libinput-%{libinput_tools_commit} -p1 < packaging/libinput-1.31.3-meson-0.63.patch
 
-# Re-apply the EINTR retry patch to the vendored evdev source and update its
-# .cargo-checksum.json so cargo --frozen accepts the modified file.
-patch -p0 <<'EINTR_PATCH'
---- vendor/evdev/src/raw_stream.rs.orig	2026-01-01 00:00:00
-+++ vendor/evdev/src/raw_stream.rs	2026-01-01 00:00:00
-@@ -432,8 +432,17 @@
-         let spare_capacity = self.event_buf.spare_capacity_mut();
-         let spare_capacity_size = std::mem::size_of_val(spare_capacity);
- 
--        // use libc::read instead of nix::unistd::read b/c we need to pass an uninitialized buf
--        let res = unsafe { libc::read(fd, spare_capacity.as_mut_ptr() as _, spare_capacity_size) };
--        let bytes_read = nix::errno::Errno::result(res)?;
-+        // use libc::read instead of nix::unistd::read b/c we need to pass an uninitialized buf
-+        // Retry on EINTR: a signal (e.g. SIGWINCH) must not silently break the event drain
-+        // loop and leave a touch frame open, which would stall pointer motion.
-+        let bytes_read = loop {
-+            let res = unsafe {
-+                libc::read(fd, spare_capacity.as_mut_ptr() as _, spare_capacity_size)
-+            };
-+            match nix::errno::Errno::result(res) {
-+                Err(nix::errno::Errno::EINTR) => continue,
-+                other => break other?,
-+            }
-+        };
-         let num_read = bytes_read as usize / mem::size_of::<input_event>();
-EINTR_PATCH
+# Reconcile the .cargo-checksum.json for vendor/evdev to match whatever
+# state raw_stream.rs is actually in (patched or unpatched). This is
+# idempotent: it recomputes the real sha256 and writes it, so cargo
+# --frozen never sees a checksum mismatch regardless of SRPM origin.
 python3 -c "
 import hashlib, json, pathlib
 p = pathlib.Path('vendor/evdev/src/raw_stream.rs')

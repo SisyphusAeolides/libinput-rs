@@ -74,7 +74,7 @@ cat > "$_pf" <<'EINTR_PATCH'
 +        };
          let num_read = bytes_read as usize / mem::size_of::<input_event>();
 EINTR_PATCH
-patch -p0 < "$_pf"
+patch -p0 --forward < "$_pf" || true
 rm -f "$_pf"
 python3 -c "
 import hashlib, json, pathlib
