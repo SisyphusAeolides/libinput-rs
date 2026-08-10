@@ -1,8 +1,8 @@
-libinput-rs (1:0.3.5-2~ppa1~ubuntu26.04.1) resolute; urgency=medium
+libinput-rs (1:0.3.5+fix1-1~ppa1~ubuntu26.04.1) resolute; urgency=medium
 
-  * Fix spec/Cargo.toml version consistency (vendor checksum update).
+  * Rebuild with corrected orig: spec version 0.3.5, updated vendor checksum.
 
- -- Kenny Glowner <SisyphusAeolides@pm.me>  Mon, 10 Aug 2026 20:00:00 -0500
+ -- Kenny Glowner <SisyphusAeolides@pm.me>  Mon, 10 Aug 2026 21:00:00 -0500
 
 libinput-rs (1:0.3.5-1~ppa1~ubuntu26.04.1) resolute; urgency=medium
 

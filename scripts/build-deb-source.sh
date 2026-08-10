@@ -47,6 +47,46 @@ cargo vendor --offline --locked "$vendor_dir" >/dev/null
 rm -rf -- "$source_dir/vendor"
 mv -- "$vendor_dir" "$source_dir/vendor"
 
+# Re-apply the EINTR retry patch to the vendored evdev raw_stream.rs and
+# update its .cargo-checksum.json so --locked builds accept the modified file.
+_pf=$(mktemp /tmp/eintr-patch.XXXXXX)
+cat > "$_pf" <<'EINTR_PATCH'
+--- vendor/evdev/src/raw_stream.rs.orig	2026-01-01 00:00:00
++++ vendor/evdev/src/raw_stream.rs	2026-01-01 00:00:00
+@@ -432,8 +432,17 @@
+         let spare_capacity = self.event_buf.spare_capacity_mut();
+         let spare_capacity_size = std::mem::size_of_val(spare_capacity);
+ 
+-        // use libc::read instead of nix::unistd::read b/c we need to pass an uninitialized buf
+-        let res = unsafe { libc::read(fd, spare_capacity.as_mut_ptr() as _, spare_capacity_size) };
+-        let bytes_read = nix::errno::Errno::result(res)?;
++        // use libc::read instead of nix::unistd::read b/c we need to pass an uninitialized buf
++        // Retry on EINTR: a signal (e.g. SIGWINCH) must not silently break the event drain
++        // loop and leave a touch frame open, which would stall pointer motion.
++        let bytes_read = loop {
++            let res = unsafe {
++                libc::read(fd, spare_capacity.as_mut_ptr() as _, spare_capacity_size)
++            };
++            match nix::errno::Errno::result(res) {
++                Err(nix::errno::Errno::EINTR) => continue,
++                other => break other?,
++            }
++        };
+         let num_read = bytes_read as usize / mem::size_of::<input_event>();
+EINTR_PATCH
+patch -p0 < "$_pf"
+rm -f "$_pf"
+python3 -c "
+import hashlib, json, pathlib
+p = pathlib.Path('vendor/evdev/src/raw_stream.rs')
+new_hash = hashlib.sha256(p.read_bytes()).hexdigest()
+cf = pathlib.Path('vendor/evdev/.cargo-checksum.json')
+data = json.loads(cf.read_text())
+data['files']['src/raw_stream.rs'] = new_hash
+cf.write_text(json.dumps(data, separators=(',', ':'), sort_keys=True))
+print('Updated vendor checksum:', new_hash)
+"
+
 upstream_archive="$build_root/libinput-$upstream_commit.tar.gz"
 curl --fail --location --retry 3 --retry-all-errors \
     --output "$upstream_archive" "$upstream_url"
