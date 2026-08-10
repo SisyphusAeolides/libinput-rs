@@ -1136,6 +1136,11 @@ impl LibinputContext {
                         if errno == Some(libc::EAGAIN) || errno == Some(libc::EWOULDBLOCK) {
                             break;
                         }
+                        if errno == Some(libc::EINTR) {
+                            continue;
+                        }
+                        // Any other error: stop trying to drain this fd.
+                        break;
                     }
                     std::cmp::Ordering::Equal => break,
                     std::cmp::Ordering::Greater => continue,

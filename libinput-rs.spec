@@ -4,7 +4,7 @@
 %global libinput_tools_sha256 d5d8c8464f9cb24b0897c03edfe7d7c9e75ff5a91fe9b5b48791781aa9642858
 
 Name:           libinput-rs
-Version:        0.3.3
+Version:        0.3.4
 Release:        1%{?dist}
 Summary:        Drop-in Rust replacement for libinput 1.31.3
 
@@ -210,6 +210,10 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 %{_datadir}/zsh/site-functions/_libinput
 
 %changelog
+* Sun Aug 10 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.3.4-1
+- Handle EINTR in drain_fd to prevent an infinite loop when signals interrupt
+  timerfd or eventfd reads during dispatch
+
 * Wed Jul 29 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.3.1-1
 - Ship the complete pinned libinput 1.31.3 diagnostic and recording utility suite
 - Dispatch standard commands through their upstream implementations
