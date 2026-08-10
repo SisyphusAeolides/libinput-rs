@@ -8,7 +8,7 @@ StopWhenUnneeded=yes
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/true
-ExecStop=/usr/bin/libinput elan-recover --all --affected-only --quiet
+ExecStop=/usr/bin/libinput elan-recover --all --quiet
 RemainAfterExit=yes
 
 [Install]
