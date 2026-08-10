@@ -71,6 +71,8 @@ fn print_help() {
          --version ... show version information and exit\n\n\
          Commands:\n  list-devices\n\tList all devices with their default configuration options\n\n  \
          debug-events\n\tPrint events to stdout\n\n  \
+         debug-tablet\n\tPrint tablet tool events to stdout\n\n  \
+         debug-tablet-pad\n\tPrint tablet pad events to stdout\n\n  \
          measure <feature>\n\tMeasure various device properties. See the man page for more info\n\n  \
          analyze <feature>\n\tAnalyze device events. See the man page for more info\n\n  \
          record\n\tRecord event stream from a device node. See the man page for more info\n\n  \

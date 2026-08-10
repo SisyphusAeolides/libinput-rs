@@ -21,3 +21,22 @@ List built-in profile identifiers and priorities.
 .TP
 .BI --identify " device"
 Print the planned profile for one event node.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+A device path was given but could not be read, or no profiles are defined.
+.SH EXAMPLES
+.TP
+Print the profile that would be applied to the first touchpad:
+.B libinput-rs-chwd --identify /dev/input/event0
+.TP
+Show all profiles the backend knows about:
+.B libinput-rs-chwd --list-profiles
+.TP
+Scan every readable event node and print selections:
+.B libinput-rs-chwd --auto
+.SH SEE ALSO
+.BR libinput (1)

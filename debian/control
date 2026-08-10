@@ -6,6 +6,7 @@ Build-Depends:
  debhelper-compat (= 13),
  cargo (>= 1.75),
  rustc (>= 1.75),
+ binutils,
  gcc,
  gfortran,
  meson (>= 0.63),
@@ -37,6 +38,7 @@ Pre-Depends: ${misc:Pre-Depends}
 Depends:
  ${shlibs:Depends},
  ${misc:Depends},
+ libgfortran5 | libgfortran (>= 10),
  libinput-bin (>= ${binary:Version})
 Description: input device management and event handling library - shared library
  libinput-rs implements the libinput 1.31.3 public C ABI in Rust. It handles
