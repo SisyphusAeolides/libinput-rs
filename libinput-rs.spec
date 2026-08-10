@@ -43,7 +43,6 @@ BuildRequires:  systemd-rpm-macros
 %if 0%{?fedora}
 BuildRequires:  libwacom-devel >= 2.18
 %endif
-Requires:       libgfortran
 Requires:       python3
 Requires:       python3-libevdev
 Requires:       python3-pyudev
