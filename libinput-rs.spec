@@ -211,7 +211,12 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 %{_datadir}/zsh/site-functions/_libinput
 
 %changelog
-* Mon Aug 10 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.3.4-1
+* Mon Aug 10 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.3.5-1
+- Retry fill_events on EINTR to permanently fix pointer freeze on signal delivery
+- Packaging: add binutils BuildRequires, explicit libgfortran Requires
+- CLI help text: add debug-tablet and debug-tablet-pad subcommands
+- Fix udev rule and recovery service to target device 2-0015
+
 * Mon Aug 10 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.3.4-1
 - Handle EINTR in drain_fd to prevent an infinite loop when signals interrupt
   timerfd or eventfd reads during dispatch

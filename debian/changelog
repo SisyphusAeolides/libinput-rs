@@ -1,9 +1,19 @@
+libinput-rs (1:0.3.5-1~ppa1~ubuntu26.04.1) resolute; urgency=medium
+
+  * Retry fill_events on EINTR to permanently fix pointer freeze on
+    signal delivery (e.g. SIGWINCH from terminal resize).
+  * Packaging: add binutils Build-Depends, explicit libgfortran runtime dep.
+  * CLI help text: add debug-tablet and debug-tablet-pad subcommands.
+  * libinput-rs-chwd.8: add EXIT STATUS and EXAMPLES sections.
+  * Fix udev rule and recovery service to target device 2-0015.
+
+ -- Kenny Glowner <SisyphusAeolides@pm.me>  Mon, 10 Aug 2026 16:00:00 -0500
+
 libinput-rs (1:0.3.4-1~ppa1~ubuntu26.04.1) resolute; urgency=medium
 
   * Handle EINTR in drain_fd to prevent an infinite loop when signals
     interrupt timerfd or eventfd reads during dispatch.
 
- -- Kenny Glowner <SisyphusAeolides@pm.me>  Mon, 10 Aug 2026 10:16:00 -0500
  -- Kenny Glowner <SisyphusAeolides@pm.me>  Mon, 10 Aug 2026 10:16:00 -0500
 
 libinput-rs (1:0.3.3-1~ppa1~ubuntu26.04.1) resolute; urgency=medium
