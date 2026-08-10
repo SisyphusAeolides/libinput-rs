@@ -65,7 +65,7 @@ libexec_dir="$stage/usr/libexec/libinput"
 [[ ! -e "$stage/usr/lib/systemd/system-preset/90-libinput-rs.preset" ]]
 [[ -f "$stage/usr/lib/systemd/system/libinput-rs-elan-resume.service" ]]
 [[ -f "$stage/usr/lib/systemd/system-preset/91-libinput-rs-elan.preset" ]]
-rg -F 'ExecStop=/usr/bin/libinput elan-recover --all --affected-only --quiet' \
+rg -F 'ExecStop=/usr/bin/libinput elan-recover --all --quiet' \
     "$stage/usr/lib/systemd/system/libinput-rs-elan-resume.service"
 [[ ! -e "$stage/etc/libinput-rs/config.json" ]]
 native_helpers=(
