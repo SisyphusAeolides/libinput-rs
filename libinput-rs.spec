@@ -210,7 +210,8 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 %{_datadir}/zsh/site-functions/_libinput
 
 %changelog
-* Sun Aug 10 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.3.4-1
+* Mon Aug 10 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.3.4-1
+* Mon Aug 10 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.3.4-1
 - Handle EINTR in drain_fd to prevent an infinite loop when signals interrupt
   timerfd or eventfd reads during dispatch
 
