@@ -6304,6 +6304,14 @@ impl BackendState {
                             dead_fds.push(fd);
                             break;
                         }
+                        // EINTR: a signal interrupted the read (e.g. SIGWINCH from a terminal
+                        // resizing during a /command menu). Retry so the touch frame is not
+                        // abandoned mid-gesture, which would stall pointer motion.
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::Interrupted =>
+                        {
+                            continue;
+                        }
                         Err(_) => break,
                     }
                 };
