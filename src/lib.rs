@@ -1,7 +1,7 @@
 //! Rust implementation of the libinput.so.10 ABI.
 //!
-//! Version 0.3.1 is a tested drop-in replacement for libinput 1.31.3 on the
-//! supported x86_64 DNF/RPM targets. The release gate covers the complete
+//! Version 0.3.9 is a tested drop-in replacement for libinput 1.31.3 on the
+//! supported x86_64 packaging targets. The release gate covers the complete
 //! public ABI and the pinned upstream public-ABI behavioral corpus.
 
 #![allow(non_snake_case, clippy::missing_safety_doc)]
@@ -83,11 +83,15 @@ unsafe fn enqueue_events(
     }
 }
 
-pub(crate) unsafe fn emit_debug_log(ctx: *mut LibinputContext, message: &str) {
-    if ctx.is_null() || (*ctx).log_priority > 10 {
+unsafe fn emit_log(ctx: *mut LibinputContext, priority: u32, label: &str, message: &str) {
+    if ctx.is_null() || (*ctx).log_priority > priority {
         return;
     }
+
     let Some(handler) = (*ctx).log_handler else {
+        if (*ctx).default_log_handler_enabled {
+            eprintln!("libinput {label}: {message}");
+        }
         return;
     };
     let Ok(message) = std::ffi::CString::new(format!("{}\n", message.replace('%', "%%"))) else {
@@ -96,45 +100,21 @@ pub(crate) unsafe fn emit_debug_log(ctx: *mut LibinputContext, message: &str) {
     input_emit_log(
         handler as *mut libc::c_void,
         ctx.cast(),
-        10,
+        priority,
         message.as_ptr(),
     );
+}
+
+pub(crate) unsafe fn emit_debug_log(ctx: *mut LibinputContext, message: &str) {
+    emit_log(ctx, 10, "debug", message);
 }
 
 pub(crate) unsafe fn emit_error_log(ctx: *mut LibinputContext, message: &str) {
-    if ctx.is_null() || (*ctx).log_priority > 30 {
-        return;
-    }
-    let Some(handler) = (*ctx).log_handler else {
-        return;
-    };
-    let Ok(message) = std::ffi::CString::new(format!("{}\n", message.replace('%', "%%"))) else {
-        return;
-    };
-    input_emit_log(
-        handler as *mut libc::c_void,
-        ctx.cast(),
-        30,
-        message.as_ptr(),
-    );
+    emit_log(ctx, 30, "error", message);
 }
 
 pub(crate) unsafe fn emit_info_log(ctx: *mut LibinputContext, message: &str) {
-    if ctx.is_null() || (*ctx).log_priority > 20 {
-        return;
-    }
-    let Some(handler) = (*ctx).log_handler else {
-        return;
-    };
-    let Ok(message) = std::ffi::CString::new(format!("{}\n", message.replace('%', "%%"))) else {
-        return;
-    };
-    input_emit_log(
-        handler as *mut libc::c_void,
-        ctx.cast(),
-        20,
-        message.as_ptr(),
-    );
+    emit_log(ctx, 20, "info", message);
 }
 
 // ---------------------------------------------------------------------------
@@ -321,7 +301,11 @@ pub unsafe extern "C" fn libinput_dispatch(ctx: *mut LibinputContext) -> libc::c
         return -1;
     }
     let mut events: [libc::epoll_event; 16] = std::mem::zeroed();
-    libc::epoll_wait((*ctx).epoll_fd, events.as_mut_ptr(), 16, 0);
+    if libc::epoll_wait((*ctx).epoll_fd, events.as_mut_ptr(), 16, 0) < 0 {
+        return -std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO);
+    }
     (*ctx).drain_fd();
     populate_events(ctx);
     0
@@ -414,6 +398,29 @@ pub unsafe extern "C" fn libinput_event_device_notify_get_base_event(
 // ---------------------------------------------------------------------------
 // Pointer event accessors
 // ---------------------------------------------------------------------------
+
+fn apply_absolute_calibration(
+    x: f64,
+    y: f64,
+    x_min: f64,
+    x_max: f64,
+    y_min: f64,
+    y_max: f64,
+    matrix: [f32; 6],
+) -> (f64, f64) {
+    let x_range = x_max - x_min + 1.0;
+    let y_range = y_max - y_min + 1.0;
+    if x_range <= 0.0 || y_range <= 0.0 {
+        return (x, y);
+    }
+    let normalized_x = (x - x_min) / x_range;
+    let normalized_y = (y - y_min) / y_range;
+    let matrix = matrix.map(f64::from);
+    (
+        (matrix[0] * normalized_x + matrix[1] * normalized_y + matrix[2]) * x_range + x_min,
+        (matrix[3] * normalized_x + matrix[4] * normalized_y + matrix[5]) * y_range + y_min,
+    )
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_get_pointer_event(
@@ -527,7 +534,25 @@ pub unsafe extern "C" fn libinput_event_pointer_get_absolute_x(event: *const Lib
         return 0.0;
     }
     if let EventPayload::PointerMotionAbsolute(e) = &(*event).payload {
-        e.abs_x
+        let (x, _) = apply_absolute_calibration(
+            e.abs_x,
+            e.abs_y,
+            e.x_min,
+            e.x_max,
+            e.y_min,
+            e.y_max,
+            e.calibration,
+        );
+        let resolution = if (*event).device.is_null() {
+            None
+        } else {
+            (*(*event).device).abs_x_resolution
+        };
+        resolution
+            .filter(|resolution| *resolution > 0)
+            .map_or(x - e.x_min, |resolution| {
+                (x - e.x_min) / f64::from(resolution)
+            })
     } else {
         0.0
     }
@@ -539,7 +564,25 @@ pub unsafe extern "C" fn libinput_event_pointer_get_absolute_y(event: *const Lib
         return 0.0;
     }
     if let EventPayload::PointerMotionAbsolute(e) = &(*event).payload {
-        e.abs_y
+        let (_, y) = apply_absolute_calibration(
+            e.abs_x,
+            e.abs_y,
+            e.x_min,
+            e.x_max,
+            e.y_min,
+            e.y_max,
+            e.calibration,
+        );
+        let resolution = if (*event).device.is_null() {
+            None
+        } else {
+            (*(*event).device).abs_y_resolution
+        };
+        resolution
+            .filter(|resolution| *resolution > 0)
+            .map_or(y - e.y_min, |resolution| {
+                (y - e.y_min) / f64::from(resolution)
+            })
     } else {
         0.0
     }
@@ -791,9 +834,10 @@ pub unsafe extern "C" fn libinput_event_touch_get_slot(event: *const LibinputEve
         return -1;
     }
     match &(*event).payload {
-        EventPayload::TouchDown(e) | EventPayload::TouchMotion(e) | EventPayload::TouchUp(e) => {
-            e.slot
-        }
+        EventPayload::TouchDown(e)
+        | EventPayload::TouchMotion(e)
+        | EventPayload::TouchUp(e)
+        | EventPayload::TouchCancel(e) => e.slot,
         _ => -1,
     }
 }
@@ -804,9 +848,10 @@ pub unsafe extern "C" fn libinput_event_touch_get_seat_slot(event: *const Libinp
         return -1;
     }
     match &(*event).payload {
-        EventPayload::TouchDown(e) | EventPayload::TouchMotion(e) | EventPayload::TouchUp(e) => {
-            e.seat_slot
-        }
+        EventPayload::TouchDown(e)
+        | EventPayload::TouchMotion(e)
+        | EventPayload::TouchUp(e)
+        | EventPayload::TouchCancel(e) => e.seat_slot,
         _ => -1,
     }
 }
@@ -820,10 +865,21 @@ pub unsafe extern "C" fn libinput_event_touch_get_x(event: *const LibinputEvent)
         EventPayload::TouchDown(e) | EventPayload::TouchMotion(e) => {
             let device = (*event).device;
             if !device.is_null() {
-                if let (Some((minimum, _)), Some(resolution)) =
-                    ((*device).abs_x_range, (*device).abs_x_resolution)
-                {
-                    return (e.x - minimum as f64) / resolution as f64;
+                if let (Some((x_min, x_max)), Some((y_min, y_max)), Some(resolution)) = (
+                    (*device).abs_x_range,
+                    (*device).abs_y_range,
+                    (*device).abs_x_resolution,
+                ) {
+                    let (x, _) = apply_absolute_calibration(
+                        e.x,
+                        e.y,
+                        x_min.into(),
+                        x_max.into(),
+                        y_min.into(),
+                        y_max.into(),
+                        e.calibration,
+                    );
+                    return (x - f64::from(x_min)) / f64::from(resolution);
                 }
             }
             e.x
@@ -841,10 +897,21 @@ pub unsafe extern "C" fn libinput_event_touch_get_y(event: *const LibinputEvent)
         EventPayload::TouchDown(e) | EventPayload::TouchMotion(e) => {
             let device = (*event).device;
             if !device.is_null() {
-                if let (Some((minimum, _)), Some(resolution)) =
-                    ((*device).abs_y_range, (*device).abs_y_resolution)
-                {
-                    return (e.y - minimum as f64) / resolution as f64;
+                if let (Some((x_min, x_max)), Some((y_min, y_max)), Some(resolution)) = (
+                    (*device).abs_x_range,
+                    (*device).abs_y_range,
+                    (*device).abs_y_resolution,
+                ) {
+                    let (_, y) = apply_absolute_calibration(
+                        e.x,
+                        e.y,
+                        x_min.into(),
+                        x_max.into(),
+                        y_min.into(),
+                        y_max.into(),
+                        e.calibration,
+                    );
+                    return (y - f64::from(y_min)) / f64::from(resolution);
                 }
             }
             e.y
@@ -865,12 +932,18 @@ unsafe fn transformed_touch_coordinates(event: *const LibinputEvent) -> Option<(
     let ((xmin, xmax), (ymin, ymax)) = ((*device).abs_x_range?, (*device).abs_y_range?);
     let x_span = (xmax as i64 - xmin as i64 + 1).max(1) as f64;
     let y_span = (ymax as i64 - ymin as i64 + 1).max(1) as f64;
-    let x = (touch.x - xmin as f64) / x_span;
-    let y = (touch.y - ymin as f64) / y_span;
-    let matrix = (*device).calibration;
+    let (x, y) = apply_absolute_calibration(
+        touch.x,
+        touch.y,
+        xmin.into(),
+        xmax.into(),
+        ymin.into(),
+        ymax.into(),
+        touch.calibration,
+    );
     Some((
-        matrix[0] as f64 * x + matrix[1] as f64 * y + matrix[2] as f64,
-        matrix[3] as f64 * x + matrix[4] as f64 * y + matrix[5] as f64,
+        (x - f64::from(xmin)) / x_span,
+        (y - f64::from(ymin)) / y_span,
     ))
 }
 
@@ -1421,11 +1494,11 @@ pub unsafe extern "C" fn libinput_device_config_3fg_drag_set_enabled(
     if dev.is_null() {
         return 1;
     }
-    if !matches!(enable, 0..=2) {
-        return 2;
-    }
     if libinput_device_config_3fg_drag_get_finger_count(dev) < 3 {
         return 1;
+    }
+    if !matches!(enable, 0..=2) {
+        return 2;
     }
     (*dev).drag_3fg_enabled = enable;
     0
@@ -2403,9 +2476,9 @@ pub unsafe extern "C" fn libinput_seat_get_user_data(
 #[no_mangle]
 pub unsafe extern "C" fn libinput_config_status_to_str(status: u32) -> *const libc::c_char {
     match status {
-        0 => b"success\0".as_ptr().cast(),
-        1 => b"unsupported\0".as_ptr().cast(),
-        2 => b"invalid\0".as_ptr().cast(),
+        0 => b"Success\0".as_ptr().cast(),
+        1 => b"Unsupported configuration option\0".as_ptr().cast(),
+        2 => b"Invalid argument range\0".as_ptr().cast(),
         _ => std::ptr::null(),
     }
 }
@@ -2444,6 +2517,7 @@ pub unsafe extern "C" fn libinput_log_set_handler(
     if ctx.is_null() {
         return;
     }
+    (*ctx).default_log_handler_enabled = false;
     (*ctx).log_handler = handler;
 }
 
@@ -2581,11 +2655,11 @@ pub unsafe extern "C" fn libinput_device_config_rotation_set_angle(
     if dev.is_null() {
         return 1;
     }
+    if !(*dev).rotation_available {
+        return if degrees_cw == 0 { 0 } else { 1 };
+    }
     if degrees_cw >= 360 {
         return 2;
-    }
-    if !(*dev).rotation_available && degrees_cw != 0 {
-        return 1;
     }
     (*dev).rotation_angle = degrees_cw;
     0
@@ -2813,11 +2887,14 @@ pub unsafe extern "C" fn libinput_device_pointer_has_button(
     dev: *const LibinputDevice,
     button: u32,
 ) -> libc::c_int {
-    if dev.is_null() || button > u16::MAX as u32 {
+    if dev.is_null() {
         return 0;
     }
     if !(*dev).has_pointer {
         return -1;
+    }
+    if button > u16::MAX as u32 {
+        return 0;
     }
     (*dev).event_codes.contains(&(button as u16)) as libc::c_int
 }
@@ -2828,16 +2905,16 @@ pub unsafe extern "C" fn libinput_device_switch_has_switch(
     sw: u32,
 ) -> libc::c_int {
     if dev.is_null() {
-        return 0;
+        return -1;
     }
     if !(*dev).has_switch {
-        return 0;
+        return -1;
     }
     let kernel_code = match sw {
         1 => 0,
         2 => 1,
         3 => 10,
-        _ => return 0,
+        _ => return -1,
     };
     (*dev).switch_codes.contains(&kernel_code) as libc::c_int
 }
@@ -2976,9 +3053,18 @@ pub unsafe extern "C" fn libinput_event_pointer_get_absolute_x_transformed(
         return 0.0;
     }
     if let EventPayload::PointerMotionAbsolute(e) = &(*event).payload {
-        let range = e.x_max - e.x_min;
+        let (x, _) = apply_absolute_calibration(
+            e.abs_x,
+            e.abs_y,
+            e.x_min,
+            e.x_max,
+            e.y_min,
+            e.y_max,
+            e.calibration,
+        );
+        let range = e.x_max - e.x_min + 1.0;
         if range > 0.0 {
-            (e.abs_x - e.x_min) * f64::from(width) / range
+            (x - e.x_min) * f64::from(width) / range
         } else {
             0.0
         }
@@ -2996,9 +3082,18 @@ pub unsafe extern "C" fn libinput_event_pointer_get_absolute_y_transformed(
         return 0.0;
     }
     if let EventPayload::PointerMotionAbsolute(e) = &(*event).payload {
-        let range = e.y_max - e.y_min;
+        let (_, y) = apply_absolute_calibration(
+            e.abs_x,
+            e.abs_y,
+            e.x_min,
+            e.x_max,
+            e.y_min,
+            e.y_max,
+            e.calibration,
+        );
+        let range = e.y_max - e.y_min + 1.0;
         if range > 0.0 {
-            (e.abs_y - e.y_min) * f64::from(height) / range
+            (y - e.y_min) * f64::from(height) / range
         } else {
             0.0
         }
@@ -3294,8 +3389,7 @@ pub unsafe extern "C" fn libinput_event_tablet_tool_get_distance(
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_dx(event: *const LibinputEvent) -> f64 {
-    if event.is_null() || (*event).event_type != LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_AXIS
-    {
+    if event.is_null() {
         return 0.0;
     }
     match &(*event).payload {
@@ -3306,8 +3400,7 @@ pub unsafe extern "C" fn libinput_event_tablet_tool_get_dx(event: *const Libinpu
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_dy(event: *const LibinputEvent) -> f64 {
-    if event.is_null() || (*event).event_type != LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_AXIS
-    {
+    if event.is_null() {
         return 0.0;
     }
     match &(*event).payload {
@@ -3736,11 +3829,10 @@ pub unsafe extern "C" fn libinput_plugin_system_append_path(
         return;
     }
     let path = CStr::from_ptr(path);
-    if path.to_bytes().is_empty()
-        || (*ctx)
-            .plugin_paths
-            .iter()
-            .any(|candidate| candidate.as_bytes() == path.to_bytes())
+    if (*ctx)
+        .plugin_paths
+        .iter()
+        .any(|candidate| candidate.as_bytes() == path.to_bytes())
     {
         return;
     }
@@ -3752,9 +3844,9 @@ pub unsafe extern "C" fn libinput_plugin_system_append_path(
 #[no_mangle]
 pub unsafe extern "C" fn libinput_plugin_system_load_plugins(
     ctx: *mut LibinputContext,
-    flags: libc::c_uint,
+    _flags: libc::c_uint,
 ) -> libc::c_int {
-    if ctx.is_null() || flags != 0 {
+    if ctx.is_null() {
         return -libc::EINVAL;
     }
     if (*ctx).plugins_loaded {
@@ -4366,6 +4458,18 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_returns_negative_errno_on_epoll_failure() {
+        unsafe {
+            let ctx = libinput_path_create_context(&INTERFACE, std::ptr::null_mut());
+            assert!(!ctx.is_null());
+            libc::close((*ctx).epoll_fd);
+            (*ctx).epoll_fd = -1;
+            assert_eq!(libinput_dispatch(ctx), -libc::EBADF);
+            libinput_unref(ctx);
+        }
+    }
+
+    #[test]
     fn shared_device_groups_preserve_identity_and_user_data() {
         unsafe {
             let first = Box::new(LibinputDevice::new(
@@ -4467,15 +4571,21 @@ mod tests {
         unsafe {
             let ctx = libinput_path_create_context(&INTERFACE, std::ptr::null_mut());
             let custom = std::ffi::CString::new("/tmp/plugins").unwrap();
+            let empty = std::ffi::CString::new("").unwrap();
             libinput_plugin_system_append_path(ctx, custom.as_ptr());
             libinput_plugin_system_append_path(ctx, custom.as_ptr());
+            libinput_plugin_system_append_path(ctx, empty.as_ptr());
             libinput_plugin_system_append_default_paths(ctx);
-            assert_eq!((*ctx).plugin_paths.len(), 3);
+            assert_eq!((*ctx).plugin_paths.len(), 4);
             assert_eq!((&(*ctx).plugin_paths)[0].as_bytes(), b"/tmp/plugins");
-            assert_eq!(libinput_plugin_system_load_plugins(ctx, 0), -libc::ENOSYS);
+            assert_eq!((&(*ctx).plugin_paths)[1].as_bytes(), b"");
+            assert_eq!(
+                libinput_plugin_system_load_plugins(ctx, u32::MAX),
+                -libc::ENOSYS
+            );
             let ignored = std::ffi::CString::new("/ignored").unwrap();
             libinput_plugin_system_append_path(ctx, ignored.as_ptr());
-            assert_eq!((*ctx).plugin_paths.len(), 3);
+            assert_eq!((*ctx).plugin_paths.len(), 4);
             assert_eq!(libinput_plugin_system_load_plugins(ctx, 0), 0);
             libinput_unref(ctx);
         }
@@ -4591,6 +4701,220 @@ mod tests {
                 1
             );
             assert!(libinput_seat_unref(seat.cast()).is_null());
+        }
+    }
+
+    #[test]
+    fn config_status_strings_match_upstream() {
+        unsafe {
+            assert_eq!(
+                std::ffi::CStr::from_ptr(libinput_config_status_to_str(0)).to_bytes(),
+                b"Success"
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(libinput_config_status_to_str(1)).to_bytes(),
+                b"Unsupported configuration option"
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(libinput_config_status_to_str(2)).to_bytes(),
+                b"Invalid argument range"
+            );
+            assert!(libinput_config_status_to_str(3).is_null());
+        }
+    }
+
+    #[test]
+    fn absolute_pointer_coordinates_snapshot_calibration_and_use_inclusive_ranges() {
+        unsafe {
+            let mut device = Box::new(LibinputDevice::new(
+                "pointer",
+                "/dev/input/event0",
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ));
+            device.abs_x_resolution = Some(20);
+            device.abs_y_resolution = Some(40);
+            let event = LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE,
+                payload: EventPayload::PointerMotionAbsolute(
+                    crate::ffi_types::PointerMotionAbsoluteEvent {
+                        time_usec: 1,
+                        abs_x: 110.0,
+                        abs_y: 220.0,
+                        x_min: 10.0,
+                        x_max: 1009.0,
+                        y_min: 20.0,
+                        y_max: 2019.0,
+                        calibration: [1.0, 0.0, 0.1, 0.0, 1.0, 0.0],
+                    },
+                ),
+                context: std::ptr::null_mut(),
+                device: &mut *device,
+            };
+            device.calibration = [1.0, 0.0, 0.9, 0.0, 1.0, 0.0];
+
+            assert!((libinput_event_pointer_get_absolute_x(&event) - 10.0).abs() < 1e-6);
+            assert_eq!(libinput_event_pointer_get_absolute_y(&event), 5.0);
+            assert!(
+                (libinput_event_pointer_get_absolute_x_transformed(&event, 100) - 20.0).abs()
+                    < 1e-6
+            );
+            assert_eq!(
+                libinput_event_pointer_get_absolute_y_transformed(&event, 100),
+                10.0
+            );
+        }
+    }
+
+    #[test]
+    fn touch_cancel_retains_slot_information() {
+        unsafe {
+            let event = LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_TOUCH_CANCEL,
+                payload: EventPayload::TouchCancel(crate::ffi_types::TouchEvent {
+                    time_usec: 1,
+                    slot: 7,
+                    seat_slot: 11,
+                    x: 0.0,
+                    y: 0.0,
+                    calibration: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                }),
+                context: std::ptr::null_mut(),
+                device: std::ptr::null_mut(),
+            };
+
+            assert_eq!(libinput_event_touch_get_slot(&event), 7);
+            assert_eq!(libinput_event_touch_get_seat_slot(&event), 11);
+        }
+    }
+
+    #[test]
+    fn touch_coordinates_use_event_time_calibration() {
+        unsafe {
+            let mut device = Box::new(LibinputDevice::new(
+                "touch",
+                "/dev/input/event0",
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ));
+            device.abs_x_range = Some((10, 1009));
+            device.abs_y_range = Some((20, 2019));
+            device.abs_x_resolution = Some(20);
+            device.abs_y_resolution = Some(40);
+            let event = LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_TOUCH_MOTION,
+                payload: EventPayload::TouchMotion(crate::ffi_types::TouchEvent {
+                    time_usec: 1,
+                    slot: 0,
+                    seat_slot: 0,
+                    x: 110.0,
+                    y: 220.0,
+                    calibration: [1.0, 0.0, 0.1, 0.0, 1.0, 0.0],
+                }),
+                context: std::ptr::null_mut(),
+                device: &mut *device,
+            };
+            device.calibration = [1.0, 0.0, 0.9, 0.0, 1.0, 0.0];
+
+            assert!((libinput_event_touch_get_x(&event) - 10.0).abs() < 1e-6);
+            assert_eq!(libinput_event_touch_get_y(&event), 5.0);
+            assert!((libinput_event_touch_get_x_transformed(&event, 100) - 20.0).abs() < 1e-6);
+            assert_eq!(libinput_event_touch_get_y_transformed(&event, 100), 10.0);
+        }
+    }
+
+    #[test]
+    fn tablet_tip_events_expose_axis_deltas() {
+        unsafe {
+            let event = LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_TIP,
+                payload: EventPayload::TabletTool(crate::ffi_types::TabletToolEvent {
+                    time_usec: 1,
+                    tool: std::ptr::null_mut(),
+                    proximity_state: 0,
+                    x: 0.0,
+                    y: 0.0,
+                    dx: 2.5,
+                    dy: -1.5,
+                    x_min: 0.0,
+                    x_max: 1.0,
+                    y_min: 0.0,
+                    y_max: 1.0,
+                    x_resolution: 1.0,
+                    y_resolution: 1.0,
+                    x_changed: true,
+                    y_changed: true,
+                    pressure: 0.0,
+                    pressure_min: 0.0,
+                    pressure_max: 1.0,
+                    pressure_changed: false,
+                    distance: 0.0,
+                    distance_changed: false,
+                    tilt_x: 0.0,
+                    tilt_y: 0.0,
+                    tilt_x_changed: false,
+                    tilt_y_changed: false,
+                    rotation: 0.0,
+                    rotation_changed: false,
+                    slider: 0.0,
+                    slider_changed: false,
+                    wheel_delta: 0.0,
+                    wheel_discrete: 0,
+                    wheel_changed: false,
+                    size_major: 0.0,
+                    size_minor: 0.0,
+                    size_major_changed: false,
+                    size_minor_changed: false,
+                    tip_state: 1,
+                    button: 0,
+                    button_state: 0,
+                    seat_button_count: 0,
+                }),
+                context: std::ptr::null_mut(),
+                device: std::ptr::null_mut(),
+            };
+
+            assert_eq!(libinput_event_tablet_tool_get_dx(&event), 2.5);
+            assert_eq!(libinput_event_tablet_tool_get_dy(&event), -1.5);
+        }
+    }
+
+    #[test]
+    fn unsupported_configs_report_unsupported_before_invalid_values() {
+        unsafe {
+            let mut device = Box::new(LibinputDevice::new(
+                "device",
+                "/dev/input/event0",
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ));
+
+            assert_eq!(
+                libinput_device_config_rotation_set_angle(&mut *device, 360),
+                1
+            );
+            assert_eq!(
+                libinput_device_config_rotation_set_angle(&mut *device, 0),
+                0
+            );
+            assert_eq!(
+                libinput_device_config_3fg_drag_set_enabled(&mut *device, u32::MAX),
+                1
+            );
+            assert_eq!(libinput_device_pointer_has_button(&*device, u32::MAX), -1);
+            assert_eq!(libinput_device_switch_has_switch(&*device, 1), -1);
+            assert_eq!(libinput_device_switch_has_switch(&*device, u32::MAX), -1);
+        }
+    }
+
+    #[test]
+    fn setting_a_null_log_handler_disables_the_default_handler() {
+        unsafe {
+            let ctx = libinput_path_create_context(&INTERFACE, std::ptr::null_mut());
+            assert!((*ctx).default_log_handler_enabled);
+            libinput_log_set_handler(ctx, None);
+            assert!(!(*ctx).default_log_handler_enabled);
+            libinput_unref(ctx);
         }
     }
 }

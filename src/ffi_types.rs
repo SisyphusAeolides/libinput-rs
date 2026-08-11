@@ -98,6 +98,7 @@ pub struct PointerMotionAbsoluteEvent {
     pub x_max: f64,
     pub y_min: f64,
     pub y_max: f64,
+    pub calibration: [f32; 6],
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +205,7 @@ pub struct TouchEvent {
     pub seat_slot: i32,
     pub x: f64,
     pub y: f64,
+    pub calibration: [f32; 6],
 }
 
 #[derive(Debug, Clone)]
@@ -1015,6 +1017,7 @@ pub struct LibinputContext {
             args: *mut libc::c_void,
         ),
     >,
+    pub default_log_handler_enabled: bool,
     pub log_priority: u32,
     pub touch_arbitration_until: Option<Instant>,
     pub backend: Mutex<BackendState>,
@@ -1066,6 +1069,7 @@ impl LibinputContext {
             seats: vec![seat],
             refcount: AtomicI32::new(1),
             log_handler: None,
+            default_log_handler_enabled: true,
             log_priority: 30,
             touch_arbitration_until: None,
             backend: Mutex::new(backend),

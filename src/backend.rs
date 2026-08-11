@@ -3962,7 +3962,7 @@ unsafe fn tablet_tool_payload(
     (*lib_dev).tablet_current_size_minor = size_minor;
     TabletToolEvent {
         time_usec,
-        tool,
+        tool: crate::libinput_tablet_tool_ref(tool.cast()).cast(),
         proximity_state,
         x: transformed_x * x_range + x_min,
         y: transformed_y * y_range + y_min,
@@ -6044,6 +6044,7 @@ impl BackendState {
                         seat_slot: -1,
                         x: 0.0,
                         y: 0.0,
+                        calibration: (*device).calibration,
                     }),
                     context: ctx,
                     device,
@@ -6674,6 +6675,7 @@ impl BackendState {
                         seat_slot,
                         x: slot.x,
                         y: slot.y,
+                        calibration: (*lib_dev).calibration,
                     }),
                     context: ctx,
                     device: lib_dev,
@@ -8664,6 +8666,7 @@ impl BackendState {
                         x_max: f64::from(x_max),
                         y_min: f64::from(y_min),
                         y_max: f64::from(y_max),
+                        calibration: (*lib_dev).calibration,
                     }),
                     context: ctx,
                     device: lib_dev,
@@ -10811,6 +10814,7 @@ impl BackendState {
                                     seat_slot,
                                     x: slot.x,
                                     y: slot.y,
+                                    calibration: (*lib_dev).calibration,
                                 }),
                                 context: ctx,
                                 device: lib_dev,
@@ -10837,6 +10841,7 @@ impl BackendState {
                                     seat_slot,
                                     x: slot.x,
                                     y: slot.y,
+                                    calibration: (*lib_dev).calibration,
                                 }),
                             )
                         } else if slot.active {
@@ -10848,6 +10853,7 @@ impl BackendState {
                                     seat_slot: slot.seat_slot.unwrap_or(-1),
                                     x: slot.x,
                                     y: slot.y,
+                                    calibration: (*lib_dev).calibration,
                                 }),
                             )
                         } else if slot.reported {
@@ -10862,6 +10868,7 @@ impl BackendState {
                                     seat_slot,
                                     x: slot.x,
                                     y: slot.y,
+                                    calibration: (*lib_dev).calibration,
                                 }),
                             )
                         } else {

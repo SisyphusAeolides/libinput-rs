@@ -1,3 +1,10 @@
+libinput-rs (1:0.3.9-1~ppa1~ubuntu26.04.1) resolute; urgency=medium
+
+  * Restore exact public API accessor, status, logging, and error semantics.
+  * Preserve event-time calibration and tablet tool event ownership.
+
+ -- Kenny Glowner <SisyphusAeolides@pm.me>  Tue, 11 Aug 2026 10:00:00 -0500
+
 libinput-rs (1:0.3.8-1~ppa1~ubuntu26.04.1) resolute; urgency=medium
 
   * Fix pointer freeze: retry fetch_events drain loop on EINTR in backend dispatch
