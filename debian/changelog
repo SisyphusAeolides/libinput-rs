@@ -1,4 +1,4 @@
-libinput-rs (1:0.3.6-1~ppa1~ubuntu26.04.1) resolute; urgency=medium
+libinput-rs (1:0.3.7-1~ppa1~ubuntu26.04.1) resolute; urgency=medium
 
   * Fix pointer freeze: retry fetch_events drain loop on EINTR in backend dispatch
 
