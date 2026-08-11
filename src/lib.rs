@@ -1221,16 +1221,6 @@ pub unsafe extern "C" fn libinput_device_get_context(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libinput_device_get_devnode(
-    dev: *const LibinputDevice,
-) -> *const libc::c_char {
-    if dev.is_null() {
-        return std::ptr::null();
-    }
-    (*dev).devnode.as_ptr()
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn libinput_device_touch_get_touch_count(
     dev: *const LibinputDevice,
 ) -> libc::c_int {
