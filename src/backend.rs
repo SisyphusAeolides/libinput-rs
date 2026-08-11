@@ -4317,9 +4317,22 @@ unsafe fn update_tablet_tip_from_pressure(td: &mut TrackedDevice, touch_button_c
 // BackendState
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
+struct RequestedPath {
+    path: PathBuf,
+    syspath: Option<PathBuf>,
+}
+
+fn path_identity_matches(
+    expected: Option<&std::path::Path>,
+    current: Option<&std::path::Path>,
+) -> bool {
+    expected.is_none() || expected == current
+}
+
 pub struct BackendState {
     devices: HashMap<RawFd, TrackedDevice>,
-    requested_paths: Vec<PathBuf>,
+    requested_paths: Vec<RequestedPath>,
     discovery: crate::hwdetect::HardwareDiscovery,
     quirks: crate::quirks::QuirksEngine,
     suspended: bool,
@@ -6950,14 +6963,17 @@ impl BackendState {
         if let Some(index) = self
             .requested_paths
             .iter()
-            .position(|requested| requested == path)
+            .position(|requested| requested.path == path)
         {
             self.requested_paths.remove(index);
         }
     }
 
     pub fn remember_path(&mut self, path: &std::path::Path) {
-        self.requested_paths.push(path.to_path_buf());
+        self.requested_paths.push(RequestedPath {
+            path: path.to_path_buf(),
+            syspath: crate::udev::syspath_from_path(path),
+        });
     }
 
     pub unsafe fn resume(
@@ -6982,9 +6998,16 @@ impl BackendState {
         let paths = self.requested_paths.to_vec();
         let mut events = Vec::new();
         let mut failed = false;
-        for path in paths {
+        for requested in paths {
+            if !path_identity_matches(
+                requested.syspath.as_deref(),
+                crate::udev::syspath_from_path(&requested.path).as_deref(),
+            ) {
+                failed = true;
+                continue;
+            }
             let old_len = self.devices.len();
-            self.try_open(ctx, &path, &mut events);
+            self.try_open(ctx, &requested.path, &mut events);
             failed |= self.devices.len() == old_len;
         }
         out.extend(events);
@@ -11888,6 +11911,17 @@ mod tests {
         assert!(crate::evtrans::is_button_code(KeyCode::BTN_LEFT.0));
         assert!(crate::evtrans::is_button_code(KeyCode::BTN_0.0));
         assert!(crate::evtrans::is_button_code(0x2c0));
+    }
+
+    #[test]
+    fn path_resume_rejects_a_reused_device_node() {
+        let original = std::path::Path::new("/sys/devices/virtual/input/input1/event0");
+        let replacement = std::path::Path::new("/sys/devices/virtual/input/input2/event0");
+
+        assert!(path_identity_matches(Some(original), Some(original)));
+        assert!(!path_identity_matches(Some(original), Some(replacement)));
+        assert!(!path_identity_matches(Some(original), None));
+        assert!(path_identity_matches(None, Some(replacement)));
     }
 
     #[test]

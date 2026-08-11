@@ -226,6 +226,7 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 %changelog
 * Tue Aug 11 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.3.10-1
 - Return tablet relative deltas only for axis events, matching upstream
+- Validate path-device identity across suspend and resume
 
 * Tue Aug 11 2026 Kenny Glowner <SisyphusAeolides@pm.me> - 0.3.9-1
 - Restore exact public API accessor, status, logging, and error semantics

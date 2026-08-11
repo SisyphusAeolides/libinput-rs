@@ -17,6 +17,7 @@ extern "C" {
         device: *mut libc::c_void,
         key: *const libc::c_char,
     ) -> *const libc::c_char;
+    fn udev_device_get_syspath(device: *mut libc::c_void) -> *const libc::c_char;
 }
 
 pub unsafe fn device_from_path(path: &Path) -> *mut libc::c_void {
@@ -71,4 +72,17 @@ pub unsafe fn property_value(device: *mut libc::c_void, key: &str) -> Option<Str
     let key = CString::new(key).ok()?;
     let value = udev_device_get_property_value(device, key.as_ptr());
     (!value.is_null()).then(|| CStr::from_ptr(value).to_string_lossy().into_owned())
+}
+
+pub fn syspath_from_path(path: &Path) -> Option<std::path::PathBuf> {
+    unsafe {
+        let device = UdevDevice::from_path(path);
+        if device.as_ptr().is_null() {
+            return None;
+        }
+        let syspath = udev_device_get_syspath(device.as_ptr());
+        (!syspath.is_null()).then(|| {
+            std::path::PathBuf::from(CStr::from_ptr(syspath).to_string_lossy().into_owned())
+        })
+    }
 }
