@@ -274,7 +274,7 @@ fn discard_pending_input_events(fd: RawFd) {
     let bytes = std::mem::size_of_val(&events);
     loop {
         let read = unsafe { libc::read(fd, events.as_mut_ptr().cast(), bytes) };
-        if read > 0
+        if read == bytes as libc::ssize_t
             || (read < 0
                 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted)
         {
