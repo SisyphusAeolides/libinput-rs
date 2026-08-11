@@ -1,6 +1,6 @@
 //! Rust implementation of the libinput.so.10 ABI.
 //!
-//! Version 0.3.9 is a tested drop-in replacement for libinput 1.31.3 on the
+//! Version 0.3.10 is a tested drop-in replacement for libinput 1.31.3 on the
 //! supported x86_64 packaging targets. The release gate covers the complete
 //! public ABI and the pinned upstream public-ABI behavioral corpus.
 
@@ -3389,7 +3389,8 @@ pub unsafe extern "C" fn libinput_event_tablet_tool_get_distance(
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_dx(event: *const LibinputEvent) -> f64 {
-    if event.is_null() {
+    if event.is_null() || (*event).event_type != LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_AXIS
+    {
         return 0.0;
     }
     match &(*event).payload {
@@ -3400,7 +3401,8 @@ pub unsafe extern "C" fn libinput_event_tablet_tool_get_dx(event: *const Libinpu
 
 #[no_mangle]
 pub unsafe extern "C" fn libinput_event_tablet_tool_get_dy(event: *const LibinputEvent) -> f64 {
-    if event.is_null() {
+    if event.is_null() || (*event).event_type != LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_AXIS
+    {
         return 0.0;
     }
     match &(*event).payload {
@@ -4824,10 +4826,10 @@ mod tests {
     }
 
     #[test]
-    fn tablet_tip_events_expose_axis_deltas() {
+    fn tablet_deltas_are_exposed_only_for_axis_events() {
         unsafe {
-            let event = LibinputEvent {
-                event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_TIP,
+            let mut event = LibinputEvent {
+                event_type: LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_AXIS,
                 payload: EventPayload::TabletTool(crate::ffi_types::TabletToolEvent {
                     time_usec: 1,
                     tool: std::ptr::null_mut(),
@@ -4876,6 +4878,16 @@ mod tests {
 
             assert_eq!(libinput_event_tablet_tool_get_dx(&event), 2.5);
             assert_eq!(libinput_event_tablet_tool_get_dy(&event), -1.5);
+
+            for event_type in [
+                LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_PROXIMITY,
+                LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_TIP,
+                LibinputEventType::LIBINPUT_EVENT_TABLET_TOOL_BUTTON,
+            ] {
+                event.event_type = event_type;
+                assert_eq!(libinput_event_tablet_tool_get_dx(&event), 0.0);
+                assert_eq!(libinput_event_tablet_tool_get_dy(&event), 0.0);
+            }
         }
     }
 

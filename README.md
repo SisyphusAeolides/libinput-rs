@@ -5,7 +5,7 @@ x86_64 Ubuntu, DNF/RPM, and Arch-based systems. It implements the `libinput.so.1
 ships the matching runtime, development, command-line, udev, and quirks
 package surface.
 
-Release 0.3.9 is validated against upstream libinput 1.31.3 commit
+Release 0.3.10 is validated against upstream libinput 1.31.3 commit
 `26191d396d74d505541d6311f0b4ae68d791b890`. The release gate covers all 309
 public symbols, 25 symbol-version nodes, SONAME `libinput.so.10`, and all
 23,245 pinned behavioral cases. The verified result is 12,185 passes, 11,059
@@ -57,7 +57,7 @@ To create a signed, offline-buildable Launchpad source upload:
 ```bash
 make ppa-source
 dput ppa:sisyphusaeolides/corinth \
-  ../libinput-rs_0.3.9-1~ppa1~ubuntu26.04.1_source.changes
+  ../libinput-rs_0.3.10-1~ppa1~ubuntu26.04.1_source.changes
 ```
 
 ## Install on DNF/RPM systems

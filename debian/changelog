@@ -1,3 +1,9 @@
+libinput-rs (1:0.3.10-1~ppa1~ubuntu26.04.1) resolute; urgency=medium
+
+  * Return tablet relative deltas only for axis events, matching upstream.
+
+ -- Kenny Glowner <SisyphusAeolides@pm.me>  Tue, 11 Aug 2026 10:16:24 -0500
+
 libinput-rs (1:0.3.9-1~ppa1~ubuntu26.04.1) resolute; urgency=medium
 
   * Restore exact public API accessor, status, logging, and error semantics.
