@@ -1,0 +1,11 @@
+prefix=/usr
+includedir=${prefix}/include
+libdir=@LIBDIR@
+abi_libdir=${libdir}/libinput-rs
+
+Name: libinput-rs
+Description: Isolated experimental implementation of the libinput 1.31 ABI
+Version: 1.31.3
+Requires.private: libudev
+Libs: -L${abi_libdir} -linput
+Cflags: -I${includedir}/libinput-rs

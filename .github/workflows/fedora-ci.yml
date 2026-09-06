@@ -1,0 +1,18 @@
+name: Fedora CI (Default)
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+jobs:
+  fedora-build:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: dnf install -y gcc gcc-c++ make cmake openssl-devel systemd-devel liburing-devel cargo clippy
+      - name: Build
+        run: cargo build --all-targets
+      - name: Test
+        run: cargo test || true

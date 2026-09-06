@@ -1,0 +1,24 @@
+[Unit]
+Description=Rust Input Management Daemon
+After=systemd-udevd.service systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+ConditionPathExists=/dev/uinput
+StartLimitIntervalSec=30
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/libinput-rs
+Restart=on-failure
+RestartSec=3s
+User=root
+Group=input
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+# Fail-open models
+
+These models describe the safety rule used by the Rust daemon: a physical
+touchpad can be grabbed only after the uinput sink is ready, and every failure
+while forwarding input transitions back to a released state.
+
+The resource-lifecycle models cover the shared-library backend: an acquired
+restricted descriptor must be consumed by exactly one reject/remove path, and
+only a udev backend can possess hotplug permission. A path backend has no
+constructor for that permission.
+
+- Agda proves that no value witnessing permission to grab can exist while the
+  sink is absent.
+- Idris 2 makes invalid runtime states unconstructable with indexed types and
+  total transitions.
+- Fortran supplies an independent executable state-machine model. Its runtime
+  checks cover fail-open grabbing, exactly-once restricted-descriptor closure,
+  and the rule that only a udev backend may enable hotplug.
+
+Run `make proofs` to check the DNF-packaged Agda, Idris 2, and GNU Fortran
+models. `make proofs-strict` first verifies that all three compilers are
+installed.

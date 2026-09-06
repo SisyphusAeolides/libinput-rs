@@ -1,0 +1,86 @@
+#!/usr/bin/make -f
+
+export CARGO_PROFILE_RELEASE_DEBUG = 2
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+UPSTREAM_SOURCE := upstream/libinput-tools
+UPSTREAM_BUILD := upstream-tools-build
+UPSTREAM_STAGE := $(CURDIR)/debian/upstream-stage
+PACKAGE_STAGE := $(CURDIR)/debian/tmp
+CARGO_FLAGS := --frozen --release --offline --features libwacom
+
+%:
+	dh $@
+
+clean:
+	@if command -v dh_clean >/dev/null 2>&1; then dh_clean -Xvendor; fi
+
+override_dh_auto_configure:
+	CFLAGS="$$(dpkg-buildflags --get CFLAGS)" \
+	CXXFLAGS="$$(dpkg-buildflags --get CXXFLAGS)" \
+	LDFLAGS="$$(dpkg-buildflags --get LDFLAGS)" \
+	meson setup $(UPSTREAM_BUILD) $(UPSTREAM_SOURCE) \
+		--buildtype=plain \
+		--prefix=/usr \
+		--libdir=lib/$(DEB_HOST_MULTIARCH) \
+		-Dudev-dir=/usr/lib/udev \
+		-Dtests=false \
+		-Ddocumentation=false \
+		-Ddebug-gui=true \
+		-Dlibwacom=true \
+		-Dlua-plugins=disabled
+
+override_dh_auto_build:
+	CARGO_NET_OFFLINE=true cargo build $(CARGO_FLAGS) --bins
+	CARGO_NET_OFFLINE=true CARGO_FEATURES="--features libwacom" \
+		RPM_LD_FLAGS="$$(dpkg-buildflags --get LDFLAGS)" ./build-shared.sh
+	meson compile -C $(UPSTREAM_BUILD)
+
+override_dh_auto_test:
+	CARGO_NET_OFFLINE=true cargo test --locked --offline --workspace --features libwacom
+	$(MAKE) packaging-check
+
+override_dh_auto_install:
+	DESTDIR=$(UPSTREAM_STAGE) meson install -C $(UPSTREAM_BUILD) --no-rebuild
+	install -Dm755 target/release/libinput $(PACKAGE_STAGE)/usr/bin/libinput
+	ln -s libinput $(PACKAGE_STAGE)/usr/bin/libinput-rs
+	install -Dm755 target/release/libinput-rs-chwd $(PACKAGE_STAGE)/usr/bin/libinput-rs-chwd
+	install -Dm755 target/release/libinput-device-group $(PACKAGE_STAGE)/usr/lib/udev/libinput-device-group
+	install -Dm755 target/release/libinput-fuzz-extract $(PACKAGE_STAGE)/usr/lib/udev/libinput-fuzz-extract
+	install -Dm755 target/release/libinput-fuzz-to-zero $(PACKAGE_STAGE)/usr/lib/udev/libinput-fuzz-to-zero
+	install -Dm644 packaging/80-libinput-device-groups.rules $(PACKAGE_STAGE)/usr/lib/udev/rules.d/80-libinput-device-groups.rules
+	install -Dm644 packaging/90-libinput-fuzz-override.rules $(PACKAGE_STAGE)/usr/lib/udev/rules.d/90-libinput-fuzz-override.rules
+	install -Dm644 packaging/90-libinput-rs-elantech-crc.rules $(PACKAGE_STAGE)/usr/lib/udev/rules.d/90-libinput-rs-elantech-crc.rules
+	install -Dm644 systemd/libinput-rs-elan-resume.service $(PACKAGE_STAGE)/usr/lib/systemd/system/libinput-rs-elan-resume.service
+	install -Dm644 systemd/91-libinput-rs-elan.preset $(PACKAGE_STAGE)/usr/lib/systemd/system-preset/91-libinput-rs-elan.preset
+	install -d $(PACKAGE_STAGE)/usr/share/libinput
+	install -m644 quirks/*.quirks $(PACKAGE_STAGE)/usr/share/libinput/
+	install -Dm755 target/release/libinput.so $(PACKAGE_STAGE)/usr/lib/$(DEB_HOST_MULTIARCH)/libinput.so.10.13.0
+	ln -s libinput.so.10.13.0 $(PACKAGE_STAGE)/usr/lib/$(DEB_HOST_MULTIARCH)/libinput.so.10
+	ln -s libinput.so.10 $(PACKAGE_STAGE)/usr/lib/$(DEB_HOST_MULTIARCH)/libinput.so
+	install -Dm644 packaging/libinput.h $(PACKAGE_STAGE)/usr/include/libinput.h
+	install -d $(PACKAGE_STAGE)/usr/lib/$(DEB_HOST_MULTIARCH)/pkgconfig
+	sed 's|@LIBDIR@|/usr/lib/$(DEB_HOST_MULTIARCH)|g' packaging/libinput-rs.pc.in > $(PACKAGE_STAGE)/usr/lib/$(DEB_HOST_MULTIARCH)/pkgconfig/libinput.pc
+	install -d $(PACKAGE_STAGE)/usr/libexec/libinput
+	install -m755 $(UPSTREAM_STAGE)/usr/bin/libinput $(PACKAGE_STAGE)/usr/libexec/libinput/libinput-tool
+	for helper in $(UPSTREAM_STAGE)/usr/libexec/libinput/libinput-*; do \
+		install -m755 "$$helper" $(PACKAGE_STAGE)/usr/libexec/libinput/; \
+	done
+	for helper in libinput-analyze-buttons libinput-analyze-per-slot-delta \
+		libinput-analyze-recording libinput-analyze-touch-down-state \
+		libinput-list-kernel-devices libinput-measure-fuzz \
+		libinput-measure-touch-size libinput-measure-touchpad-pressure \
+		libinput-measure-touchpad-size libinput-measure-touchpad-tap \
+		libinput-replay; do \
+		sed -i '1s|^#!/usr/bin/env python3$$|#!/usr/bin/python3|' \
+			$(PACKAGE_STAGE)/usr/libexec/libinput/$$helper; \
+	done
+	install -d $(PACKAGE_STAGE)/usr/share/man/man1
+	install -m644 $(UPSTREAM_STAGE)/usr/share/man/man1/libinput*.1 $(PACKAGE_STAGE)/usr/share/man/man1/
+	install -Dm644 $(UPSTREAM_STAGE)/usr/share/zsh/site-functions/_libinput $(PACKAGE_STAGE)/usr/share/zsh/site-functions/_libinput
+	install -Dm644 packaging/libinput-rs.8 $(PACKAGE_STAGE)/usr/share/man/man8/libinput-rs.8
+	install -Dm644 packaging/libinput-rs-chwd.8 $(PACKAGE_STAGE)/usr/share/man/man8/libinput-rs-chwd.8
+
+override_dh_makeshlibs:
+	dh_makeshlibs -plibinput10 -V -- -c4

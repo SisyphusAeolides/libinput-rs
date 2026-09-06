@@ -1,0 +1,32 @@
+.TH LIBINPUT-RS 8 "July 2026" "libinput-rs 0.2.0" "System Administration"
+.SH NAME
+libinput-rs \- optional fail-open touchpad companion
+.SH SYNOPSIS
+.B libinput-rs
+.SH DESCRIPTION
+.B libinput-rs
+creates a uinput pointer before exclusively grabbing supported physical
+touchpads. Keyboards are observed without an exclusive grab for
+disable-while-typing behavior. If the output device cannot be created or event
+forwarding fails, the process exits and the kernel releases all grabs.
+.PP
+The service is disabled by default. It is not ordered before a display manager.
+.SH CONFIGURATION
+Configuration is read from
+.IR /etc/libinput-rs/config.json .
+.SH EXPERIMENTAL ABI LIBRARY
+The experimental libinput ABI implementation is installed at
+.IR /usr/lib64/libinput-rs/libinput.so.10 .
+That directory is not in the system dynamic linker path. The library must not
+replace the distribution-provided
+.IR /usr/lib64/libinput.so.10 .
+.SH FILES
+.TP
+.I /etc/libinput-rs/config.json
+Daemon configuration.
+.TP
+.I /usr/lib/systemd/system/libinput-rs.service
+Optional systemd service.
+.SH SEE ALSO
+.BR libinput (1),
+.BR systemctl (1)

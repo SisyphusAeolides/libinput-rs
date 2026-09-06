@@ -1,0 +1,71 @@
+.TH LIBINPUT-RS 8 "July 2026" "libinput-rs 0.3.1" "System Administration"
+.SH NAME
+libinput-rs \- Rust libinput ABI replacement
+.SH SYNOPSIS
+.B libinput-rs
+.RI [ command ]
+.SH DESCRIPTION
+The
+.B libinput-rs
+package installs a tested drop-in implementation of
+.IR libinput.so.10
+in the system library directory. Display managers, compositors, and other
+libinput clients use it after the dynamic linker cache is refreshed and the
+clients are restarted.
+.PP
+The same package installs the public header, unversioned linker name, and
+pkg-config metadata that replace the distribution's development package.
+.PP
+The compatibility command
+.B libinput-rs
+invokes the installed
+.B libinput
+command-line interface. Input processing itself runs entirely inside the
+shared backend used by the compositor. No resident input companion or exclusive
+device grab is installed. Motion, scrolling, tapping, click mapping, and
+disable-while-typing use the standard libinput device configuration API.
+.PP
+An enabled, non-resident sleep unit invokes the guarded ELAN recovery command
+after resume on ThinkPad P53 systems. It exits without action on other systems
+and never opens or grabs an input event device.
+.SH FILES
+.TP
+.I /usr/lib64/libinput.so.10.13.0
+Replacement shared library on 64-bit Fedora systems.
+.TP
+.I /usr/lib64/libinput.so.10
+Runtime SONAME link.
+.TP
+.I /usr/lib64/libinput.so
+Development linker name supplied by libinput-rs.
+.TP
+.I /usr/include/libinput.h
+C development header supplied by libinput-rs.
+.TP
+.I /usr/lib64/pkgconfig/libinput.pc
+pkg-config metadata supplied by libinput-rs on 64-bit Fedora systems.
+.TP
+.I /usr/lib/systemd/system/libinput-rs-elan-resume.service
+P53-gated one-shot ELAN recovery after system resume.
+.SH INSTALLATION
+Install from a text console or SSH session so rollback remains available.
+Install the single replacement package:
+.PP
+.nf
+sudo dnf install libinput-rs --allowerasing
+sudo ldconfig
+sudo systemctl reboot
+.fi
+.PP
+.SH ROLLBACK
+Restore Fedora's runtime and development packages in one transaction:
+.PP
+.nf
+sudo dnf install libinput libinput-devel --allowerasing
+sudo ldconfig
+sudo systemctl reboot
+.fi
+.SH SEE ALSO
+.BR libinput (1),
+.BR ldconfig (8),
+.BR systemctl (1)

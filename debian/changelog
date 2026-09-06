@@ -1,0 +1,52 @@
+libinput-rs (1:0.3.11-1~ppa1~ubuntu26.04.1) resolute; urgency=medium
+
+  * Return tablet relative deltas only for axis events, matching upstream.
+  * Validate path-device identity across suspend and resume.
+
+ -- Kenny Glauner <SisyphusAeolides@pm.me>  Tue, 11 Aug 2026 10:16:24 -0500
+
+libinput-rs (1:0.3.9-1~ppa1~ubuntu26.04.1) resolute; urgency=medium
+
+  * Restore exact public API accessor, status, logging, and error semantics.
+  * Preserve event-time calibration and tablet tool event ownership.
+
+ -- Kenny Glauner <SisyphusAeolides@pm.me>  Tue, 11 Aug 2026 10:00:00 -0500
+
+libinput-rs (1:0.3.8-1~ppa1~ubuntu26.04.1) resolute; urgency=medium
+
+  * Fix pointer freeze: retry fetch_events drain loop on EINTR in backend dispatch
+
+ -- Kenny Glauner <SisyphusAeolides@pm.me>  Mon, 11 Aug 2026 00:00:00 -0500
+
+libinput-rs (1:0.3.5+fix1-1~ppa1~ubuntu26.04.1) resolute; urgency=medium
+
+  * Rebuild with corrected orig: spec version 0.3.5, updated vendor checksum.
+
+ -- Kenny Glauner <SisyphusAeolides@pm.me>  Mon, 10 Aug 2026 21:00:00 -0500
+
+libinput-rs (1:0.3.5-1~ppa1~ubuntu26.04.1) resolute; urgency=medium
+
+  * Retry fill_events on EINTR to permanently fix pointer freeze on
+    signal delivery (e.g. SIGWINCH from terminal resize).
+  * Packaging: add binutils Build-Depends, explicit libgfortran runtime dep.
+  * CLI help text: add debug-tablet and debug-tablet-pad subcommands.
+  * libinput-rs-chwd.8: add EXIT STATUS and EXAMPLES sections.
+  * Fix udev rule and recovery service to target device 2-0015.
+
+ -- Kenny Glauner <SisyphusAeolides@pm.me>  Mon, 10 Aug 2026 16:00:00 -0500
+
+libinput-rs (1:0.3.4-1~ppa1~ubuntu26.04.1) resolute; urgency=medium
+
+  * Handle EINTR in drain_fd to prevent an infinite loop when signals
+    interrupt timerfd or eventfd reads during dispatch.
+
+ -- Kenny Glauner <SisyphusAeolides@pm.me>  Mon, 10 Aug 2026 10:16:00 -0500
+
+libinput-rs (1:0.3.3-1~ppa1~ubuntu26.04.1) resolute; urgency=medium
+
+  * Initial Ubuntu release for the Corinth PPA.
+  * Preserve the libinput10, libinput-bin, libinput-dev, and libinput-tools
+    package identities used by Ubuntu.
+  * Ship the complete libinput 1.31.3 ABI, utility, udev, and quirks surface.
+
+ -- Kenny Glauner <SisyphusAeolides@pm.me>  Sat, 08 Aug 2026 00:00:00 -0500

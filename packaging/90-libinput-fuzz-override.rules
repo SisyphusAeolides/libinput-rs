@@ -1,0 +1,13 @@
+ACTION=="remove", GOTO="libinput_fuzz_override_end"
+KERNEL!="event*", GOTO="libinput_fuzz_override_end"
+
+ATTRS{capabilities/abs}!="0", ENV{ID_INPUT_TOUCHPAD}=="1", \
+    IMPORT{program}="libinput-fuzz-extract %S%p", \
+    RUN{program}+="libinput-fuzz-to-zero %S%p", \
+    GOTO="libinput_fuzz_override_end"
+ATTRS{capabilities/abs}!="0", ENV{ID_INPUT_TOUCHSCREEN}=="1", \
+    IMPORT{program}="libinput-fuzz-extract %S%p", \
+    RUN{program}+="libinput-fuzz-to-zero %S%p", \
+    GOTO="libinput_fuzz_override_end"
+
+LABEL="libinput_fuzz_override_end"

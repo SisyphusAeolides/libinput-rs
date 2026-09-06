@@ -1,0 +1,15 @@
+[Unit]
+Description=Reinitialize affected ELAN I2C input controllers after sleep
+Documentation=man:libinput(1)
+DefaultDependencies=no
+Before=sleep.target
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/true
+ExecStop=/usr/bin/libinput elan-recover --all --quiet
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sleep.target

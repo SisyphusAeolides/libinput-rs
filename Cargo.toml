@@ -1,0 +1,37 @@
+[package]
+name = "libinput-rs"
+version = "0.3.15"
+authors = ["Kenny Glauner <SisyphusAeolides@pm.me>"]
+edition = "2021"
+rust-version = "1.75"
+description = "100% drop-in Rust replacement for the libinput 1.31.3 C ABI and tools"
+license = "MIT"
+repository = "https://github.com/SisyphusAeolides/libinput-rs"
+homepage = "https://github.com/SisyphusAeolides/libinput-rs"
+readme = "README.md"
+keywords = ["libinput", "evdev", "touchpad", "linux", "input"]
+categories = ["hardware-support", "os::linux-apis"]
+exclude = [
+    ".cargo",
+    ".github",
+    "actual_exports.txt",
+    "expected_exports.txt",
+    "vendor",
+    "rpmbuild",
+    "rpmbuild2",
+    "proofs/fortran/build",
+]
+
+[lib]
+name = "input"
+crate-type = ["rlib", "staticlib"]
+path = "src/lib.rs"
+
+[features]
+default = []
+libwacom = []
+
+[dependencies]
+evdev-upstream = { package = "evdev", version = "=0.13.2" }
+nix = { version = "0.29", features = ["ioctl", "fs", "inotify"] }
+libc = "0.2"

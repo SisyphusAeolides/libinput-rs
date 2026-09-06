@@ -1,0 +1,7 @@
+# The replacement intentionally ships runtime and development interfaces in
+# one package. Providing and obsoleting both distribution package names is
+# required for a single DNF transaction, and the versioned SONAME remains a
+# runtime file even though the package also provides libinput-devel.
+addFilter(r"self-obsoletion libinput < 1\.32\.0 obsoletes libinput = 1\.31\.3")
+addFilter(r"self-obsoletion libinput-devel < 1\.32\.0 obsoletes libinput-devel = 1\.31\.3")
+addFilter(r"non-devel-file-in-devel-package /usr/lib64/libinput\.so\.10\.13\.0")

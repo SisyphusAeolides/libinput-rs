@@ -1,0 +1,3 @@
+# Auto-recover ELAN I2C touchpad when it loses its driver binding.
+ACTION=="unbind", SUBSYSTEM=="i2c", KERNEL=="2-0015", DRIVER=="elan_i2c", \
+    RUN+="/usr/bin/libinput elan-recover --device 2-0015 --quiet"

@@ -1,0 +1,15 @@
+[Apple Touchpad One Button]
+MatchName=litest appletouch
+MatchBus=usb
+MatchVendor=0x05ac
+MatchProduct=0x021a
+MatchVersion=0x0000
+MatchUdevType=touchpad
+ModelAppleTouchpadOneButton=1
+
+[Resolved Class And Ignore]
+MatchName=libinput-rs quirk override test
+MatchBus=usb
+MatchUdevType=touchpad
+AttrDeviceClass=touchpad
+AttrLibinputIgnore=1
