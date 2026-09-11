@@ -15,7 +15,7 @@ debugging that upstream explicitly disables in release builds.
 
 ## Supported systems
 
-The supported package path is the Sisyphus repository for Fedora-based
+The supported package path is the Sisyphus repository for DNF/RPM based
 distributions. It replaces the distribution libinput packages and installs the
 same shared-library ABI, tools, headers, udev rules, and quirks tree.
 
@@ -25,7 +25,7 @@ packaged library therefore depends on the standard libgfortran runtime.
 
 ## Install from the Sisyphus repository
 
-The package is available in the Sisyphus Copr repository for Fedora-based systems.
+The package is available in the Sisyphus Copr repository for DNF/RPM based systems.
 Enable the repository and install the package:
 
 ```console
