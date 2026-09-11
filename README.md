@@ -36,8 +36,8 @@ Server = https://sisyphusaeolides.github.io/Sisyphus-Repo/$arch
 Then install it:
 
 ```bash
-sudo dnf -Syy
-sudo dnf -S libinput-rs
+sudo dnf makecache
+sudo dnf install libinput-rs
 ```
 
 The package replaces `libinput` and does not run a resident companion service.
@@ -50,13 +50,13 @@ competing.
 To restore the distribution's original runtime package:
 
 ```bash
-sudo dnf -S libinput
+sudo dnf install libinput
 ```
 
 ## Build on Fedora
 
 ```bash
-sudo dnf -S --needed base-devel rust cargo gcc-fortran meson ninja patch \
+sudo dnf install @development-tools rust cargo gcc-gfortran meson ninja patch \
   libevdev mtdev systemd pkgconf python-libevdev python-pyudev python-yaml \
   curl
 make all
@@ -170,7 +170,7 @@ On Fedora, install Agda and Chez Scheme, then build Idris2 from the upstream
 compiler source when formal verification is needed:
 
 ```bash
-sudo dnf -S --needed agda chez-scheme git base-devel gcc-fortran
+sudo dnf install agda chez-scheme git @development-tools gcc-gfortran
 mkdir -p "$HOME/src"
 git clone --branch v0.8.0 https://github.com/idris-lang/Idris2.git "$HOME/src/Idris2"
 make -C "$HOME/src/Idris2" bootstrap SCHEME=chez PREFIX="$HOME/.local"
