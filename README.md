@@ -23,7 +23,7 @@ Agda and Idris 2 proofs are verified in CI and are not runtime dependencies.
 GNU Fortran compiles the capability bitmap kernel during the package build; the
 packaged library therefore depends on the standard libgfortran runtime.
 
-## Install from the Sisyphus repository
+## Install from Copr
 
 The package is available in the Sisyphus Copr repository for DNF/RPM based systems.
 Enable the repository and install the package:
