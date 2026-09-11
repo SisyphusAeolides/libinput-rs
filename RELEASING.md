@@ -27,14 +27,14 @@ The release version must match in `Cargo.toml`, `Cargo.lock`, and
 
 ## Build and publish the Arch package
 
-The ArachOS PKGBUILD is the authoritative system package. It is kept in
-`ArachOS/packaging/pkgbuild/libinput-rs/`; the ArachOS build script replaces its
-source pin from `ArachOS/sources.lock` before calling `makepkg`.
+The Fedora PKGBUILD is the authoritative system package. It is kept in
+`Fedora/packaging/pkgbuild/libinput-rs/`; the Fedora build script replaces its
+source pin from `Fedora/sources.lock` before calling `makepkg`.
 
 Run the package and repository gates from the coordinated checkouts:
 
 ```bash
-cd ../ArachOS
+cd ../Fedora
 make verify-sources
 make build-packages
 make validate-packages
@@ -74,7 +74,7 @@ cargo publish --locked --package libinput-rs --registry crates-io
 ```
 
 The crates.io package distributes Rust source. System replacement users should
-install the signed `libinput-rs` pacman package from the ArachOS/Sisyphus
+install the signed `libinput-rs` pacman package from the Fedora/Sisyphus
 repository.
 
 ## Tag the release
