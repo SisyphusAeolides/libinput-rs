@@ -1,8 +1,8 @@
 # Compatibility gates
 
 `libinput-rs` provides the drop-in ABI, behavioral, and package compatibility
-required by the supported x86_64 Fedora dnf package and mkosi image.
-The Fedora package is built from the pinned source tree and is the only
+required by the supported x86_64 Arch package and mkosi image.
+The Arch package is built from the pinned source tree and is the only
 production packaging path for this project.
 The checked-in manifest defines the exact required evidence; it does not become
 proof merely because a field was manually set.
@@ -24,6 +24,6 @@ installed system library.
 The unfiltered release result is 23,245 completed cases: 12,185 pass, 11,059
 are hash-pinned as requiring an upstream-private configuration interface, one
 is the upstream release-build skip for internal event debugging, and zero
-fail. Pacman package validation separately checks the complete runtime,
+fail. Arch package validation separately checks the complete runtime,
 development, utility, manual-page, completion, udev, and quirks payload that
-ships in Fedora.
+ships in the Arch package.

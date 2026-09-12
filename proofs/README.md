@@ -38,7 +38,7 @@ it cannot manufacture a device class or bypass these selection laws.
   exactly-once restricted-descriptor closure, and the rule that only a udev
   backend may enable hotplug.
 
-On Fedora, install the proof toolchains with `sudo dnf -S --needed agda
-idris2 gcc-fortran`, then run `make proofs` to check the Agda, Idris 2, and
+On Arch-based systems, install the proof toolchains with `sudo pacman -S
+--needed agda chez-scheme git base-devel gcc-fortran`, then run `make proofs` to check the Agda, Idris 2, and
 GNU Fortran models. `make proofs-strict` first verifies that all three
 compilers are installed.
