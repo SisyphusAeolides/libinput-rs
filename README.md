@@ -15,23 +15,22 @@ debugging that upstream explicitly disables in release builds.
 
 ## Supported systems
 
-The supported package path is the Sisyphus repository for Arch-based
-distributions. It replaces the distribution libinput packages and installs the
-same shared-library ABI, tools, headers, udev rules, and quirks tree.
+The supported package path is the Sisyphus COPR repository for Fedora and
+compatible RPM-based distributions. It replaces the distribution libinput
+packages and installs the same shared-library ABI, tools, headers, udev rules,
+and quirks tree.
 
 Agda and Idris 2 proofs are verified in CI and are not runtime dependencies.
 GNU Fortran compiles the capability bitmap kernel during the package build; the
 packaged library therefore depends on the standard libgfortran runtime.
 
-## Install from Sisyphus
+## Install from Sisyphus COPR
 
-The package is available in the Sisyphus Arch repository. Configure that
-repository as described in [Sisyphus-Repo](https://github.com/SisyphusAeolides/Sisyphus-Repo),
-then install the package:
+The package is available from the Sisyphus COPR repository:
 
 ```console
-sudo pacman -Syu
-sudo pacman -S libinput-rs
+sudo dnf copr enable sisyphuscode/libinput-rs
+sudo dnf install libinput-rs
 ```
 
 The package replaces `libinput` and does not run a resident companion service.
@@ -44,15 +43,15 @@ competing.
 To restore the distribution's original runtime package:
 
 ```bash
-sudo pacman -S libinput
+sudo dnf swap libinput-rs libinput
 ```
 
-## Build on Arch-based systems
+## Build on Fedora / RHEL / CentOS Stream
 
 ```bash
-sudo pacman -S --needed base-devel rust gcc-fortran meson ninja patch \
-  libevdev mtdev systemd pkgconf python-libevdev python-pyudev python-yaml \
-  curl
+sudo dnf install @development-tools rust cargo gcc-gfortran meson ninja-build patch \
+  libevdev-devel mtdev-devel systemd-devel pkgconf python3-libevdev python3-pyudev \
+  python3-yaml curl
 make all
 make check
 make test
@@ -79,7 +78,7 @@ Confirm the workaround after reboot with
 `cat /sys/module/psmouse/parameters/elantech_smbus`; it should print `0`.
 
 ThinkPad P53 systems exposing the affected `LEN0408` Elantech v4 controller
-should not force SMBus off. The Arch package installs a narrowly matched udev rule that
+should not force SMBus off. The RPM package installs a narrowly matched udev rule that
 keeps the PS/2 driver's packet CRC validation enabled as a fallback across boot
 and hotplug. This rejects corrupted combined TrackPoint, button, and touchpad
 packets before they reach userspace.
@@ -87,7 +86,7 @@ packets before they reach userspace.
 The P53's I2C controller can also remain enumerated while silently ceasing to
 deliver kernel events. `sudo libinput elan-recover` safely discovers only
 devices already bound to `elan_i2c`, unbinds and rebinds each controller, and
-waits for its evdev nodes to return. The Arch package enables a non-resident systemd
+waits for its evdev nodes to return. The RPM package enables a non-resident systemd
 sleep unit that runs this recovery after resume only when DMI identifies a
 ThinkPad P53. It does not open or grab input devices and exits immediately.
 
@@ -98,7 +97,7 @@ API, so existing compositor and desktop preferences continue to apply.
 
 ## Replacement layout
 
-The Arch package installs `libinput.so.10` in the system linker path together
+The RPM package installs `libinput.so.10` in the system linker path together
 with `libinput.h`, the unversioned linker name, `libinput.pc`, and the libinput
 udev callouts and rules.
 
@@ -160,11 +159,11 @@ under `proofs/`:
 join laws. `HwSpec.idr` makes hardware classification total and keeps ignored
 or unclassifiable devices out of the live registry by type.
 
-On Arch-based systems, install Agda and Chez Scheme, then build Idris2 from the upstream
+On Fedora / RHEL, install Agda and Chez Scheme, then build Idris2 from the upstream
 compiler source when formal verification is needed:
 
 ```bash
-sudo pacman -S --needed agda chez-scheme git base-devel gcc-fortran
+sudo dnf install @development-tools gcc-gfortran agda
 mkdir -p "$HOME/src"
 git clone --branch v0.8.0 https://github.com/idris-lang/Idris2.git "$HOME/src/Idris2"
 make -C "$HOME/src/Idris2" bootstrap SCHEME=chez PREFIX="$HOME/.local"
@@ -177,14 +176,14 @@ make proofs
 
 ## Publishing
 
-The Arch package and crates.io release procedure is documented in
+The COPR build and crates.io release procedure is documented in
 [RELEASING.md](RELEASING.md). Crates.io publishes one `libinput-rs` source
-crate; system replacement installations should use the Sisyphus package.
+crate; system replacement installations should use the Sisyphus COPR package.
 
 ## Reference behavior
 
 The replacement is pinned to upstream libinput 1.31.3 and tested through its
-public C ABI. The Arch package also builds and installs the upstream 1.31.3 utility,
+public C ABI. The RPM package also builds and installs the upstream 1.31.3 utility,
 manual-page, completion, udev-callout, and quirks payload alongside the Rust
 runtime and development files. `make packaging-check` and the package build
 verify the installed payload, loader resolution, dependencies, hardening, and
