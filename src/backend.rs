@@ -1712,6 +1712,13 @@ impl TrackedDevice {
             for new_index in new_slots {
                 let newest = &self.mt_slots[new_index];
                 let newest_position = (newest.x, newest.y);
+                // Only a contact in the lower part of the pad can be a
+                // resting thumb; a late touch above that line is a finger.
+                if y_range.is_some_and(|(minimum, maximum)| {
+                    newest.y < f64::from(minimum) + f64::from(maximum - minimum) * 0.85
+                }) {
+                    continue;
+                }
                 let moving_position = self.mt_slots.iter().enumerate().find_map(|(index, slot)| {
                     (index != new_index
                         && slot.active
