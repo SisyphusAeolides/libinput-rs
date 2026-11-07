@@ -6601,6 +6601,8 @@ impl BackendState {
                 || !(*tracked.lib_device).hold_enabled
                 || tracked.hold_active
                 || tracked.hold_blocked
+                // A held physical click is a press or drag, never a resting hold.
+                || tracked.active_click_button.is_some()
                 || !tracked
                     .hold_started_at
                     .is_some_and(|start| start.elapsed() >= timeout)
