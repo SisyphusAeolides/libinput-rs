@@ -36,3 +36,11 @@ MatchBus=usb
 MatchVendor=0x06CB
 MatchProduct=0x81A7
 AttrKeyboardIntegration=internal
+
+# Nitro ANV16-42
+[Acer touchpad (06CB:CFE4)]
+MatchUdevType=keyboard
+MatchBus=usb
+MatchVendor=0x06CB
+MatchProduct=0xCFE4
+AttrKeyboardIntegration=internal

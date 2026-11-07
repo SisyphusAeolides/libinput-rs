@@ -1,6 +1,6 @@
 [package]
 name = "libinput-rs"
-version = "0.3.15"
+version = "0.3.16"
 authors = ["Kenny Glauner <SisyphusAeolides@pm.me>"]
 edition = "2021"
 rust-version = "1.75"

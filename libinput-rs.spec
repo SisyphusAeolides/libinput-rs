@@ -1,10 +1,10 @@
 %global libinput_compat_version 1.31.3
-%global libinput_replace_before 1.32.0
+%global libinput_replace_before 1.33.0
 %global libinput_tools_commit 26191d396d74d505541d6311f0b4ae68d791b890
 %global libinput_tools_sha256 d5d8c8464f9cb24b0897c03edfe7d7c9e75ff5a91fe9b5b48791781aa9642858
 
 Name:           libinput-rs
-Version:        0.3.15
+Version:        0.3.16
 Release:        1%{?dist}
 Summary:        Drop-in Rust replacement for libinput 1.31.3
 
@@ -12,6 +12,10 @@ Provides:       libinput = %{libinput_compat_version}
 Provides:       libinput%{?_isa} = %{libinput_compat_version}
 Provides:       libinput-devel = %{libinput_compat_version}
 Provides:       libinput-devel%{?_isa} = %{libinput_compat_version}
+Provides:       libinput = 1.32.0-%{release}
+Provides:       libinput%{?_isa} = 1.32.0-%{release}
+Provides:       libinput-devel = 1.32.0-%{release}
+Provides:       libinput-devel%{?_isa} = 1.32.0-%{release}
 Obsoletes:      libinput < %{libinput_replace_before}
 Obsoletes:      libinput-devel < %{libinput_replace_before}
 
@@ -224,6 +228,13 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 %{_datadir}/zsh/site-functions/_libinput
 
 %changelog
+* Sat Nov 07 2026 Kenny Glauner <SisyphusAeolides@pm.me> - 0.3.16-1
+- Accept Fedora 45 quirk files (circular touchpad model, media key event codes)
+- Match upstream touch size suppression so Apple bcm5974 touches are not dropped
+- Initialize the current slot from the kernel and apply size hints only when the kernel reports no resolution
+- Treat internal USB Apple touchpads as internal for palm detection and disable-while-typing
+- Replace libinput up to 1.32.x
+
 * Tue Aug 11 2026 Kenny Glauner <SisyphusAeolides@pm.me> - 0.3.11-1
 - Return tablet relative deltas only for axis events, matching upstream
 - Validate path-device identity across suspend and resume

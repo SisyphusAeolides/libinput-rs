@@ -132,8 +132,8 @@ rpm -qp --provides "$package" | rg '^libinput = 1\.31\.3$'
 rpm -qp --provides "$package" | rg '^libinput-devel = 1\.31\.3$'
 rpm -qp --provides "$package" | rg '^pkgconfig\(libinput\) = 1\.31\.3$'
 rpm -qp --provides "$package" | rg '^libinput\.so\.10\('
-rpm -qp --obsoletes "$package" | rg '^libinput < 1\.32\.0$'
-rpm -qp --obsoletes "$package" | rg '^libinput-devel < 1\.32\.0$'
+rpm -qp --obsoletes "$package" | rg '^libinput < 1\.33\.0$'
+rpm -qp --obsoletes "$package" | rg '^libinput-devel < 1\.33\.0$'
 for installed_path in \
     "$libdir/libinput.so.10.13.0" \
     "$libdir/libinput.so.10" \

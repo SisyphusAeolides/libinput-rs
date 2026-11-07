@@ -368,6 +368,27 @@ fn clear_kernel_abs_fuzz(device: &Device) {
     }
 }
 
+fn is_size_suppressed(
+    touch_size_range: Option<(f64, f64)>,
+    has_mt_touch_minor: bool,
+    touch_major: f64,
+    touch_minor: f64,
+    currently_suppressed: bool,
+) -> bool {
+    let Some((down, up)) = touch_size_range else {
+        return false;
+    };
+    if !has_mt_touch_minor {
+        let threshold = if currently_suppressed { down } else { up };
+        return touch_major < threshold;
+    }
+    if currently_suppressed {
+        touch_major < up || touch_minor < up || (touch_major < down && touch_minor < down)
+    } else {
+        touch_major < up || touch_minor < up
+    }
+}
+
 /// Why a touch contact was ignored by the touchpad's typing/trackpoint palm
 /// detection. Keeping this separate from the generic palm flag is essential:
 /// a contact may be released after the relevant activity timer expires only
@@ -511,6 +532,7 @@ struct TrackedDevice {
     is_absolute_pointer: bool,
     has_mt: bool,
     has_mt_pressure: bool,
+    has_mt_touch_minor: bool,
     is_semi_mt: bool,
     protocol_a: bool,
     mt_x_fuzz: i32,
@@ -1929,6 +1951,8 @@ impl TrackedDevice {
         let absolute_axes = device.supported_absolute_axes();
         let has_mt_pressure =
             absolute_axes.is_some_and(|axes| axes.contains(AbsoluteAxisCode::ABS_MT_PRESSURE));
+        let has_mt_touch_minor =
+            absolute_axes.is_some_and(|axes| axes.contains(AbsoluteAxisCode::ABS_MT_TOUCH_MINOR));
         let tablet_has_pressure =
             absolute_axes.is_some_and(|axes| axes.contains(AbsoluteAxisCode::ABS_PRESSURE));
         let tablet_has_distance =
@@ -2039,6 +2063,7 @@ impl TrackedDevice {
         let mut has_mt = false;
         let mut has_mt_slot = false;
         let mut mt_slot_count = 10_usize;
+        let mut initial_slot = 0_usize;
         let mut mt_x_fuzz = 0;
         let mut mt_y_fuzz = 0;
         if let Ok(absinfo) = device.get_absinfo() {
@@ -2081,6 +2106,8 @@ impl TrackedDevice {
                 } else if axis == AbsoluteAxisCode::ABS_MT_SLOT {
                     has_mt_slot = true;
                     mt_slot_count = (info.maximum() - info.minimum() + 1).clamp(1, 256) as usize;
+                    initial_slot = ((info.value() - info.minimum()).max(0) as usize)
+                        .min(mt_slot_count.saturating_sub(1));
                 } else if axis == AbsoluteAxisCode::ABS_MT_POSITION_X {
                     mt_x_fuzz = info.fuzz();
                 } else if axis == AbsoluteAxisCode::ABS_MT_POSITION_Y {
@@ -2169,6 +2196,7 @@ impl TrackedDevice {
             is_absolute_pointer,
             has_mt,
             has_mt_pressure,
+            has_mt_touch_minor,
             is_semi_mt: false,
             protocol_a: has_mt && !has_mt_slot,
             mt_x_fuzz,
@@ -2400,7 +2428,7 @@ impl TrackedDevice {
             pad_dials_map_to_ring: false,
             pad_dial_ring_values: [0.0; 2],
             mt_slots,
-            current_slot: 0,
+            current_slot: initial_slot,
             protocol_a_tracking_id: None,
             protocol_a_x: None,
             protocol_a_y: None,
@@ -5517,6 +5545,9 @@ impl BackendState {
             Some("external") => true,
             _ => input_id.bus_type().0 == 0x05,
         };
+        if name == "bcm5974" || applied_quirks.model_apple_touchpad_onebutton {
+            external_touchpad = false;
+        }
         external_touchpad |= input_id.vendor() == 0x046d || applied_quirks.model_wacom_touchpad;
         // DWT is available on internal touchpads and on external keyboard /
         // touchpad combinations explicitly identified by the quirks database.
@@ -5644,19 +5675,21 @@ impl BackendState {
             if size_axes_are_sentinel || x_range.is_none() || y_range.is_none() {
                 x = None;
                 y = None;
-            } else if let Some((width, height)) = applied_quirks.size_hint {
-                x = Some(width);
-                y = Some(height);
-            } else if let (Some((x_resolution, y_resolution)), Some(xr), Some(yr)) =
-                (applied_quirks.resolution_hint, x_range, y_range)
-            {
-                x = Some(xr / x_resolution);
-                y = Some(yr / y_resolution);
-            } else if is_touchpad && x.is_none() && y.is_none() {
-                // Match upstream's conservative fallback for old touchpads
-                // whose kernels provide neither resolution nor a size hint.
-                x = Some(69.0);
-                y = Some(50.0);
+            } else if x.is_none() || y.is_none() {
+                if let (Some((x_resolution, y_resolution)), Some(xr), Some(yr)) =
+                    (applied_quirks.resolution_hint, x_range, y_range)
+                {
+                    x = Some(xr / x_resolution);
+                    y = Some(yr / y_resolution);
+                } else if let Some((width, height)) = applied_quirks.size_hint {
+                    x = Some(width);
+                    y = Some(height);
+                } else if is_touchpad {
+                    // Match upstream's conservative fallback for old touchpads
+                    // whose kernels provide neither resolution nor a size hint.
+                    x = Some(69.0);
+                    y = Some(50.0);
+                }
             }
             (*lib_dev).width_mm = x;
             (*lib_dev).height_mm = y;
@@ -5760,6 +5793,10 @@ impl BackendState {
         // clears it from evdev so the kernel does not filter the same axis a
         // second time. Keep that observable evdev behavior ABI-compatible.
         clear_kernel_abs_fuzz(&td.device);
+        if td.touch_size_range.is_some() {
+            crate::udev_callout::set_abs_fuzz(&td.device, AbsoluteAxisCode::ABS_MT_TOUCH_MAJOR, 0);
+            crate::udev_callout::set_abs_fuzz(&td.device, AbsoluteAxisCode::ABS_MT_TOUCH_MINOR, 0);
+        }
 
         out.push(LibinputEvent {
             event_type: LibinputEventType::LIBINPUT_EVENT_DEVICE_ADDED,
@@ -9903,7 +9940,13 @@ impl BackendState {
                             slot.pressure_suppressed = td
                                 .touch_pressure_range
                                 .is_some_and(|(down, _)| slot.pressure < down);
-                            slot.size_suppressed = td.touch_size_range.is_some();
+                            slot.size_suppressed = is_size_suppressed(
+                                td.touch_size_range,
+                                td.has_mt_touch_minor,
+                                slot.touch_major,
+                                slot.touch_minor,
+                                true,
+                            );
                             slot.button_area_classification_pending = true;
                             slot.button_area_excluded = false;
                             slot.edge_classification_pending = true;
@@ -10544,7 +10587,13 @@ impl BackendState {
                             mt_slot.pressure_suppressed = td
                                 .touch_pressure_range
                                 .is_some_and(|(down, _)| mt_slot.pressure < down);
-                            mt_slot.size_suppressed = td.touch_size_range.is_some();
+                            mt_slot.size_suppressed = is_size_suppressed(
+                                td.touch_size_range,
+                                td.has_mt_touch_minor,
+                                mt_slot.touch_major,
+                                mt_slot.touch_minor,
+                                true,
+                            );
                             mt_slot.direct_palm_cancelled =
                                 (*lib_dev).has_touch && mt_slot.tool_type == 2;
                             mt_slot.palm_suppressed = mt_slot.direct_palm_cancelled
@@ -10654,10 +10703,15 @@ impl BackendState {
                     if slot < td.mt_slots.len() {
                         let mt_slot = &mut td.mt_slots[slot];
                         mt_slot.touch_major = val as f64;
-                        if let Some((down, up)) = td.touch_size_range {
+                        if td.touch_size_range.is_some() {
                             let was_suppressed = mt_slot.size_suppressed;
-                            let size = mt_slot.touch_major.max(mt_slot.touch_minor);
-                            mt_slot.size_suppressed = size < if was_suppressed { down } else { up };
+                            mt_slot.size_suppressed = is_size_suppressed(
+                                td.touch_size_range,
+                                td.has_mt_touch_minor,
+                                mt_slot.touch_major,
+                                mt_slot.touch_minor,
+                                was_suppressed || mt_slot.began_this_frame,
+                            );
                             if mt_slot.size_suppressed {
                                 mt_slot.palm_suppressed = true;
                             } else if was_suppressed {
@@ -10679,10 +10733,15 @@ impl BackendState {
                     if slot < td.mt_slots.len() {
                         let mt_slot = &mut td.mt_slots[slot];
                         mt_slot.touch_minor = val as f64;
-                        if let Some((down, up)) = td.touch_size_range {
+                        if td.touch_size_range.is_some() {
                             let was_suppressed = mt_slot.size_suppressed;
-                            let size = mt_slot.touch_major.max(mt_slot.touch_minor);
-                            mt_slot.size_suppressed = size < if was_suppressed { down } else { up };
+                            mt_slot.size_suppressed = is_size_suppressed(
+                                td.touch_size_range,
+                                td.has_mt_touch_minor,
+                                mt_slot.touch_major,
+                                mt_slot.touch_minor,
+                                was_suppressed || mt_slot.began_this_frame,
+                            );
                             if mt_slot.size_suppressed {
                                 mt_slot.palm_suppressed = true;
                             } else if was_suppressed {
@@ -11964,6 +12023,26 @@ impl BackendState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn size_suppression_follows_upstream_hysteresis() {
+        let range = Some((100.0, 80.0));
+        // No range configured: never suppressed.
+        assert!(!is_size_suppressed(None, true, 0.0, 0.0, true));
+        // Hovering contact stays suppressed until both axes reach `up` and one reaches `down`.
+        assert!(is_size_suppressed(range, true, 90.0, 90.0, true));
+        assert!(is_size_suppressed(range, true, 120.0, 70.0, true));
+        assert!(!is_size_suppressed(range, true, 120.0, 85.0, true));
+        assert!(!is_size_suppressed(range, true, 85.0, 120.0, true));
+        // Active contact ends only when an axis drops below `up`.
+        assert!(!is_size_suppressed(range, true, 90.0, 90.0, false));
+        assert!(is_size_suppressed(range, true, 90.0, 70.0, false));
+        // Without ABS_MT_TOUCH_MINOR only the major axis is used.
+        assert!(is_size_suppressed(range, false, 90.0, 0.0, true));
+        assert!(!is_size_suppressed(range, false, 100.0, 0.0, true));
+        assert!(!is_size_suppressed(range, false, 90.0, 0.0, false));
+        assert!(is_size_suppressed(range, false, 70.0, 0.0, false));
+    }
 
     fn active_slot(edge_state: EdgeScrollState) -> MtSlot {
         MtSlot {

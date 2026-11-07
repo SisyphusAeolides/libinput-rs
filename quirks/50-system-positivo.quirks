@@ -9,3 +9,14 @@ MatchProduct=0x0255
 MatchUdevType=touchpad
 MatchDMIModalias=dmi:*:svnPositivoBahia-VAIO:pnVJFE59F11X-*:*
 AttrEventCode=+BTN_RIGHT
+
+# Most Pixart Touchpad (093A:0255) devices don't have buttons so we remove right
+# button in 30-vendor-pixart.quirks, but this one does.
+# https://gitlab.freedesktop.org/libinput/libinput/-/work_items/1315
+[Positivo N8460 Touchpad]
+MatchBus=i2c
+MatchVendor=0x093A
+MatchProduct=0x0255
+MatchUdevType=touchpad
+MatchDMIModalias=dmi:*svnPositivoTecnologiaSA:pnN8460:*
+AttrEventCode=+BTN_RIGHT

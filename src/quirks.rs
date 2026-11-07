@@ -37,6 +37,7 @@ struct Section {
     model_touchpad_visible_marker: Option<bool>,
     model_pressure_pad: bool,
     model_wacom_intuos_pro3rd: bool,
+    model_circular_touchpad: bool,
     tpkb_combo_layout_below: bool,
     keyboard_integration: Option<KeyboardIntegration>,
     pointing_stick_integration: Option<KeyboardIntegration>,
@@ -139,6 +140,7 @@ pub struct AppliedQuirks {
     pub model_touchpad_visible_marker: bool,
     pub model_pressure_pad: bool,
     pub model_wacom_intuos_pro3rd: bool,
+    pub model_circular_touchpad: bool,
     pub tpkb_combo_layout_below: bool,
     pub keyboard_integration: Option<KeyboardIntegration>,
     pub pointing_stick_integration: Option<KeyboardIntegration>,
@@ -446,6 +448,8 @@ fn apply_file(
             section.model_pressure_pad = value.trim() == "1";
         } else if key.trim() == "ModelWacomIntuosPro3rd" {
             section.model_wacom_intuos_pro3rd = value.trim() == "1";
+        } else if key.trim() == "ModelCircularTouchpad" {
+            section.model_circular_touchpad = value.trim() == "1";
         } else if matches!(
             key,
             "ModelChromebook"
@@ -613,6 +617,7 @@ fn apply_section(
     }
     applied.model_pressure_pad |= section.model_pressure_pad;
     applied.model_wacom_intuos_pro3rd |= section.model_wacom_intuos_pro3rd;
+    applied.model_circular_touchpad |= section.model_circular_touchpad;
     applied.tpkb_combo_layout_below |= section.tpkb_combo_layout_below;
     if let Some(integration) = section.keyboard_integration {
         // Quirk files are applied in lexical order, matching the precedence
@@ -845,6 +850,7 @@ fn validate_quirk_entry(key: &str, value: &str) -> Option<String> {
                     | "ModelTouchpadPhantomClicks"
                     | "ModelPressurePad"
                     | "ModelWacomIntuosPro3rd"
+                    | "ModelCircularTouchpad"
                     | "ModelChromebook"
                     | "ModelSystem76Bonobo"
                     | "ModelSystem76Galago"
@@ -1037,6 +1043,14 @@ fn parse_key_code(name: &str) -> Option<u16> {
         "KEY_F1" => 59,
         "KEY_F2" => 60,
         "KEY_F3" => 61,
+        "KEY_MUTE" => 113,
+        "KEY_VOLUMEDOWN" => 114,
+        "KEY_VOLUMEUP" => 115,
+        "KEY_BRIGHTNESSDOWN" => 224,
+        "KEY_BRIGHTNESSUP" => 225,
+        _ if name.starts_with("KEY_") || name.starts_with("BTN_") => {
+            return name.parse::<evdev_upstream::KeyCode>().ok().map(|k| k.0);
+        }
         _ => return None,
     })
 }
@@ -1058,6 +1072,11 @@ fn key_code_name(code: u16) -> Option<&'static str> {
         59 => "KEY_F1",
         60 => "KEY_F2",
         61 => "KEY_F3",
+        113 => "KEY_MUTE",
+        114 => "KEY_VOLUMEDOWN",
+        115 => "KEY_VOLUMEUP",
+        224 => "KEY_BRIGHTNESSDOWN",
+        225 => "KEY_BRIGHTNESSUP",
         _ => return None,
     })
 }
@@ -1091,6 +1110,26 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_key_codes_round_trip() {
+        for (name, code) in [
+            ("KEY_MUTE", 113),
+            ("KEY_VOLUMEDOWN", 114),
+            ("KEY_VOLUMEUP", 115),
+            ("KEY_BRIGHTNESSDOWN", 224),
+            ("KEY_BRIGHTNESSUP", 225),
+        ] {
+            assert_eq!(parse_key_code(name), Some(code));
+            assert_eq!(key_code_name(code), Some(name));
+        }
+    }
+
+    #[test]
+    fn model_circular_touchpad_validates() {
+        assert!(validate_quirk_entry("ModelCircularTouchpad", "1").is_none());
+        assert!(validate_quirk_entry("AttrEventCode", "-KEY_BRIGHTNESSUP").is_none());
+    }
 
     #[test]
     fn synthetic_test_devices_do_not_inherit_host_machine_matches() {

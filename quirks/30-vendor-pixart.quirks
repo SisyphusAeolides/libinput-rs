@@ -26,3 +26,21 @@ MatchUdevType=touchpad
 MatchVendor=0x093A
 MatchProduct=0x1336
 AttrEventCode=-BTN_RIGHT
+
+# "093A:4811 Touchpad": haptic pressure touchpad used in Acer Predator laptops.
+# PIXA4811:00 093A:4811 Touchpad
+[Pixart Haptic Touchpad (093A:4811)]
+MatchBus=i2c
+MatchVendor=0x093A
+MatchProduct=0x4811
+MatchUdevType=touchpad
+AttrInputProp=+INPUT_PROP_PRESSUREPAD
+
+# ASUS Chromebook CX1405CTA
+# ASUS Chromebook CX1505CKA
+[Pixart Touchpad (093A:200F)]
+MatchBus=i2c
+MatchUdevType=touchpad
+MatchVendor=0x093A
+MatchProduct=0x200F
+AttrPressureRange=20:8

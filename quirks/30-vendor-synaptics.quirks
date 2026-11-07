@@ -26,3 +26,11 @@ MatchVendor=0x06CB
 MatchProduct=0xCFD2
 MatchUdevType=touchpad
 AttrInputProp=+INPUT_PROP_PRESSUREPAD
+
+# "06CB:D024 Touchpad": pressure touchpad used in HP laptops.
+[Synaptics 06CB:D024 Touchpad]
+MatchBus=i2c
+MatchVendor=0x06CB
+MatchProduct=0xD024
+MatchUdevType=touchpad
+AttrInputProp=+INPUT_PROP_PRESSUREPAD

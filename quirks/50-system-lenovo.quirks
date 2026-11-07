@@ -60,6 +60,15 @@ MatchName=*TPPS/2 Elan TrackPoint*
 MatchDMIModalias=dmi:*:svnLENOVO:*:pvrThinkPadP14sGen1:*
 AttrTrackpointMultiplier=0.4
 
+# The touchpad firmware clears the confidence bit one frame before finger
+# lift-off, so hid-multitouch reports MT_TOOL_PALM at the end of every touch
+# and taps are always cancelled as palms.
+[Lenovo P14s Gen 6 Touchpad]
+MatchUdevType=touchpad
+MatchName=ELAN0676:00 04F3:3195 Touchpad
+MatchDMIModalias=dmi:*:svnLENOVO:*:pvrThinkPadP14sGen6:*
+AttrEventCode=-ABS_MT_TOOL_TYPE
+
 # Touchpad is a clickpad but INPUT_PROP_BUTTONPAD is not set, see
 # https://gitlab.freedesktop.org/libinput/libinput/issues/234
 # NOTE: This was intended for L380 Yoga but was applied before also for normal
@@ -505,4 +514,15 @@ MatchUdevType=keyboard
 MatchBus=usb
 MatchVendor=0x258A
 MatchProduct=0x1015
+AttrKeyboardIntegration=internal
+
+# Found in:
+#   Lenovo ThinkPad X1 Tablet Gen 3 (20KJ)
+# Known names:
+#   "Chicony ThinkPad X1 Tablet Thin Keyboard Gen 3"
+[Lenovo ThinkPad X1 Tablet Gen 3 Thin Keyboard]
+MatchUdevType=keyboard
+MatchBus=usb
+MatchVendor=0x17EF
+MatchProduct=0x60B5
 AttrKeyboardIntegration=internal
