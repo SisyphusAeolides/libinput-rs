@@ -3367,6 +3367,12 @@ fn systime_to_usec(t: SystemTime) -> u64 {
         .as_micros() as u64
 }
 
+/// Current time in microseconds on the same CLOCK_MONOTONIC base that device
+/// event timestamps use, for events synthesized outside an input frame.
+fn monotonic_now_usec() -> u64 {
+    monotonic_now().map_or(0, |now| now.as_micros() as u64)
+}
+
 fn monotonic_now() -> Option<Duration> {
     let mut timestamp = libc::timespec {
         tv_sec: 0,
@@ -5830,7 +5836,7 @@ impl BackendState {
                     out.push(LibinputEvent {
                         event_type: LibinputEventType::LIBINPUT_EVENT_SWITCH_TOGGLE,
                         payload: EventPayload::SwitchToggle(SwitchEvent {
-                            time_usec: systime_to_usec(SystemTime::now()),
+                            time_usec: monotonic_now_usec(),
                             switch: match code {
                                 0 => 1,
                                 1 => 2,
@@ -5849,7 +5855,7 @@ impl BackendState {
             let mut initial_events = VecDeque::new();
             Self::process_tablet_tool_event(
                 &InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0),
-                systime_to_usec(SystemTime::now()),
+                monotonic_now_usec(),
                 lib_dev,
                 ctx,
                 &mut td,
@@ -5890,7 +5896,7 @@ impl BackendState {
         else {
             return;
         };
-        let time_usec = systime_to_usec(SystemTime::now());
+        let time_usec = monotonic_now_usec();
         if tracked.scroll_button_axes != 0 {
             Self::emit_button_scroll_stops(time_usec, device, ctx, tracked, out);
         }
@@ -5942,7 +5948,7 @@ impl BackendState {
         else {
             return;
         };
-        let time_usec = systime_to_usec(SystemTime::now());
+        let time_usec = monotonic_now_usec();
         for key in tracked.held_keys.drain(..) {
             let seat_key_count = release_seat_key(device, key.code);
             out.push_back(LibinputEvent {
@@ -6136,7 +6142,7 @@ impl BackendState {
                 continue;
             }
             let tool = td.tablet_tool;
-            let time_usec = systime_to_usec(SystemTime::now());
+            let time_usec = monotonic_now_usec();
             if td.tablet_eraser_pending_tip_up {
                 td.tablet_tip_down = false;
                 td.tablet_tip_pending = None;
@@ -6213,7 +6219,7 @@ impl BackendState {
                 payload: EventPayload::TabletTool(tablet_tool_payload(
                     td,
                     td.lib_device,
-                    systime_to_usec(SystemTime::now()),
+                    monotonic_now_usec(),
                     tool,
                     0,
                 )),
@@ -6268,7 +6274,7 @@ impl BackendState {
             };
             tracked.middle_pending_since = None;
             Self::emit_pointer_button(
-                systime_to_usec(SystemTime::now()),
+                monotonic_now_usec(),
                 tracked.lib_device,
                 ctx,
                 tracked,
@@ -6305,7 +6311,7 @@ impl BackendState {
             }
             tracked.debounce_spurious = true;
             Self::emit_pointer_button(
-                systime_to_usec(SystemTime::now()),
+                monotonic_now_usec(),
                 tracked.lib_device,
                 ctx,
                 tracked,
@@ -6399,7 +6405,7 @@ impl BackendState {
                         .iter()
                         .find(|event| event.event_type() == EventType::KEY)
                         .map(|event| systime_to_usec(event.timestamp()))
-                        .unwrap_or_else(|| systime_to_usec(SystemTime::now()));
+                        .unwrap_or_else(monotonic_now_usec);
                     self.open_lid_on_keyboard(time_usec, ctx, out);
                 }
 
@@ -6533,7 +6539,7 @@ impl BackendState {
                 out.push_back(LibinputEvent {
                     event_type: LibinputEventType::LIBINPUT_EVENT_GESTURE_HOLD_END,
                     payload: EventPayload::GestureHoldEnd(GestureEvent {
-                        time_usec: systime_to_usec(SystemTime::now()),
+                        time_usec: monotonic_now_usec(),
                         finger_count: tracked.hold_fingers,
                         dx: 0.0,
                         dy: 0.0,
@@ -6614,7 +6620,7 @@ impl BackendState {
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_GESTURE_HOLD_BEGIN,
                 payload: EventPayload::GestureHoldBegin(GestureEvent {
-                    time_usec: systime_to_usec(SystemTime::now()),
+                    time_usec: monotonic_now_usec(),
                     finger_count: fingers,
                     dx: 0.0,
                     dy: 0.0,
@@ -6651,7 +6657,7 @@ impl BackendState {
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
                 payload: EventPayload::PointerButton(PointerButtonEvent {
-                    time_usec: systime_to_usec(SystemTime::now()),
+                    time_usec: monotonic_now_usec(),
                     button: button as u32,
                     state: 0,
                     seat_button_count,
@@ -6677,7 +6683,7 @@ impl BackendState {
             out.push_back(LibinputEvent {
                 event_type: LibinputEventType::LIBINPUT_EVENT_POINTER_BUTTON,
                 payload: EventPayload::PointerButton(PointerButtonEvent {
-                    time_usec: systime_to_usec(SystemTime::now()),
+                    time_usec: monotonic_now_usec(),
                     button: KeyCode::BTN_LEFT.0 as u32,
                     state: 0,
                     seat_button_count,
@@ -6707,7 +6713,7 @@ impl BackendState {
                 continue;
             }
             td.touch_arbitration_suppressed = true;
-            let time_usec = systime_to_usec(SystemTime::now());
+            let time_usec = monotonic_now_usec();
             if is_gesture_touchpad {
                 Self::stop_touchpad_actions(td, time_usec, ctx, out);
                 for slot in &mut td.mt_slots {
@@ -12023,6 +12029,18 @@ impl BackendState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synthesized_timestamps_share_the_device_event_clock() {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        let before = ts.tv_sec as u64 * 1_000_000;
+        let now = monotonic_now_usec();
+        assert!(now >= before && now - before < 5_000_000);
+    }
 
     #[test]
     fn size_suppression_follows_upstream_hysteresis() {
