@@ -4,7 +4,7 @@
 %global libinput_tools_sha256 d5d8c8464f9cb24b0897c03edfe7d7c9e75ff5a91fe9b5b48791781aa9642858
 
 Name:           libinput-rs
-Version:        0.3.18
+Version:        0.3.19
 Release:        1%{?dist}
 Summary:        Drop-in Rust replacement for libinput 1.31.3
 
@@ -228,6 +228,8 @@ test -e %{buildroot}%{_libdir}/libinput.so.10
 %{_datadir}/zsh/site-functions/_libinput
 
 %changelog
+* Sat Nov 07 2026 Kenny Glauner <SisyphusAeolides@pm.me> - 0.3.19-1
+- Combine the motion of all contacts while a clickpad button is held so one finger can click and another drag
 * Sat Nov 07 2026 Kenny Glauner <SisyphusAeolides@pm.me> - 0.3.18-1
 - Do not begin a hold gesture while a physical touchpad click is held
 * Sat Nov 07 2026 Kenny Glauner <SisyphusAeolides@pm.me> - 0.3.17-1

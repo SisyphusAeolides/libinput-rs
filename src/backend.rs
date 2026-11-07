@@ -337,6 +337,9 @@ struct MtSlot {
     click_pinned: bool,
     click_pin_x: f64,
     click_pin_y: f64,
+    /// Last position seen while a physical click is held, used to sum the
+    /// motion of every contact the way upstream combines clickpad touches.
+    click_prev: Option<(f64, f64)>,
     gesture_initial_x: f64,
     gesture_initial_y: f64,
     gesture_rebase_pending: bool,
@@ -10297,6 +10300,9 @@ impl BackendState {
                                     slot.click_pin_x = slot.x;
                                     slot.click_pin_y = slot.y;
                                 }
+                                for slot in &mut td.mt_slots {
+                                    slot.click_prev = slot.active.then_some((slot.x, slot.y));
+                                }
                                 td.gesture_last_centroid = td.click_drag_centroid();
                                 td.pinch_base_centroid = td.gesture_last_centroid;
                             }
@@ -11523,7 +11529,25 @@ impl BackendState {
                     } else {
                         td.gesture_centroid(button_areas)
                     };
-                    if let (Some((x, y)), Some((last_x, last_y))) =
+                    if td.active_click_button.is_some() {
+                        // With the click held, add up every moving contact so a
+                        // resting finger contributes nothing and the other
+                        // finger drags at full speed.
+                        let (mut dx, mut dy) = (0.0, 0.0);
+                        for slot in &mut td.mt_slots {
+                            if slot.active && !slot.palm_suppressed && !slot.thumb_suppressed {
+                                if let Some((prev_x, prev_y)) = slot.click_prev {
+                                    dx += slot.x - prev_x;
+                                    dy += slot.y - prev_y;
+                                }
+                                slot.click_prev = Some((slot.x, slot.y));
+                            } else {
+                                slot.click_prev = None;
+                            }
+                        }
+                        td.current_dx = dx.round() as i32;
+                        td.current_dy = dy.round() as i32;
+                    } else if let (Some((x, y)), Some((last_x, last_y))) =
                         (centroid, td.gesture_last_centroid)
                     {
                         td.current_dx = (x - last_x).round() as i32;
